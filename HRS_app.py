@@ -8,7 +8,7 @@ class HRSApp(ctk.CTk):
         super().__init__()
         
         # 1. 基础窗口设置
-        self.width = 1100
+        self.width = 1260
         self.height = 700
         self.title("HRS 史料全自动采集器 V2.2")
         self.minsize(800, 600)
