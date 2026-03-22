@@ -5,6 +5,7 @@ import json
 import threading
 import hashlib
 import re
+from enum import Enum, auto
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import io
@@ -17,6 +18,13 @@ from docx import Document
 
 from components.ui.button import Button
 from config.api_key_store import load_google_api_key
+
+class OcrState(Enum):
+    IDLE = auto()
+    RUNNING = auto()
+    DONE = auto()
+    ERROR = auto()
+    CANCELLED = auto()
 
 class OCRScreen(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
@@ -41,12 +49,16 @@ class OCRScreen(ctk.CTkFrame):
         self.file_item_buttons = []
         self.selected_file_index = None
         self.selected_pdf_path = None
+        self._list_render_id = 0
+        self._list_loading_label = None
         self.ocr_cancel_event = threading.Event()
         self.ocr_task_id = 0
+        self.current_ocr_state = OcrState.IDLE
         self.ocr_pages = []
         self.current_ocr_page_index = 0
 
         self._setup_ui()
+        self._update_ui_by_state()
         self._load_file_list()
 
     def _setup_ui(self):
@@ -130,6 +142,16 @@ class OCRScreen(ctk.CTkFrame):
         )
         self.btn_start_ocr.pack(pady=(4, 8), padx=12, fill="x")
 
+        self.btn_force_reocr = Button(
+            self.action_frame,
+            text="🔄 强制重新识别",
+            fg_color="#1d4ed8",
+            hover_color="#1e40af",
+            height=36,
+            command=self.force_re_recognize
+        )
+        self.btn_force_reocr.pack(pady=(0, 8), padx=12, fill="x")
+
         self.btn_cancel_ocr = Button(
             self.action_frame,
             text="取消任务",
@@ -140,9 +162,19 @@ class OCRScreen(ctk.CTkFrame):
         )
         self.btn_cancel_ocr.pack(pady=(0, 8), padx=12, fill="x")
 
+        self.btn_clear_current_cache = Button(
+            self.action_frame,
+            text="🗑️ 删除当前缓存",
+            fg_color="#6b7280",
+            hover_color="#4b5563",
+            height=36,
+            command=self.clear_current_file_cache
+        )
+        self.btn_clear_current_cache.pack(pady=(0, 8), padx=12, fill="x")
+
         self.btn_clear_cache = Button(
             self.action_frame,
-            text="清空缓存",
+            text="🗑️ 删除全部缓存",
             fg_color="#4b5563",
             hover_color="#374151",
             height=36,
@@ -222,41 +254,117 @@ class OCRScreen(ctk.CTkFrame):
         wrap_length = max(80, event.width - 24)
         self.ocr_progress_label.configure(wraplength=wrap_length)
 
+    def _set_ocr_state(self, new_state):
+        def apply_state():
+            self.current_ocr_state = new_state
+            self._update_ui_by_state()
+        if threading.current_thread() is threading.main_thread():
+            apply_state()
+        else:
+            self.after(0, apply_state)
+
+    def _update_ui_by_state(self):
+        is_running = self.current_ocr_state == OcrState.RUNNING
+        common_state = "disabled" if is_running else "normal"
+        cancel_state = "normal" if is_running else "disabled"
+
+        self.btn_start_ocr.configure(state=common_state)
+        self.btn_force_reocr.configure(state=common_state)
+        self.btn_clear_current_cache.configure(state=common_state)
+        self.btn_clear_cache.configure(state=common_state)
+        self.btn_cancel_ocr.configure(state=cancel_state)
+
+        for btn in self.file_item_buttons:
+            if btn.winfo_exists():
+                btn.configure(state=common_state)
+
     def _load_file_list(self):
+        self._list_render_id += 1
+        render_id = self._list_render_id
+        batch_size = 30
+
         self.pdf_files.clear()
         self.file_item_buttons.clear()
         self.selected_file_index = None
 
         for widget in self.file_list_frame.winfo_children():
             widget.destroy()
+
+        self._list_loading_label = None
         
         if not os.path.exists(self.download_dir): return
 
         pdf_list = [f for f in os.listdir(self.download_dir) if f.lower().endswith('.pdf')]
         pdf_list.sort()
 
-        for index, filename in enumerate(pdf_list, start=1):
-            file_path = os.path.join(self.download_dir, filename)
-            self.pdf_files.append(file_path)
-            display_text = f"{index}. {filename}"
-            btn = ctk.CTkButton(
-                self.file_list_frame,
-                text=display_text,
-                font=("Arial", 12),
-                fg_color="transparent",
-                hover_color="#383d45",
-                text_color="#d7dbe1",
-                anchor="w",
-                height=34,
-                corner_radius=12,
-                border_width=1,
-                border_color="#333842",
-                command=lambda i=index - 1: self.on_file_select(i)
-            )
-            btn.pack(fill="x", padx=4, pady=3)
-            self.file_item_buttons.append(btn)
+        self.pdf_files.extend([os.path.join(self.download_dir, filename) for filename in pdf_list])
+        total = len(self.pdf_files)
+        target_path = self.selected_pdf_path if self.selected_pdf_path in self.pdf_files else (self.pdf_files[0] if self.pdf_files else None)
+        target_index = self.pdf_files.index(target_path) if target_path else None
+        auto_select_triggered = False
 
-        self._auto_select_pdf_and_load_cache()
+        if total == 0:
+            self._auto_select_pdf_and_load_cache()
+            return
+
+        self._list_loading_label = ctk.CTkLabel(
+            self.file_list_frame,
+            text=f"正在加载文件列表 (0/{total})...",
+            font=("Arial", 12),
+            text_color="#aeb7c2",
+            anchor="w"
+        )
+        self._list_loading_label.pack(fill="x", padx=6, pady=(8, 4), side="bottom")
+
+        def render_next_batch(start_index=0):
+            nonlocal auto_select_triggered
+            if render_id != self._list_render_id:
+                return
+
+            end_index = min(start_index + batch_size, total)
+            for list_index in range(start_index, end_index):
+                filename = pdf_list[list_index]
+                file_path = self.pdf_files[list_index]
+                cache_path = self._build_cache_path(file_path)
+                cache_tag = " 🟢 [已缓存]" if os.path.exists(cache_path) else ""
+                display_text = f"{list_index + 1}. {filename}{cache_tag}"
+                btn = ctk.CTkButton(
+                    self.file_list_frame,
+                    text=display_text,
+                    font=("Arial", 12),
+                    fg_color="transparent",
+                    hover_color="#383d45",
+                    text_color="#d7dbe1",
+                    anchor="w",
+                    height=34,
+                    corner_radius=12,
+                    border_width=1,
+                    border_color="#333842",
+                    state="disabled" if self.current_ocr_state == OcrState.RUNNING else "normal",
+                    command=lambda i=list_index: self.on_file_select(i)
+                )
+                btn.pack(fill="x", padx=4, pady=3)
+                self.file_item_buttons.append(btn)
+
+            if self._list_loading_label and self._list_loading_label.winfo_exists():
+                self._list_loading_label.configure(text=f"正在加载文件列表 ({end_index}/{total})...")
+
+            if not auto_select_triggered:
+                is_first_batch = start_index == 0
+                target_in_rendered = (target_index is not None and target_index < end_index)
+                if is_first_batch or target_in_rendered:
+                    auto_select_triggered = True
+                    self._auto_select_pdf_and_load_cache()
+
+            if end_index >= total:
+                if self._list_loading_label and self._list_loading_label.winfo_exists():
+                    self._list_loading_label.destroy()
+                self._list_loading_label = None
+                return
+
+            self.after(20, lambda: render_next_batch(end_index))
+
+        render_next_batch(0)
 
     def _auto_select_pdf_and_load_cache(self):
         if not self.pdf_files:
@@ -366,6 +474,7 @@ class OCRScreen(ctk.CTkFrame):
         if not self.selected_pdf_path:
             messagebox.showwarning("提示", "请先在左侧选择一个 PDF 文件。")
             return
+        self._set_ocr_state(OcrState.RUNNING)
         self.ocr_task_id += 1
         task_id = self.ocr_task_id
         self.ocr_cancel_event = threading.Event()
@@ -395,6 +504,7 @@ class OCRScreen(ctk.CTkFrame):
     def _show_ocr_text_result(self, ocr_pages, task_id, from_cache):
         if task_id != self.ocr_task_id:
             return
+        self._set_ocr_state(OcrState.DONE)
         if not ocr_pages:
             ocr_pages = ["未识别到文本内容。"]
         self._set_ocr_pages(ocr_pages)
@@ -408,6 +518,7 @@ class OCRScreen(ctk.CTkFrame):
     def _handle_ocr_cancelled(self, task_id):
         if task_id != self.ocr_task_id:
             return
+        self._set_ocr_state(OcrState.CANCELLED)
         self.ocr_progress_label.configure(text="OCR 状态：已取消")
         self.ocr_progress_bar.set(0)
         self._set_ocr_pages(["OCR 任务已取消，已清理本次半成品文本。"])
@@ -415,6 +526,7 @@ class OCRScreen(ctk.CTkFrame):
     def _handle_ocr_failed(self, task_id, reason):
         if task_id != self.ocr_task_id:
             return
+        self._set_ocr_state(OcrState.ERROR)
         self.ocr_progress_label.configure(text="OCR 状态：失败")
         self.ocr_progress_bar.set(0)
         messagebox.showerror("OCR 失败", reason)
@@ -559,9 +671,17 @@ class OCRScreen(ctk.CTkFrame):
             self.ocr_progress_bar.set(0)
 
     def clear_ocr_cache(self):
+        confirmed = messagebox.askyesno(
+            "严重警告",
+            "这将删除所有历史档案的 OCR 识别记录（不可恢复），是否确定？"
+        )
+        if not confirmed:
+            return
+
         if not os.path.exists(self.ocr_cache_dir):
             os.makedirs(self.ocr_cache_dir)
             messagebox.showinfo("提示", "缓存目录不存在，已自动创建。")
+            self._load_file_list()
             return
 
         removed_count = 0
@@ -578,8 +698,45 @@ class OCRScreen(ctk.CTkFrame):
 
         if failed_count > 0:
             messagebox.showwarning("提示", f"已清理 {removed_count} 个缓存文件，另有 {failed_count} 个文件删除失败。")
+        else:
+            messagebox.showinfo("提示", f"缓存已清空，共删除 {removed_count} 个文件。")
+        self._load_file_list()
+
+    def clear_current_file_cache(self):
+        if not self.selected_pdf_path:
+            messagebox.showwarning("提示", "请先在左侧选择一个 PDF 文件。")
             return
-        messagebox.showinfo("提示", f"缓存已清空，共删除 {removed_count} 个文件。")
+
+        current_pdf_name = os.path.basename(self.selected_pdf_path)
+        cache_path = self._build_cache_path(self.selected_pdf_path)
+        if not os.path.exists(cache_path):
+            messagebox.showinfo("提示", "当前文件无缓存。")
+            return
+
+        try:
+            os.remove(cache_path)
+            messagebox.showinfo("提示", "当前文件缓存已删除。")
+            self._load_file_list()
+            self._set_ocr_state(OcrState.IDLE)
+            self._set_ocr_pages([f"已删除 {current_pdf_name} 的 OCR 缓存。\n点击“开始 OCR 识别”或“🔄 强制重新识别”生成新的文本。"])
+            self.ocr_progress_label.configure(text="OCR 状态：文件已就绪，等待开始")
+            self.ocr_progress_bar.set(0)
+        except OSError as e:
+            messagebox.showerror("错误", f"删除当前缓存失败:\n{e}")
+
+    def force_re_recognize(self):
+        if not self.selected_pdf_path:
+            messagebox.showwarning("提示", "请先在左侧选择一个 PDF 文件。")
+            return
+
+        cache_path = self._build_cache_path(self.selected_pdf_path)
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+        self._load_file_list()
+        self.start_ocr_recognition()
 
     def _detect_text_from_image(self, image_bytes, api_key):
         # 1. 配置钥匙
