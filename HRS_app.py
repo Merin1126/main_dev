@@ -1,3 +1,4 @@
+from config.settings import APP_VERSION
 from components.HRS_navigation import Navigation
 import customtkinter as ctk
 # from components.navigation import Navigation
