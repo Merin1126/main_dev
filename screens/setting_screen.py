@@ -25,8 +25,8 @@ class SettingScreen(ctk.CTkFrame):
 
         ctk.CTkLabel(
             container,
-            text="⚙️ 系统与环境设置",
-            font=("Arial", 22, "bold")
+            text="\U0000E690 系统与环境设置",
+            font=("Symbols Nerd Font", 22, "bold")
         ).pack(anchor="w", padx=16, pady=(16, 8))
 
         ctk.CTkLabel(

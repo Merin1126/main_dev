@@ -1,5 +1,5 @@
 import customtkinter as ctk
-from config.settings import Color
+from config.settings import Color, APP_VERSION
 
 class Navigation(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
@@ -16,30 +16,38 @@ class Navigation(ctk.CTkFrame):
         self.current_screen = "scraper"
 
         self.nav_config = [
-            {"icon": "🚀", "label": "史料高并发抓取", "screen": "scraper"},
-            {"icon": "👁️", "label": "史料 OCR 校对", "screen": "ocr"},
-            {"icon": "⚙️", "label": "系统与环境设置", "screen": "setting"},
+            {"icon": "\uf409", "label": "史料下载", "screen": "scraper"},
+            {"icon": "\uf05f", "label": "史料校对", "screen": "ocr"},
+            {"icon": "\ue690", "label": "系统设置", "screen": "setting"},
         ]
         self.nav_buttons = {}
         self.pack_propagate(False)
 
         # ================= 顶部 Logo/标题区 =================
         self.title_container = ctk.CTkFrame(self, fg_color=Color.TRANSPARENT)
-        self.title_container.pack(pady=(34, 20), padx=10)
+        self.title_container.pack(pady=(34, 0), padx=10)
 
         self.title_label = ctk.CTkLabel(
             self.title_container, text="HRS",
             font=("Arial", 26, "bold"), text_color=Color.TEXT_WHITE, cursor="hand2"
         )
         self.title_label.pack()
-        self.title_label.bind("<Button-1>", self.toggle_navigation)
 
         self.version_label = ctk.CTkLabel(
-            self.title_container, text="V2.2",
+            self.title_container, text=APP_VERSION,
             font=("Arial", 11), text_color=Color.TEXT_MUTED
         )
         self.version_label.pack(pady=(2, 0))
-        self.version_label.bind("<Button-1>", self.toggle_navigation)
+
+        self.menu_icon_label = ctk.CTkLabel(
+            self.title_container,
+            text="\U000f035c",
+            font=("Symbols Nerd Font", 24),
+            text_color=Color.TEXT_WHITE,
+            cursor="hand2"
+        )
+        self.menu_icon_label.pack(pady=(6, 5))
+        self.menu_icon_label.bind("<Button-1>", self.toggle_navigation)
 
         # ================= 中间 导航按钮区 =================
         self.nav_btn_container = ctk.CTkFrame(self, fg_color=Color.TRANSPARENT)
@@ -49,7 +57,7 @@ class Navigation(ctk.CTkFrame):
             btn = ctk.CTkButton(
                 self.nav_btn_container,
                 text=item["icon"],
-                font=("Arial", 18),
+                font=("Symbols Nerd Font", 18),
                 fg_color=Color.TRANSPARENT,
                 text_color=Color.TEXT_MUTED,
                 hover_color=Color.BG_HOVER,
@@ -175,9 +183,13 @@ class Navigation(ctk.CTkFrame):
         for item in self.nav_config:
             btn = self.nav_buttons[item["screen"]]
             if expanded:
-                btn.configure(text=f'{item["icon"]}  {item["label"]}', font=("Arial", 15, "bold"), anchor="w")
+                btn.configure(
+                    text=f'{item["icon"]}  {item["label"]}',
+                    font=("Symbols Nerd Font", 15, "bold"),
+                    anchor="w"
+                )
             else:
-                btn.configure(text=item["icon"], font=("Arial", 18), anchor="center")
+                btn.configure(text=item["icon"], font=("Symbols Nerd Font", 18), anchor="center")
 
     def _blend_hex(self, start_hex, end_hex, ratio):
         def _hex_to_rgb(hex_color):

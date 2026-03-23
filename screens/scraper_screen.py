@@ -21,7 +21,7 @@ class ScraperScreen(ctk.CTkFrame):
 
     def _setup_ui(self):
         # 页面大标题
-        title_lbl = ctk.CTkLabel(self, text="🚀 史料高并发抓取控制台", font=("Arial", 28, "bold"))
+        title_lbl = ctk.CTkLabel(self, text="史料下载控制台", font=("Arial", 28, "bold"))
         title_lbl.pack(pady=(30, 10))
 
         # 中间的圆角主容器 (Main Card Container)
@@ -29,16 +29,28 @@ class ScraperScreen(ctk.CTkFrame):
         container.pack(pady=20, padx=40, fill="both", expand=True)
 
         # ================= 表单输入区 =================
-        ctk.CTkLabel(container, text="🔍 检索关键词:", font=("Arial", 15, "bold")).pack(pady=(30, 5))
+        ctk.CTkLabel(
+            container,
+            text="\ue68f 检索关键词:",
+            font=("Symbols Nerd Font", 15, "bold")
+        ).pack(pady=(30, 5))
         # 使用你刚移植的高级 Input 组件
         self.entry_keyword = Input(container, width=400, defaultValue="反帝國主義")
         self.entry_keyword.pack()
 
-        ctk.CTkLabel(container, text="📅 起始年份 (如 1921):", font=("Arial", 15, "bold")).pack(pady=(20, 5))
+        ctk.CTkLabel(
+            container,
+            text="\U000f0e17 起始年份 (如 1921):",
+            font=("Symbols Nerd Font", 15, "bold")
+        ).pack(pady=(20, 5))
         self.entry_start_year = Input(container, width=400, defaultValue="1921")
         self.entry_start_year.pack()
 
-        ctk.CTkLabel(container, text="📅 结束年份 (如 1927):", font=("Arial", 15, "bold")).pack(pady=(20, 5))
+        ctk.CTkLabel(
+            container,
+            text="\U000f0e17 结束年份 (如 1927):",
+            font=("Symbols Nerd Font", 15, "bold")
+        ).pack(pady=(20, 5))
         self.entry_end_year = Input(container, width=400, defaultValue="1927")
         self.entry_end_year.pack()
 
@@ -48,7 +60,7 @@ class ScraperScreen(ctk.CTkFrame):
 
         # 使用你刚移植的高级 Button 组件
         self.btn_start = Button(
-            btn_frame, text="🚀 开始抓取", width=160, 
+            btn_frame, text="开始抓取", width=160,
             fg_color=Color.BTN_SUCCESS_ALT, hover_color=Color.BTN_SUCCESS_ALT_HOVER, 
             command=self.start_scraping_thread
         )

@@ -77,7 +77,18 @@ class OCRScreen(ctk.CTkFrame):
         self.left_frame = ctk.CTkFrame(self.paned_window, corner_radius=10)
         self.paned_window.add(self.left_frame, minsize=150, stretch="always")
         
-        ctk.CTkLabel(self.left_frame, text="📁 史料文件库", font=("Arial", 16, "bold")).pack(pady=10)
+        file_library_title = ctk.CTkFrame(self.left_frame, fg_color=Color.TRANSPARENT)
+        file_library_title.pack(pady=10)
+        ctk.CTkLabel(
+            file_library_title,
+            text="\U0000EAEB",
+            font=("Symbols Nerd Font", 20, "bold")
+        ).pack(side="left")
+        ctk.CTkLabel(
+            file_library_title,
+            text=" 史料文件库",
+            font=("Arial", 16, "bold")
+        ).pack(side="left")
         
         list_container = ctk.CTkFrame(self.left_frame, fg_color=Color.TRANSPARENT)
         list_container.pack(fill="both", expand=True, padx=5, pady=5)
@@ -131,7 +142,11 @@ class OCRScreen(ctk.CTkFrame):
         self.action_frame = ctk.CTkFrame(self.paned_window, corner_radius=10)
         self.paned_window.add(self.action_frame, minsize=180, stretch="never")
 
-        ctk.CTkLabel(self.action_frame, text="⚙️ 操作区", font=("Arial", 15, "bold")).pack(pady=(12, 8), padx=10)
+        ctk.CTkLabel(
+            self.action_frame,
+            text="\U0000F013 操作区",
+            font=("Symbols Nerd Font", 15, "bold")
+        ).pack(pady=(12, 8), padx=10)
 
         self.btn_start_ocr = Button(
             self.action_frame,
@@ -145,7 +160,8 @@ class OCRScreen(ctk.CTkFrame):
 
         self.btn_force_reocr = Button(
             self.action_frame,
-            text="🔄 强制重新识别",
+            text="\U0000F079 强制重新识别",
+            fontFamily="Symbols Nerd Font",
             fg_color=Color.BTN_PRIMARY_ALT,
             hover_color=Color.BTN_PRIMARY_ALT_HOVER,
             height=36,
@@ -165,7 +181,8 @@ class OCRScreen(ctk.CTkFrame):
 
         self.btn_clear_current_cache = Button(
             self.action_frame,
-            text="🗑️ 删除当前缓存",
+            text="\U000F01B4 删除当前缓存",
+            fontFamily="Symbols Nerd Font",
             fg_color=Color.BG_BUTTON_MUTED,
             hover_color=Color.BG_BUTTON_MUTED_HOVER,
             height=36,
@@ -175,7 +192,8 @@ class OCRScreen(ctk.CTkFrame):
 
         self.btn_clear_cache = Button(
             self.action_frame,
-            text="🗑️ 删除全部缓存",
+            text="\U000F01B4 删除全部缓存",
+            fontFamily="Symbols Nerd Font",
             fg_color=Color.BG_BUTTON_MUTED_HOVER,
             hover_color=Color.BG_BUTTON_NEUTRAL_HOVER,
             height=36,
@@ -184,7 +202,9 @@ class OCRScreen(ctk.CTkFrame):
         self.btn_clear_cache.pack(pady=(0, 8), padx=12, fill="x")
 
         self.btn_export = Button(
-            self.action_frame, text="💾 确认并导出文档",
+            self.action_frame,
+            text="\U0000EA7F 确认并导出文档",
+            fontFamily="Symbols Nerd Font",
             fg_color=Color.PRIMARY, hover_color=Color.PRIMARY_HOVER,
             height=40, command=self.export_document
         )
@@ -207,7 +227,11 @@ class OCRScreen(ctk.CTkFrame):
         self.right_frame = ctk.CTkFrame(self.paned_window, corner_radius=10)
         self.paned_window.add(self.right_frame, minsize=260, stretch="always")
 
-        ctk.CTkLabel(self.right_frame, text="📝 OCR 文字校对区", font=("Arial", 16, "bold")).pack(pady=10)
+        ctk.CTkLabel(
+            self.right_frame,
+            text="\U0000F14B OCR 文字校对区",
+            font=("Symbols Nerd Font", 16, "bold")
+        ).pack(pady=10)
 
         text_page_toolbar = ctk.CTkFrame(self.right_frame, fg_color=Color.TRANSPARENT)
         text_page_toolbar.pack(fill="x", padx=10, pady=(0, 6))
@@ -719,7 +743,9 @@ class OCRScreen(ctk.CTkFrame):
             messagebox.showinfo("提示", "当前文件缓存已删除。")
             self._load_file_list()
             self._set_ocr_state(OcrState.IDLE)
-            self._set_ocr_pages([f"已删除 {current_pdf_name} 的 OCR 缓存。\n点击“开始 OCR 识别”或“🔄 强制重新识别”生成新的文本。"])
+            self._set_ocr_pages([
+                f"已删除 {current_pdf_name} 的 OCR 缓存。\n点击“开始 OCR 识别”或“\U0000F079 强制重新识别”生成新的文本。"
+            ])
             self.ocr_progress_label.configure(text="OCR 状态：文件已就绪，等待开始")
             self.ocr_progress_bar.set(0)
         except OSError as e:

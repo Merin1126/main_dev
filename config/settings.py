@@ -4,6 +4,9 @@ from pathlib import Path
 # 定义项目根目录
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+#全局版本号配置
+APP_VERSION = "V2.5.1"
+
 # 保留给未来可能需要的图片组件结构
 imagesTupple = namedtuple("images", ["light", "dark"])
 
@@ -82,9 +85,9 @@ class Color:
 class ScreenName:
     """HRS V2.2 全局视图路由名称"""
     SCRAPER = "scraper"
-    SCRAPER_TITLE = "史料高并发抓取"
+    SCRAPER_TITLE = "史料下载"
     OCR = "ocr"
-    OCR_TITLE = "史料 OCR 校对"
+    OCR_TITLE = "史料校对"
     SETTING = "setting"
     SETTING_TITLE = "系统与环境设置"
 

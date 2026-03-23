@@ -10,7 +10,7 @@ class HRSApp(ctk.CTk):
         # 1. 基础窗口设置
         self.width = 1260
         self.height = 700
-        self.title("HRS 史料全自动采集器 V2.2")
+        self.title(f"HRS 史料库下载与校对工具 {APP_VERSION}")
         self.minsize(800, 600)
         self._center_window() # 调用原作者优雅的居中算法
 
