@@ -5,9 +5,9 @@ from tkinter import messagebox
 from components.ui.button import Button
 from config.settings import Color
 from config.api_key_store import (
-    load_google_api_key,
-    save_google_api_key,
-    clear_google_api_key,
+    load_google_api_key as load_gemini_api_key,
+    save_google_api_key as save_gemini_api_key,
+    clear_google_api_key as clear_gemini_api_key,
     mask_api_key,
 )
 
@@ -31,7 +31,7 @@ class SettingScreen(ctk.CTkFrame):
 
         ctk.CTkLabel(
             container,
-            text="Google Vision API Key（本地保存，不写入代码）",
+            text="Google Gemini API Key（本地保存，不写入代码）",
             font=("Arial", 14)
         ).pack(anchor="w", padx=16, pady=(8, 6))
 
@@ -40,7 +40,7 @@ class SettingScreen(ctk.CTkFrame):
             width=520,
             height=40,
             show="*",
-            placeholder_text="请输入 Google Vision API Key"
+            placeholder_text="请输入 Google Gemini API Key"
         )
         self.api_entry.pack(anchor="w", padx=16, pady=(0, 8))
 
@@ -77,7 +77,7 @@ class SettingScreen(ctk.CTkFrame):
         ).pack(anchor="w", padx=16, pady=(2, 16))
 
     def _load_config(self):
-        key = load_google_api_key()
+        key = load_gemini_api_key()
         if key:
             self.api_hint_label.configure(text=f"当前状态：已配置（{mask_api_key(key)}）")
         else:
@@ -88,17 +88,18 @@ class SettingScreen(ctk.CTkFrame):
         if not raw_key:
             messagebox.showwarning("提示", "请输入 API Key 后再保存。")
             return
-        save_google_api_key(raw_key)
+        save_gemini_api_key(raw_key)
         self.api_entry.delete(0, "end")
         self.api_hint_label.configure(text=f"当前状态：已配置（{mask_api_key(raw_key)}）")
-        messagebox.showinfo("成功", "API Key 已保存到本地安全配置。")
+        messagebox.showinfo("成功", "Gemini API Key 已保存到本地安全配置。")
 
     def clear_api_key(self):
-        removed = clear_google_api_key()
-        os.environ.pop("GOOGLE_VISION_API_KEY", None)
+        removed = clear_gemini_api_key()
+        os.environ.pop("GOOGLE_GEMINI_API_KEY", None)
+        os.environ.pop("GOOGLE_VISION_API_KEY", None)  # 兼容清理旧变量
         self.api_entry.delete(0, "end")
         self.api_hint_label.configure(text="当前状态：未配置")
         if removed:
-            messagebox.showinfo("成功", "已清空本地 API Key 配置。")
+            messagebox.showinfo("成功", "已清空本地 Gemini API Key 配置。")
         else:
-            messagebox.showinfo("提示", "未检测到本地 API Key 文件，当前已是未配置状态。")
+            messagebox.showinfo("提示", "未检测到本地 Gemini API Key 文件，当前已是未配置状态。")

@@ -41,3 +41,4 @@ Thumbs.db
 # 7. 日志文件
 *.log
 *.md
+api_cost_log.csv

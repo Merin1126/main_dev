@@ -18,7 +18,8 @@ from docx import Document
 
 from components.ui.button import Button
 from config.settings import Color
-from config.api_key_store import load_google_api_key
+from config.api_key_store import load_google_api_key as load_gemini_api_key
+from utils.token_logger import log_gemini_usage
 
 class OcrState(Enum):
     IDLE = auto()
@@ -31,7 +32,10 @@ class OCRScreen(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
         super().__init__(master, fg_color=Color.TRANSPARENT, **kwargs)
         self.master = master
-        self.google_api_key = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
+        self.gemini_api_key = (
+            os.getenv("GOOGLE_GEMINI_API_KEY", "").strip()
+            or os.getenv("GOOGLE_VISION_API_KEY", "").strip()
+        )
 
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.download_dir = os.path.join(base_dir, "JACAR_Downloads")
@@ -57,6 +61,12 @@ class OCRScreen(ctk.CTkFrame):
         self.current_ocr_state = OcrState.IDLE
         self.ocr_pages = []
         self.current_ocr_page_index = 0
+        self.session_prompt_non_cached = 0
+        self.session_cached_tokens = 0
+        self.session_output_tokens = 0
+        self.session_total_tokens = 0
+        self.session_cost_jpy = 0.0
+        self.session_cost_cny = 0.0
 
         self._setup_ui()
         self._update_ui_by_state()
@@ -148,6 +158,23 @@ class OCRScreen(ctk.CTkFrame):
             font=("Symbols Nerd Font", 15, "bold")
         ).pack(pady=(12, 8), padx=10)
 
+        ctk.CTkLabel(
+            self.action_frame,
+            text="选择模型：",
+            font=("Arial", 13, "bold")
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
+        self.selected_model_var = ctk.StringVar(value="gemini-3-flash-preview")
+        self.model_option_menu = ctk.CTkOptionMenu(
+            self.action_frame,
+            values=["gemini-3-flash-preview", "gemini-3.1-pro-preview"],
+            variable=self.selected_model_var,
+            command=lambda _value: self._refresh_usage_summary_label(),
+            fg_color=Color.BG_HOVER,
+            button_color=Color.PRIMARY
+        )
+        self.model_option_menu.pack(fill="x", padx=12, pady=(0, 10))
+
         self.btn_start_ocr = Button(
             self.action_frame,
             text="开始 OCR 识别",
@@ -223,6 +250,14 @@ class OCRScreen(ctk.CTkFrame):
         self.ocr_progress_bar = ctk.CTkProgressBar(self.action_frame)
         self.ocr_progress_bar.pack(fill="x", padx=12, pady=(0, 12))
         self.ocr_progress_bar.set(0)
+        self.usage_summary_label = ctk.CTkLabel(
+            self.action_frame,
+            text="本次任务累计：Token=0 | JPY=0.0000 | CNY=0.0000",
+            font=("Arial", 12),
+            justify="left",
+            anchor="w"
+        )
+        self.usage_summary_label.pack(fill="x", padx=12, pady=(0, 12))
 
         self.right_frame = ctk.CTkFrame(self.paned_window, corner_radius=10)
         self.paned_window.add(self.right_frame, minsize=260, stretch="always")
@@ -278,6 +313,38 @@ class OCRScreen(ctk.CTkFrame):
     def _on_action_frame_resize(self, event):
         wrap_length = max(80, event.width - 24)
         self.ocr_progress_label.configure(wraplength=wrap_length)
+        self.usage_summary_label.configure(wraplength=wrap_length)
+
+    def _reset_usage_summary(self):
+        self.session_prompt_non_cached = 0
+        self.session_cached_tokens = 0
+        self.session_output_tokens = 0
+        self.session_total_tokens = 0
+        self.session_cost_jpy = 0.0
+        self.session_cost_cny = 0.0
+        self._refresh_usage_summary_label()
+
+    def _refresh_usage_summary_label(self):
+        current_model = self.selected_model_var.get() if hasattr(self, "selected_model_var") else "N/A"
+        self.usage_summary_label.configure(
+            text=(
+                f"模型={current_model} | "
+                f"本次任务累计：Token={self.session_total_tokens} | "
+                f"JPY={self.session_cost_jpy:.4f} | "
+                f"CNY={self.session_cost_cny:.4f}"
+            )
+        )
+
+    def _accumulate_usage_summary(self, usage_summary):
+        if not usage_summary:
+            return
+        self.session_prompt_non_cached += int(usage_summary.get("prompt_non_cached", 0))
+        self.session_cached_tokens += int(usage_summary.get("cached_content_token_count", 0))
+        self.session_output_tokens += int(usage_summary.get("candidates_token_count", 0))
+        self.session_total_tokens += int(usage_summary.get("total_token_count", 0))
+        self.session_cost_jpy += float(usage_summary.get("cost_jpy", 0.0))
+        self.session_cost_cny += float(usage_summary.get("cost_cny", 0.0))
+        self._refresh_usage_summary_label()
 
     def _set_ocr_state(self, new_state):
         def apply_state():
@@ -472,7 +539,7 @@ class OCRScreen(ctk.CTkFrame):
             self.render_page()
 
             if not self._load_cached_ocr_for_pdf(file_path):
-                self._set_ocr_pages([f"已加载文件：{os.path.basename(file_path)}\n点击“开始 OCR 识别”后将调用 Google API。"])
+                self._set_ocr_pages([f"已加载文件：{os.path.basename(file_path)}\n点击“开始 OCR 识别”后将调用 Gemini API。"])
                 self.ocr_progress_label.configure(text="OCR 状态：文件已就绪，等待开始")
                 self.ocr_progress_bar.set(0)
         except Exception as e:
@@ -499,11 +566,12 @@ class OCRScreen(ctk.CTkFrame):
         if not self.selected_pdf_path:
             messagebox.showwarning("提示", "请先在左侧选择一个 PDF 文件。")
             return
+        self._reset_usage_summary()
         self._set_ocr_state(OcrState.RUNNING)
         self.ocr_task_id += 1
         task_id = self.ocr_task_id
         self.ocr_cancel_event = threading.Event()
-        self._set_ocr_pages([f"正在调用 Google API 提取 {os.path.basename(self.selected_pdf_path)} 的文字...\n请稍候，正在逐页识别。"])
+        self._set_ocr_pages([f"正在调用 Gemini API 提取 {os.path.basename(self.selected_pdf_path)} 的文字...\n请稍候，正在逐页识别。"])
         self.ocr_progress_label.configure(text="OCR 状态：准备开始")
         self.ocr_progress_bar.set(0)
         self._start_ocr_worker(self.selected_pdf_path, task_id)
@@ -514,7 +582,7 @@ class OCRScreen(ctk.CTkFrame):
 
     def _run_ocr_worker(self, file_path, task_id):
         try:
-            ocr_pages, from_cache = self._extract_text_with_google_ocr(file_path, task_id)
+            ocr_pages, from_cache = self._extract_text_with_gemini_ocr(file_path, task_id)
             self.after(0, lambda: self._show_ocr_text_result(ocr_pages, task_id, from_cache))
         except RuntimeError as e:
             err_msg = str(e)
@@ -555,12 +623,18 @@ class OCRScreen(ctk.CTkFrame):
         self.ocr_progress_label.configure(text="OCR 状态：失败")
         self.ocr_progress_bar.set(0)
         messagebox.showerror("OCR 失败", reason)
-        self.text_editor.insert("end", "\n\nOCR 失败，请检查网络连接和 GOOGLE_VISION_API_KEY 配置。")
+        self.text_editor.insert("end", "\n\nOCR 失败，请检查网络连接和 GOOGLE_GEMINI_API_KEY 配置。")
 
-    def _extract_text_with_google_ocr(self, pdf_path, task_id):
-        api_key = os.getenv("GOOGLE_VISION_API_KEY", "").strip() or load_google_api_key()
+    def _extract_text_with_gemini_ocr(self, pdf_path, task_id):
+        api_key = (
+            os.getenv("GOOGLE_GEMINI_API_KEY", "").strip()
+            or os.getenv("GOOGLE_VISION_API_KEY", "").strip()
+            or load_gemini_api_key()
+        )
         if not api_key:
-            raise RuntimeError("未检测到 GOOGLE_VISION_API_KEY。请先在系统环境变量中配置后再使用 OCR。")
+            raise RuntimeError(
+                "未检测到 GOOGLE_GEMINI_API_KEY。请先配置该环境变量后再使用 OCR。"
+            )
 
         cache_path = self._build_cache_path(pdf_path)
         if os.path.exists(cache_path):
@@ -583,7 +657,12 @@ class OCRScreen(ctk.CTkFrame):
 
                 pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
                 image_bytes = pix.tobytes("png")
-                page_text = self._detect_text_from_image(image_bytes, api_key)
+                page_text = self._detect_text_from_image(
+                    image_bytes,
+                    api_key,
+                    file_name=f"{os.path.basename(pdf_path)}_第{page_index + 1}页",
+                    model_name=self.selected_model_var.get(),
+                )
                 all_page_texts.append(page_text.strip() if page_text else "（本页未识别到文本）")
 
         cache_payload = json.dumps({"format": "paged_v1", "pages": all_page_texts}, ensure_ascii=False)
@@ -765,7 +844,13 @@ class OCRScreen(ctk.CTkFrame):
         self._load_file_list()
         self.start_ocr_recognition()
 
-    def _detect_text_from_image(self, image_bytes, api_key):
+    def _detect_text_from_image(
+        self,
+        image_bytes,
+        api_key,
+        file_name="未知图片",
+        model_name="gemini-3.1-pro-preview",
+    ):
         # 1. 配置钥匙
         client = genai.Client(api_key=api_key)
         image = Image.open(io.BytesIO(image_bytes))
@@ -784,7 +869,7 @@ class OCRScreen(ctk.CTkFrame):
         try:
             # 将安全设置和提示词一并发送给 Gemini 3.1 Pro
             response = client.models.generate_content(
-                model='gemini-3.1-pro-preview',
+                model=model_name,
                 contents=[academic_prompt, image],
                 config=types.GenerateContentConfig(
                     safety_settings=[
@@ -807,6 +892,12 @@ class OCRScreen(ctk.CTkFrame):
                     ]
                 )
             )
+            usage_summary = log_gemini_usage(
+                getattr(response, "usage_metadata", None),
+                file_name,
+                model_name
+            )
+            self.after(0, lambda s=usage_summary: self._accumulate_usage_summary(s))
             return response.text
             
         except Exception as e:

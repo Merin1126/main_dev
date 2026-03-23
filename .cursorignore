@@ -36,3 +36,4 @@ env/
 
 # 7. 系统默认文件
 .DS_Store
+api_cost_log.csv
