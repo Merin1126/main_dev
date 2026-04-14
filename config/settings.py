@@ -5,7 +5,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 #全局版本号配置
-APP_VERSION = "V2.5.1"
+APP_VERSION = "V2.6.2"
 
 # 保留给未来可能需要的图片组件结构
 imagesTupple = namedtuple("images", ["light", "dark"])
@@ -88,6 +88,10 @@ class ScreenName:
     SCRAPER_TITLE = "史料下载"
     OCR = "ocr"
     OCR_TITLE = "史料校对"
+    TRANSLATION = "translation"
+    TRANSLATION_TITLE = "史料翻译"
+    ANALYSIS = "analysis"
+    ANALYSIS_TITLE = "史料分析"
     SETTING = "setting"
     SETTING_TITLE = "系统与环境设置"
 
@@ -95,5 +99,7 @@ class ScreenName:
 LIST_SCREEN = [
     ScreenName.SCRAPER,
     ScreenName.OCR,
+    ScreenName.TRANSLATION,
+    ScreenName.ANALYSIS,
     ScreenName.SETTING,
 ]

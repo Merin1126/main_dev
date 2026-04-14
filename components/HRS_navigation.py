@@ -18,6 +18,8 @@ class Navigation(ctk.CTkFrame):
         self.nav_config = [
             {"icon": "\uf409", "label": "史料下载", "screen": "scraper"},
             {"icon": "\uf05f", "label": "史料校对", "screen": "ocr"},
+            {"icon": "\uf1ab", "label": "史料翻译", "screen": "translation"},
+            {"icon": "\uf080", "label": "史料分析", "screen": "analysis"},
             {"icon": "\ue690", "label": "系统设置", "screen": "setting"},
         ]
         self.nav_buttons = {}
