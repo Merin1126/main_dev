@@ -28,6 +28,13 @@ class OcrState(Enum):
     ERROR = auto()
     CANCELLED = auto()
 
+
+# Font Awesome glyphs (Private Use Area) — Symbols Nerd Font
+_TREE_ICON_FOLDER_CLOSED = "\uf07b"  # 折叠
+_TREE_ICON_FOLDER_OPEN = "\uf07c"  # 展开
+_TREE_ICON_PDF = "\uf1c1"
+
+
 class OCRScreen(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
         super().__init__(master, fg_color=Color.TRANSPARENT, **kwargs)
@@ -54,8 +61,8 @@ class OCRScreen(ctk.CTkFrame):
         self.file_item_buttons = []
         self.selected_file_index = None
         self.selected_pdf_path = None
-        self._list_render_id = 0
-        self._list_loading_label = None
+        self.expanded_folders = {}
+        self._pdf_path_to_index = {}
         self.ocr_cancel_event = threading.Event()
         self.ocr_task_id = 0
         self.current_ocr_state = OcrState.IDLE
@@ -458,93 +465,150 @@ class OCRScreen(ctk.CTkFrame):
             if btn.winfo_exists():
                 btn.configure(state=common_state)
 
-    def _load_file_list(self):
-        self._list_render_id += 1
-        render_id = self._list_render_id
-        batch_size = 30
+    @staticmethod
+    def _norm_path(p):
+        return os.path.normpath(os.path.abspath(p))
 
+    def _collect_pdfs_dfs(self, root_dir):
+        """深度优先：先各子目录（按名排序），再当前目录下的 PDF（按名排序）。"""
+        ordered = []
+
+        def visit(d):
+            try:
+                names = os.listdir(d)
+            except OSError:
+                return
+            subdirs = sorted(
+                n
+                for n in names
+                if os.path.isdir(os.path.join(d, n)) and not n.startswith(".")
+            )
+            pdfs_here = sorted(n for n in names if n.lower().endswith(".pdf"))
+            for name in subdirs:
+                visit(os.path.join(d, name))
+            for name in pdfs_here:
+                ordered.append(os.path.join(d, name))
+
+        if os.path.isdir(root_dir):
+            visit(root_dir)
+        return ordered
+
+    def _toggle_folder_expanded(self, norm_path, child_host, folder_btn, display_name):
+        cur = self.expanded_folders.get(norm_path, True)
+        new_expanded = not cur
+        self.expanded_folders[norm_path] = new_expanded
+        icon = _TREE_ICON_FOLDER_OPEN if new_expanded else _TREE_ICON_FOLDER_CLOSED
+        folder_btn.configure(text=f"{icon}  {display_name}")
+        if new_expanded:
+            child_host.pack(fill="x", padx=0, pady=0)
+        else:
+            child_host.pack_forget()
+
+    def _render_dir_tree(self, parent, abs_dir, depth):
+        """在 parent 内渲染 abs_dir 的一层子项（子文件夹 + PDF）。"""
+        try:
+            names = os.listdir(abs_dir)
+        except OSError:
+            return
+
+        subdirs = sorted(
+            n
+            for n in names
+            if os.path.isdir(os.path.join(abs_dir, n)) and not n.startswith(".")
+        )
+        pdfs_here = sorted(n for n in names if n.lower().endswith(".pdf"))
+
+        list_state = "disabled" if self.current_ocr_state == OcrState.RUNNING else "normal"
+
+        for name in subdirs:
+            dpath = os.path.join(abs_dir, name)
+            norm = self._norm_path(dpath)
+            if norm not in self.expanded_folders:
+                self.expanded_folders[norm] = True
+            expanded = self.expanded_folders[norm]
+
+            outer = ctk.CTkFrame(parent, fg_color=Color.TRANSPARENT)
+            outer.pack(fill="x")
+
+            icon = _TREE_ICON_FOLDER_OPEN if expanded else _TREE_ICON_FOLDER_CLOSED
+            folder_btn = ctk.CTkButton(
+                outer,
+                text=f"{icon}  {name}",
+                font=("Symbols Nerd Font", 12),
+                fg_color=Color.TRANSPARENT,
+                hover_color=Color.BG_LIST_ITEM_HOVER,
+                text_color=Color.TEXT_HINT,
+                anchor="w",
+                height=34,
+                corner_radius=16,
+                border_width=1,
+                border_color=Color.BORDER_LIST_ITEM,
+                state="normal",
+            )
+            folder_btn.pack(fill="x", padx=(4 + depth * 18, 4), pady=2)
+
+            child_host = ctk.CTkFrame(outer, fg_color=Color.TRANSPARENT)
+            self._render_dir_tree(child_host, dpath, depth + 1)
+            if expanded:
+                child_host.pack(fill="x", padx=0, pady=0)
+            else:
+                child_host.pack_forget()
+
+            folder_btn.configure(
+                command=lambda n=norm, ch=child_host, b=folder_btn, dn=name: self._toggle_folder_expanded(
+                    n, ch, b, dn
+                )
+            )
+
+        for name in pdfs_here:
+            fpath = os.path.join(abs_dir, name)
+            norm_f = self._norm_path(fpath)
+            idx = self._pdf_path_to_index.get(norm_f)
+            if idx is None:
+                continue
+            cache_path = self._build_cache_path(fpath)
+            cache_tag = "   🟢 [已缓存]" if os.path.exists(cache_path) else ""
+            text = f"{_TREE_ICON_PDF}  {name}{cache_tag}"
+            btn = ctk.CTkButton(
+                parent,
+                text=text,
+                font=("Symbols Nerd Font", 12),
+                fg_color=Color.TRANSPARENT,
+                hover_color=Color.BG_LIST_ITEM_HOVER,
+                text_color=Color.TEXT_HINT,
+                anchor="w",
+                height=34,
+                corner_radius=16,
+                border_width=1,
+                border_color=Color.BORDER_LIST_ITEM,
+                state=list_state,
+                command=lambda i=idx: self.on_file_select(i),
+            )
+            btn.pack(fill="x", padx=(4 + depth * 18, 4), pady=2)
+            self.file_item_buttons.append(btn)
+
+    def _load_file_list(self):
         self.pdf_files.clear()
         self.file_item_buttons.clear()
         self.selected_file_index = None
+        self._pdf_path_to_index.clear()
 
         for widget in self.file_list_frame.winfo_children():
             widget.destroy()
 
-        self._list_loading_label = None
-        
-        if not os.path.exists(self.download_dir): return
-
-        pdf_list = [f for f in os.listdir(self.download_dir) if f.lower().endswith('.pdf')]
-        pdf_list.sort()
-
-        self.pdf_files.extend([os.path.join(self.download_dir, filename) for filename in pdf_list])
-        total = len(self.pdf_files)
-        target_path = self.selected_pdf_path if self.selected_pdf_path in self.pdf_files else (self.pdf_files[0] if self.pdf_files else None)
-        target_index = self.pdf_files.index(target_path) if target_path else None
-        auto_select_triggered = False
-
-        if total == 0:
+        if not os.path.exists(self.download_dir):
             self._auto_select_pdf_and_load_cache()
             return
 
-        self._list_loading_label = ctk.CTkLabel(
-            self.file_list_frame,
-            text=f"正在加载文件列表 (0/{total})...",
-            font=("Arial", 12),
-            text_color=Color.TEXT_HINT_SOFT,
-            anchor="w"
-        )
-        self._list_loading_label.pack(fill="x", padx=6, pady=(8, 4), side="bottom")
+        self.pdf_files = self._collect_pdfs_dfs(self.download_dir)
+        self._pdf_path_to_index = {self._norm_path(p): i for i, p in enumerate(self.pdf_files)}
 
-        def render_next_batch(start_index=0):
-            nonlocal auto_select_triggered
-            if render_id != self._list_render_id:
-                return
+        if not self.pdf_files:
+            self._auto_select_pdf_and_load_cache()
+            return
 
-            end_index = min(start_index + batch_size, total)
-            for list_index in range(start_index, end_index):
-                filename = pdf_list[list_index]
-                file_path = self.pdf_files[list_index]
-                cache_path = self._build_cache_path(file_path)
-                cache_tag = " 🟢 [已缓存]" if os.path.exists(cache_path) else ""
-                display_text = f"{list_index + 1}. {filename}{cache_tag}"
-                btn = ctk.CTkButton(
-                    self.file_list_frame,
-                    text=display_text,
-                    font=("Arial", 12),
-                    fg_color=Color.TRANSPARENT,
-                    hover_color=Color.BG_LIST_ITEM_HOVER,
-                    text_color=Color.TEXT_HINT,
-                    anchor="w",
-                    height=34,
-                    corner_radius=16,
-                    border_width=1,
-                    border_color=Color.BORDER_LIST_ITEM,
-                    state="disabled" if self.current_ocr_state == OcrState.RUNNING else "normal",
-                    command=lambda i=list_index: self.on_file_select(i)
-                )
-                btn.pack(fill="x", padx=4, pady=3)
-                self.file_item_buttons.append(btn)
-
-            if self._list_loading_label and self._list_loading_label.winfo_exists():
-                self._list_loading_label.configure(text=f"正在加载文件列表 ({end_index}/{total})...")
-
-            if not auto_select_triggered:
-                is_first_batch = start_index == 0
-                target_in_rendered = (target_index is not None and target_index < end_index)
-                if is_first_batch or target_in_rendered:
-                    auto_select_triggered = True
-                    self._auto_select_pdf_and_load_cache()
-
-            if end_index >= total:
-                if self._list_loading_label and self._list_loading_label.winfo_exists():
-                    self._list_loading_label.destroy()
-                self._list_loading_label = None
-                return
-
-            self.after(20, lambda: render_next_batch(end_index))
-
-        render_next_batch(0)
+        self._render_dir_tree(self.file_list_frame, self.download_dir, depth=0)
+        self._auto_select_pdf_and_load_cache()
 
     def _auto_select_pdf_and_load_cache(self):
         if not self.pdf_files:
@@ -554,7 +618,12 @@ class OCRScreen(ctk.CTkFrame):
             self.ocr_progress_bar.set(0)
             return
 
-        target_path = self.selected_pdf_path if self.selected_pdf_path in self.pdf_files else self.pdf_files[0]
+        sel_norm = self._norm_path(self.selected_pdf_path) if self.selected_pdf_path else None
+        match = next(
+            (p for p in self.pdf_files if self._norm_path(p) == sel_norm),
+            None,
+        )
+        target_path = match if match is not None else self.pdf_files[0]
         target_index = self.pdf_files.index(target_path)
         self.on_file_select(target_index)
 
@@ -597,6 +666,8 @@ class OCRScreen(ctk.CTkFrame):
 
     def _refresh_file_item_styles(self):
         for idx, btn in enumerate(self.file_item_buttons):
+            if not btn.winfo_exists():
+                continue
             if idx == self.selected_file_index:
                 btn.configure(
                     fg_color=Color.BG_LIST_ITEM_ACTIVE,
