@@ -171,7 +171,9 @@ def jacar_auto_search(target_keyword, start_year, end_year, update_gui_progress,
     else:
         application_path = os.path.dirname(os.path.abspath(__file__))
 
-    download_dir = os.path.join(application_path, "JACAR_Downloads")
+    base_download_dir = os.path.join(application_path, "JACAR_Downloads")
+    download_dir = os.path.join(base_download_dir, target_keyword) # 🌟 核心修改点
+
     if not os.path.exists(download_dir):
         os.makedirs(download_dir)
     
