@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 
+import customtkinter as ctk
+
+from config.academic_prompts import ANALYSIS_ACADEMIC_PROMPT
 from screens.base_screen import BaseDocumentScreen
 
 
@@ -24,35 +28,307 @@ class AnalysisScreen(BaseDocumentScreen):
         "此处将按「背景—主体—态度—价值」四维度输出结构化甄别意见，便于复核与写作引用。"
     )
 
+    def __init__(self, master, **kwargs):
+        # 父类初始化过程中会触发 _show_current_ocr_page；先准备占位属性避免启动期访问报错
+        self.form_entries: dict[str, ctk.CTkEntry] = {}
+        self.form_textboxes: dict[str, ctk.CTkTextbox] = {}
+        self.relevance_var = None
+        self._debug_popup = None
+        self._debug_popup_textbox = None
+        self._last_raw_popup_signature = None
+        self._raw_response_mode = False
+        super().__init__(master, **kwargs)
+        self.text_editor.pack_forget()
+        self._build_controlled_form()
+        # 父类初始化阶段可能已加载了当前页文本；表单建好后主动同步一次
+        self._show_current_ocr_page()
+
+    def _build_controlled_form(self) -> None:
+        self.form_entries: dict[str, ctk.CTkEntry] = {}
+        self.form_textboxes: dict[str, ctk.CTkTextbox] = {}
+        self.relevance_var = ctk.StringVar(value="未设定")
+
+        self.form_frame = ctk.CTkScrollableFrame(self.right_frame, corner_radius=8)
+        self.form_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        self._ensure_bottom_save_area_after_form()
+
+        self._add_section_title("⏳ 历史背景（Historical_Context）")
+        self._add_entry_field("Date_Written", "成文时间（Date_Written）")
+        self._add_entry_field("Author_Sender", "发文者（Author_Sender）")
+        self._add_entry_field("Recipient", "收文对象（Recipient）")
+        self._add_entry_field("Document_Type", "文书类型（Document_Type）")
+
+        self._add_section_title("👥 实体与概念（Entities_and_Concepts）")
+        self._add_text_field("Organizations", "组织机构（Organizations）", height=72)
+        self._add_text_field("Key_Figures", "关键人物（Key_Figures）", height=72)
+        self._add_text_field("All_Figures", "全部人物（All_Figures）", height=72)
+        self._add_text_field("Locations", "核心地点（Locations）", height=72)
+        self._add_text_field("Discourse_Keywords", "话语关键词（Discourse_Keywords）", height=72)
+
+        self._add_section_title("🎯 话语分析（Discourse_Analysis）")
+        self._add_text_field("Observation_Info", "观察信息（Observation_Info）", height=80)
+        self._add_text_field("Core_Judgment", "核心判断（Core_Judgment）", height=80)
+        self._add_text_field("Response_Action", "因应措施（Response_Action）", height=80)
+
+        score_wrap = ctk.CTkFrame(self.form_frame, fg_color="transparent")
+        score_wrap.pack(fill="x", pady=(4, 8))
+        ctk.CTkLabel(
+            score_wrap,
+            text="关联评分（Relevance_Score）",
+            anchor="w",
+            font=("Arial", 13, "bold"),
+        ).pack(fill="x", pady=(4, 4))
+        self.relevance_menu = ctk.CTkOptionMenu(
+            score_wrap,
+            values=["未设定", "1", "2", "3", "4", "5"],
+            variable=self.relevance_var,
+        )
+        self.relevance_menu.pack(fill="x", pady=(0, 4))
+
+    def _ensure_bottom_save_area_after_form(self) -> None:
+        """将右侧底部的“保存修改”操作区稳定放在表单下方，避免 pack before 目标未管理导致崩溃。"""
+        save_area = None
+        for child in self.right_frame.winfo_children():
+            if child is self.form_frame:
+                continue
+            # 查找包含“保存修改”按钮的直接子容器（base_screen 中的 text_action_frame）
+            try:
+                grandchildren = child.winfo_children()
+            except Exception:
+                continue
+            for g in grandchildren:
+                try:
+                    text = g.cget("text")
+                except Exception:
+                    continue
+                if isinstance(text, str) and "保存修改" in text:
+                    save_area = child
+                    break
+            if save_area is not None:
+                break
+
+        if save_area is not None:
+            save_area.pack_forget()
+            save_area.pack(fill="x", padx=8, pady=(0, 10))
+
+    def _add_section_title(self, title: str) -> None:
+        ctk.CTkLabel(
+            self.form_frame,
+            text=title,
+            anchor="w",
+            font=("Arial", 15, "bold"),
+        ).pack(fill="x", pady=(8, 6))
+
+    def _add_entry_field(self, key: str, label: str) -> None:
+        wrap = ctk.CTkFrame(self.form_frame, fg_color="transparent")
+        wrap.pack(fill="x", pady=(2, 6))
+        ctk.CTkLabel(wrap, text=label, anchor="w", font=("Arial", 13)).pack(fill="x", pady=(2, 2))
+        entry = ctk.CTkEntry(wrap)
+        entry.pack(fill="x")
+        self.form_entries[key] = entry
+
+    def _add_text_field(self, key: str, label: str, height: int = 72) -> None:
+        wrap = ctk.CTkFrame(self.form_frame, fg_color="transparent")
+        wrap.pack(fill="x", pady=(2, 8))
+        ctk.CTkLabel(wrap, text=label, anchor="w", font=("Arial", 13)).pack(fill="x", pady=(2, 2))
+        textbox = ctk.CTkTextbox(wrap, height=height)
+        textbox.pack(fill="x")
+        self.form_textboxes[key] = textbox
+
+    def _clear_form(self) -> None:
+        if self.relevance_var is None:
+            return
+        for entry in self.form_entries.values():
+            entry.delete(0, "end")
+        for textbox in self.form_textboxes.values():
+            textbox.delete("0.0", "end")
+        self.relevance_var.set("未设定")
+
+    @staticmethod
+    def _join_list(value) -> str:
+        if isinstance(value, list):
+            items = [str(v).strip() for v in value if str(v).strip()]
+            return ", ".join(items)
+        if isinstance(value, str):
+            return value.strip()
+        return ""
+
+    @staticmethod
+    def _split_list(text: str) -> list[str]:
+        normalized = (text or "").replace("，", ",")
+        return [item.strip() for item in normalized.split(",") if item.strip()]
+
+    def _set_entry_value(self, key: str, value) -> None:
+        entry = self.form_entries[key]
+        entry.delete(0, "end")
+        entry.insert(0, "" if value is None else str(value))
+
+    def _set_textbox_value(self, key: str, value) -> None:
+        textbox = self.form_textboxes[key]
+        textbox.delete("0.0", "end")
+        text = self._join_list(value)
+        if text:
+            textbox.insert("0.0", text)
+
+    def _show_current_ocr_page(self):
+        super()._show_current_ocr_page()
+        if self.relevance_var is None or not self.form_entries or not self.form_textboxes:
+            return
+        if not self.ocr_pages:
+            self._clear_form()
+            self._raw_response_mode = False
+            return
+        current_text = self.ocr_pages[self.current_ocr_page_index]
+        try:
+            payload = json.loads(current_text)
+            if not isinstance(payload, dict):
+                raise ValueError("JSON root is not an object")
+        except Exception:
+            self._clear_form()
+            self._raw_response_mode = True
+            self._maybe_show_raw_response_popup(current_text)
+            return
+        self._raw_response_mode = False
+
+        ctx = payload.get("Historical_Context", {})
+        ent = payload.get("Entities_and_Concepts", {})
+        discourse = payload.get("Discourse_Analysis", {})
+
+        self._set_entry_value("Date_Written", ctx.get("Date_Written", ""))
+        self._set_entry_value("Author_Sender", ctx.get("Author_Sender", ""))
+        self._set_entry_value("Recipient", ctx.get("Recipient", ""))
+        self._set_entry_value("Document_Type", ctx.get("Document_Type", ""))
+
+        self._set_textbox_value("Organizations", ent.get("Organizations", []))
+        self._set_textbox_value("Key_Figures", ent.get("Key_Figures", []))
+        self._set_textbox_value("All_Figures", ent.get("All_Figures", []))
+        self._set_textbox_value("Locations", ent.get("Locations", []))
+        self._set_textbox_value("Discourse_Keywords", ent.get("Discourse_Keywords", []))
+
+        self._set_textbox_value("Observation_Info", discourse.get("Observation_Info", ""))
+        self._set_textbox_value("Core_Judgment", discourse.get("Core_Judgment", ""))
+        self._set_textbox_value("Response_Action", discourse.get("Response_Action", ""))
+
+        score = discourse.get("Relevance_Score", "未设定")
+        score_text = str(score).strip() if score is not None else "未设定"
+        self.relevance_var.set(score_text if score_text in {"1", "2", "3", "4", "5"} else "未设定")
+
+    def _is_system_hint_text(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+        # 启动/引导/状态提示文案，不视为“模型异常原始响应”
+        if t == type(self).idle_editor_hint:
+            return True
+        if getattr(type(self), "missing_full_ocr_notice", None) and t == type(self).missing_full_ocr_notice:
+            return True
+        if t.startswith("已加载文件：") and "后将调用 Gemini API" in t:
+            return True
+        if t.startswith("正在调用 Gemini API"):
+            return True
+        if t.startswith(f"{type(self).task_short_name} 任务已取消"):
+            return True
+        return False
+
+    def _maybe_show_raw_response_popup(self, raw_text: str) -> None:
+        if self._is_system_hint_text(raw_text):
+            return
+        signature = (
+            getattr(self, "selected_pdf_path", None),
+            self.current_ocr_page_index,
+            hash(raw_text),
+        )
+        if signature == self._last_raw_popup_signature:
+            return
+        self._last_raw_popup_signature = signature
+        self._show_raw_response_popup(raw_text)
+
+    def _show_raw_response_popup(self, raw_text: str) -> None:
+        popup = self._debug_popup
+        if popup is None or not popup.winfo_exists():
+            popup = ctk.CTkToplevel(self)
+            popup.title("原始响应（调试）")
+            popup.geometry("860x520")
+            popup.transient(self.winfo_toplevel())
+
+            ctk.CTkLabel(
+                popup,
+                text="当前页返回内容不是合法 JSON。以下为 Gemini 原始响应（只读）：",
+                anchor="w",
+                font=("Arial", 13, "bold"),
+            ).pack(fill="x", padx=12, pady=(12, 6))
+
+            box = ctk.CTkTextbox(popup, wrap="word")
+            box.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+            box.configure(state="disabled")
+
+            def _on_close():
+                self._debug_popup = None
+                self._debug_popup_textbox = None
+                popup.destroy()
+
+            popup.protocol("WM_DELETE_WINDOW", _on_close)
+            self._debug_popup = popup
+            self._debug_popup_textbox = box
+
+        box = self._debug_popup_textbox
+        if box is not None and box.winfo_exists():
+            box.configure(state="normal")
+            box.delete("0.0", "end")
+            box.insert("0.0", raw_text or "")
+            box.configure(state="disabled")
+        self._debug_popup.lift()
+        self._debug_popup.focus_force()
+
+    def _save_current_ocr_page(self):
+        if self._raw_response_mode:
+            # 当前页是非 JSON 原始响应模式：保留原文，不用空表单覆盖缓存。
+            return
+        if not self.ocr_pages:
+            self.ocr_pages = [""]
+            self.current_ocr_page_index = 0
+        if self.current_ocr_page_index < 0:
+            self.current_ocr_page_index = 0
+        if self.current_ocr_page_index >= len(self.ocr_pages):
+            self.current_ocr_page_index = len(self.ocr_pages) - 1
+
+        raw = (self.ocr_pages[self.current_ocr_page_index] or "").strip()
+        try:
+            payload = json.loads(raw) if raw else {}
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+
+        payload.setdefault("Document_ID", "")
+        payload.setdefault("Citation_Metadata", {})
+        ctx = payload.setdefault("Historical_Context", {})
+        ent = payload.setdefault("Entities_and_Concepts", {})
+        discourse = payload.setdefault("Discourse_Analysis", {})
+
+        ctx["Date_Written"] = self.form_entries["Date_Written"].get().strip()
+        ctx["Author_Sender"] = self.form_entries["Author_Sender"].get().strip()
+        ctx["Recipient"] = self.form_entries["Recipient"].get().strip()
+        ctx["Document_Type"] = self.form_entries["Document_Type"].get().strip()
+
+        ent["Organizations"] = self._split_list(self.form_textboxes["Organizations"].get("0.0", "end").strip())
+        ent["Key_Figures"] = self._split_list(self.form_textboxes["Key_Figures"].get("0.0", "end").strip())
+        ent["All_Figures"] = self._split_list(self.form_textboxes["All_Figures"].get("0.0", "end").strip())
+        ent["Locations"] = self._split_list(self.form_textboxes["Locations"].get("0.0", "end").strip())
+        ent["Discourse_Keywords"] = self._split_list(
+            self.form_textboxes["Discourse_Keywords"].get("0.0", "end").strip()
+        )
+
+        discourse["Observation_Info"] = self.form_textboxes["Observation_Info"].get("0.0", "end").strip()
+        discourse["Core_Judgment"] = self.form_textboxes["Core_Judgment"].get("0.0", "end").strip()
+        discourse["Response_Action"] = self.form_textboxes["Response_Action"].get("0.0", "end").strip()
+        score = self.relevance_var.get().strip()
+        discourse["Relevance_Score"] = int(score) if score.isdigit() and score in {"1", "2", "3", "4", "5"} else None
+
+        self.ocr_pages[self.current_ocr_page_index] = json.dumps(payload, ensure_ascii=False, indent=2)
+
     def get_academic_prompt(self) -> str:
-          return """你是一位专攻日本近代政治与军事档案的顶尖研究者。
-  
-  请仔细阅读以下由 OCR 提取的 1921-1927 年间日本军政档案原文文本。你需要对日方对中国共产党、国民革命及反帝运动的「观察、认识、判断与因应」进行深度解构。
-  
-  【强制执行规则】：
-  必须严格以 JSON 格式输出，绝对不要包含任何 Markdown 标记（如 ```json），直接输出纯 JSON 字符串。请严格遵循以下 JSON 结构与字段定义：
-  
-  {
-    "Historical_Context": {
-      "Date_Written": "提取文件的撰写或发布时间（请转换为 YYYY-MM-DD 格式，若仅有年月则填 YYYY-MM，未知填 null）",
-      "Author_Sender": "提取发文者或报告人的职衔与姓名（如：驻广州总领事、特务机关长）",
-      "Recipient": "提取收文者或呈报对象（如：外务大臣、参谋本部）",
-      "Document_Type": "判断文书类型（如：情报报告、训令、电报、决议草案等）"
-    },
-    "Entities_and_Concepts": {
-      "Organizations": ["提取文中出现的所有相关组织与机构（如：中国共产党、广州国民政府、省港罢工委员会等）"],
-      "Key_Figures": ["提取文中出现的关键人物（如：陈独秀、鲍罗廷、孙中山等）"],
-      "All_Figures": ["提取文中出现的所有人物姓名"],
-      "Locations": ["提取事件发生的核心地理位置（如：广州、沙面、武汉等）"],
-      "Discourse_Keywords": ["提取日方在公文中使用的具有『强烈主观色彩』或『话语权力』的历史专有名词（如：赤化、排外、暴支、容共、过激派等）"]
-    },
-    "Discourse_Analysis": {
-      "Observation_Info": "（观察与认知）用一句话概括日方通过何种渠道获取了什么具体情报或事实？",
-      "Core_Judgment": "（认识与判断）用一句话精准概括日方对该事件的定性或战略研判（如：认为受赤化思想主导、判断国共必将分裂等）。",
-      "Response_Action": "（因应）用一句话概括日方已经采取或建议采取的具体对策（如无，填写『未提及』）。",
-      "Relevance_Score": 1到5的整数（评估该史料对研究日本军政界应对中国共产革命与反帝运动的价值，1为无关流水账，5为具有极高战略研究价值的核心机密报告）
-    }
-  }"""
+        return ANALYSIS_ACADEMIC_PROMPT
 
     def export_document(self) -> None:
         self._export_text_pages_default()

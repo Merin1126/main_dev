@@ -1516,39 +1516,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 with open(json_save_path, "w", encoding="utf-8") as jf:
                     json.dump(data, jf, ensure_ascii=False, indent=2)
 
-                # --- 🥈 UI 轨：严格映射 analysis_screen.py 的 JSON 字段并中文化展示 ---
-                ctx = data.get("Historical_Context", {})
-                ent = data.get("Entities_and_Concepts", {})
-                metrics = data.get("Discourse_Analysis", {})
-
-                def _fmt_list(value):
-                    if isinstance(value, list):
-                        items = [str(v).strip() for v in value if str(v).strip()]
-                        return "、".join(items) if items else "无"
-                    if isinstance(value, str):
-                        return value.strip() or "无"
-                    return "无"
-
-                formatted = "【⏳ 历史背景（Historical_Context）】\n"
-                formatted += f"成文时间（Date_Written）：{ctx.get('Date_Written', '未知')}\n"
-                formatted += f"发文者（Author_Sender）：{ctx.get('Author_Sender', '未知')}\n"
-                formatted += f"收文对象（Recipient）：{ctx.get('Recipient', '未知')}\n"
-                formatted += f"文书类型（Document_Type）：{ctx.get('Document_Type', '未知')}\n\n"
-
-                formatted += "【👥 实体与概念（Entities_and_Concepts）】\n"
-                formatted += f"组织机构（Organizations）：{_fmt_list(ent.get('Organizations', []))}\n"
-                formatted += f"关键人物（Key_Figures）：{_fmt_list(ent.get('Key_Figures', []))}\n"
-                formatted += f"全部人物（All_Figures）：{_fmt_list(ent.get('All_Figures', []))}\n"
-                formatted += f"核心地点（Locations）：{_fmt_list(ent.get('Locations', []))}\n"
-                formatted += f"话语关键词（Discourse_Keywords）：{_fmt_list(ent.get('Discourse_Keywords', []))}\n\n"
-
-                formatted += "【🎯 话语分析（Discourse_Analysis）】\n"
-                formatted += f"观察信息（Observation_Info）：{metrics.get('Observation_Info', '无')}\n"
-                formatted += f"核心判断（Core_Judgment）：{metrics.get('Core_Judgment', '无')}\n"
-                formatted += f"因应措施（Response_Action）：{metrics.get('Response_Action', '无')}\n"
-                formatted += f"关联评分（Relevance_Score）：{metrics.get('Relevance_Score', '无')} / 5\n"
-
-                return formatted
+                # --- 🥈 UI 轨：直接返回 JSON 字符串（由子类决定如何渲染） ---
+                return json.dumps(data, ensure_ascii=False, indent=2)
 
             except json.JSONDecodeError:
                 # 4. 如果大模型吐出的不是合法的 JSON，说明是常规 OCR 或纯文本翻译
