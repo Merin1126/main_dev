@@ -54,6 +54,14 @@ class ScraperScreen(ctk.CTkFrame):
         self.entry_end_year = Input(container, width=400, defaultValue="1927")
         self.entry_end_year.pack()
 
+        self.headless_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            container,
+            text="无头模式（不打开浏览器窗口）",
+            variable=self.headless_var,
+            font=("Arial", 13),
+        ).pack(pady=(14, 0))
+
         # ================= 操作按钮区 =================
         btn_frame = ctk.CTkFrame(container, fg_color=Color.TRANSPARENT)
         btn_frame.pack(pady=35)
@@ -124,7 +132,8 @@ class ScraperScreen(ctk.CTkFrame):
         # 启动后台爬虫线程
         scraper_thread = threading.Thread(
             target=core_scraper.jacar_auto_search,
-            args=(kw, sy, ey, self.update_progress, self.finish_scraping, self.stop_event)
+            args=(kw, sy, ey, self.update_progress, self.finish_scraping, self.stop_event),
+            kwargs={"headless": bool(self.headless_var.get())}
         )
         scraper_thread.daemon = True
         scraper_thread.start()

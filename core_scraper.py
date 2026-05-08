@@ -163,7 +163,7 @@ def api_download_worker(task_queue, stop_event):
 # ==========================================
 # 👷 包工头：单一 Selenium 控制翻页与发布任务
 # ==========================================
-def jacar_auto_search(target_keyword, start_year, end_year, update_gui_progress, finish_scraping, stop_event):
+def jacar_auto_search(target_keyword, start_year, end_year, update_gui_progress, finish_scraping, stop_event, headless=False):
     print("正在初始化网络环境与高并发队列...")
     
     if getattr(sys, 'frozen', False):
@@ -187,6 +187,10 @@ def jacar_auto_search(target_keyword, start_year, end_year, update_gui_progress,
         workers.append(t)
     
     chrome_options = Options()
+    if headless:
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
     driver = webdriver.Chrome(options=chrome_options)
     wait = WebDriverWait(driver, 15)
     
