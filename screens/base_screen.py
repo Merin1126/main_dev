@@ -69,7 +69,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     )
 
     @abstractmethod
-    def get_academic_prompt(self) -> str:
+    def get_academic_prompt(self, page_index: int = None) -> str:
         """返回发送给 Gemini 的学术/任务提示词（可含对输出格式的约束）。"""
 
     @abstractmethod
@@ -1069,6 +1069,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     file_name=file_tag,
                     model_name=model_name,
                     image_bytes=image_bytes,
+                    page_index=page_index,
                 )
             else:
                 ocr_text = self._get_ocr_text_for_page(self.selected_pdf_path, page_index)
@@ -1079,6 +1080,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     file_name=file_tag,
                     model_name=model_name,
                     source_text=ocr_text,
+                    page_index=page_index,
                 )
 
             if task_id != self.ocr_task_id:
@@ -1218,6 +1220,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                         file_name=file_tag,
                         model_name=model_name,
                         image_bytes=image_bytes,
+                        page_index=page_index,
                     )
                 else:
                     ocr_src = self._get_ocr_text_for_page(pdf_path, page_index)
@@ -1231,6 +1234,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                         file_name=file_tag,
                         model_name=model_name,
                         source_text=ocr_src,
+                        page_index=page_index,
                     )
                 marker = type(self).empty_page_marker
                 all_page_texts.append(page_text.strip() if page_text else marker)
@@ -1438,12 +1442,13 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         *,
         image_bytes: bytes | None = None,
         source_text: str | None = None,
+        page_index: int = None,
     ):
         if (image_bytes is None) == (source_text is None):
             raise ValueError("必须且仅能指定 image_bytes 与 source_text 其中之一")
 
         client = genai.Client(api_key=api_key)
-        academic_prompt = self.get_academic_prompt()
+        academic_prompt = self.get_academic_prompt(page_index)
 
         if image_bytes is not None:
             image = Image.open(io.BytesIO(image_bytes))
@@ -1511,7 +1516,15 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
                 # 使用解析出的 Document_ID 命名，如果没有则退化为 PDF 的基础文件名
                 doc_id = data.get("Document_ID", file_name.replace(".pdf", ""))
-                json_save_path = os.path.join(db_dir, f"{doc_id}.json")
+                safe_doc_id = re.sub(r'[\\/:*?"<>|]+', "_", str(doc_id)).strip("_") or "unknown_document"
+                page_match = re.search(r"第(\d+)页", file_name)
+                if page_match:
+                    page_suffix = f"_p{int(page_match.group(1)):04d}"
+                else:
+                    # 兜底：无页码信息时避免覆盖
+                    page_suffix = f"_seg_{abs(hash(file_name)) % 100000:05d}"
+
+                json_save_path = os.path.join(db_dir, f"{safe_doc_id}{page_suffix}.json")
 
                 with open(json_save_path, "w", encoding="utf-8") as jf:
                     json.dump(data, jf, ensure_ascii=False, indent=2)

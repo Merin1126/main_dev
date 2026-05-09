@@ -382,8 +382,36 @@ class AnalysisScreen(BaseDocumentScreen):
 
         self.ocr_pages[self.current_ocr_page_index] = json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def get_academic_prompt(self) -> str:
-        return ANALYSIS_ACADEMIC_PROMPT
+    def get_academic_prompt(self, page_index: int = None) -> str:
+        # 将提示词中的占位符替换为真实的插件列表
+        plugin_keys = "』、『".join(TRANSLATION_PLUGINS.keys())
+        base_prompt = ANALYSIS_ACADEMIC_PROMPT.replace("__TRANSLATION_PLUGIN_ENUM__", f"『{plugin_keys}』")
+
+        # 滚动记忆逻辑：如果不是第一页，尝试读取上一页的 JSON
+        if page_index is not None and page_index > 0 and self.ocr_pages:
+            try:
+                prev_raw = self.ocr_pages[page_index - 1]
+                if prev_raw:
+                    prev_data = json.loads(prev_raw)
+                    ctx = prev_data.get("Historical_Context", {})
+                    if ctx:
+                        date = ctx.get("Date_Written", "未知")
+                        sender = ctx.get("Author_Sender", "未知")
+                        recipient = ctx.get("Recipient", "未知")
+                        doc_type = ctx.get("Document_Type", "未知")
+                        plugins = ctx.get("Translation_Plugins", [])
+
+                        inject_text = (
+                            f"\n\n【系统附加连贯性指令】：\n"
+                            f"当前正在分析该份档案的第 {page_index + 1} 页。\n"
+                            f"作为参考，上一页提取到的元数据为：时间[{date}]，发文者[{sender}]，收文者[{recipient}]，类型[{doc_type}]，翻译插件标签为{plugins}。\n"
+                            f"▶️ 如果本页内容是上一页的延续（未出现新的公文开头），请直接【继承】上述元数据和插件标签填充JSON，以保持同份档案的数据连续性。\n"
+                            f"▶️ 如果本页出现了全新的发文落款或切换了公文类型，请提取新的数据覆盖。"
+                        )
+                        base_prompt += inject_text
+            except Exception:
+                pass
+        return base_prompt
 
     def export_document(self) -> None:
         self._export_text_pages_default()

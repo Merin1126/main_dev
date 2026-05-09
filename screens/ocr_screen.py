@@ -22,7 +22,7 @@ class OCRScreen(BaseDocumentScreen):
         "此处将显示本地缓存或新的 OCR 识别结果..."
     )
 
-    def get_academic_prompt(self) -> str:
+    def get_academic_prompt(self, page_index: int = None) -> str:
         return """你现在是一位顶尖的日本近代史学者与古籍档案解析专家。
 请仔细阅读这张大正时代日本内阁/军部历史档案的扫描件，并将其中的文字准确无误地提取出来。
 
