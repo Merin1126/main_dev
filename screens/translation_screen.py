@@ -23,7 +23,7 @@ class TranslationScreen(BaseDocumentScreen):
     )
 
     def get_academic_prompt(self) -> str:
-        return """你是一位精通日语近代史文献与中文学术写作的历史学者，长期研习陈太勇等学者严谨、克制、重史料互证的行文方式。
+        return """你是一位精通日语近代史文献与中文学术写作的历史学者。
 
 请阅读以下由 OCR 提取的大正/昭和时代日文档案文本，将其译为**简体中文**。
 

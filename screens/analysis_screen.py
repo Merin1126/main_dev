@@ -7,6 +7,7 @@ import re
 import customtkinter as ctk
 
 from config.academic_prompts import ANALYSIS_ACADEMIC_PROMPT
+from config.translation_prompts import TRANSLATION_PLUGINS
 from screens.base_screen import BaseDocumentScreen
 
 
@@ -32,6 +33,9 @@ class AnalysisScreen(BaseDocumentScreen):
         # 父类初始化过程中会触发 _show_current_ocr_page；先准备占位属性避免启动期访问报错
         self.form_entries: dict[str, ctk.CTkEntry] = {}
         self.form_textboxes: dict[str, ctk.CTkTextbox] = {}
+        self.plugin_vars: dict[str, ctk.BooleanVar] = {}
+        self.plugin_checkboxes: list[ctk.CTkCheckBox] = []
+        self.plugin_wrap = None
         self.relevance_var = None
         self._debug_popup = None
         self._debug_popup_textbox = None
@@ -46,6 +50,9 @@ class AnalysisScreen(BaseDocumentScreen):
     def _build_controlled_form(self) -> None:
         self.form_entries: dict[str, ctk.CTkEntry] = {}
         self.form_textboxes: dict[str, ctk.CTkTextbox] = {}
+        self.plugin_vars: dict[str, ctk.BooleanVar] = {}
+        self.plugin_checkboxes: list[ctk.CTkCheckBox] = []
+        self.plugin_wrap = None
         self.relevance_var = ctk.StringVar(value="未设定")
 
         self.form_frame = ctk.CTkScrollableFrame(self.right_frame, corner_radius=8)
@@ -57,6 +64,17 @@ class AnalysisScreen(BaseDocumentScreen):
         self._add_entry_field("Author_Sender", "发文者（Author_Sender）")
         self._add_entry_field("Recipient", "收文对象（Recipient）")
         self._add_entry_field("Document_Type", "文书类型（Document_Type）")
+        self._add_section_title("🧩 翻译插件 (Translation_Plugins)")
+        plugin_wrap = ctk.CTkFrame(self.form_frame, fg_color="transparent")
+        plugin_wrap.pack(fill="x", pady=(2, 6))
+        self.plugin_wrap = plugin_wrap
+        for plugin_name in TRANSLATION_PLUGINS.keys():
+            var = ctk.BooleanVar(value=False)
+            self.plugin_vars[plugin_name] = var
+            cb = ctk.CTkCheckBox(plugin_wrap, text=plugin_name, variable=var)
+            self.plugin_checkboxes.append(cb)
+        plugin_wrap.bind("<Configure>", self._on_plugin_wrap_resize)
+        self.after(0, self._relayout_plugin_checkboxes)
 
         self._add_section_title("👥 实体与概念（Entities_and_Concepts）")
         self._add_text_field("Organizations", "组织机构（Organizations）", height=72)
@@ -84,6 +102,34 @@ class AnalysisScreen(BaseDocumentScreen):
             variable=self.relevance_var,
         )
         self.relevance_menu.pack(fill="x", pady=(0, 4))
+
+    def _on_plugin_wrap_resize(self, _event) -> None:
+        self._relayout_plugin_checkboxes()
+
+    def _relayout_plugin_checkboxes(self) -> None:
+        """根据容器宽度动态排布插件复选框：窄窗口自动换行，宽窗口横向排列。"""
+        if self.plugin_wrap is None or not self.plugin_checkboxes:
+            return
+        width = self.plugin_wrap.winfo_width()
+        if width <= 1:
+            width = self.form_frame.winfo_width()
+        if width <= 1:
+            return
+
+        # 估算单个复选框占位宽度（含间距），动态计算每行列数
+        item_width = 145
+        cols = max(1, width // item_width)
+
+        for i in range(max(1, len(self.plugin_checkboxes))):
+            self.plugin_wrap.grid_columnconfigure(i, weight=0)
+        for i in range(cols):
+            self.plugin_wrap.grid_columnconfigure(i, weight=1, uniform="plugin")
+
+        for idx, cb in enumerate(self.plugin_checkboxes):
+            cb.grid_forget()
+            row = idx // cols
+            col = idx % cols
+            cb.grid(row=row, column=col, sticky="w", padx=(0, 12), pady=4)
 
     def _ensure_bottom_save_area_after_form(self) -> None:
         """将右侧底部的“保存修改”操作区稳定放在表单下方，避免 pack before 目标未管理导致崩溃。"""
@@ -142,6 +188,8 @@ class AnalysisScreen(BaseDocumentScreen):
             entry.delete(0, "end")
         for textbox in self.form_textboxes.values():
             textbox.delete("0.0", "end")
+        for var in self.plugin_vars.values():
+            var.set(False)
         self.relevance_var.set("未设定")
 
     @staticmethod
@@ -198,6 +246,12 @@ class AnalysisScreen(BaseDocumentScreen):
         self._set_entry_value("Author_Sender", ctx.get("Author_Sender", ""))
         self._set_entry_value("Recipient", ctx.get("Recipient", ""))
         self._set_entry_value("Document_Type", ctx.get("Document_Type", ""))
+        plugins = ctx.get("Translation_Plugins", [])
+        if not isinstance(plugins, list):
+            plugins = []
+        plugin_set = {str(p).strip() for p in plugins if str(p).strip()}
+        for name, var in self.plugin_vars.items():
+            var.set(name in plugin_set)
 
         self._set_textbox_value("Organizations", ent.get("Organizations", []))
         self._set_textbox_value("Key_Figures", ent.get("Key_Figures", []))
@@ -310,6 +364,7 @@ class AnalysisScreen(BaseDocumentScreen):
         ctx["Author_Sender"] = self.form_entries["Author_Sender"].get().strip()
         ctx["Recipient"] = self.form_entries["Recipient"].get().strip()
         ctx["Document_Type"] = self.form_entries["Document_Type"].get().strip()
+        ctx["Translation_Plugins"] = [name for name, var in self.plugin_vars.items() if var.get()]
 
         ent["Organizations"] = self._split_list(self.form_textboxes["Organizations"].get("0.0", "end").strip())
         ent["Key_Figures"] = self._split_list(self.form_textboxes["Key_Figures"].get("0.0", "end").strip())

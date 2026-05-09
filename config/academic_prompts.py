@@ -12,7 +12,8 @@ ANALYSIS_ACADEMIC_PROMPT = """你是一位专攻日本近代政治与军事档�
     "Date_Written": "提取文件的撰写或发布时间（请转换为 YYYY-MM-DD 格式，若仅有年月则填 YYYY-MM，未知填 null）",
     "Author_Sender": "提取发文者或报告人的职衔与姓名（如：驻广州总领事、特务机关长）",
     "Recipient": "提取收文者或呈报对象（如：外务大臣、参谋本部）",
-    "Document_Type": "判断文书类型（如：情报报告、训令、电报、决议草案等）"
+    "Document_Type": "判断文书类型（如：情报报告、训令、电报、决议草案等）",
+    "Translation_Plugins": ["根据 Document_Type 和文本语境，从以下限定列表中选择 0 到多个最匹配的翻译滤镜，必须绝对使用原词：『外交密电』、『前线战报』、『内阁阁议』、『特务情报』。若无匹配则输出空数组 []"]
   },
   "Entities_and_Concepts": {
     "Organizations": ["提取文中出现的所有相关组织与机构（如：中国共产党、广州国民政府、省港罢工委员会等）"],
