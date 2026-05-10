@@ -251,6 +251,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.session_total_tokens = 0
         self.session_cost_jpy = 0.0
         self.session_cost_cny = 0.0
+        self.session_api_call_pages = 0
+        self.session_cache_loaded_pages = 0
+        self.session_max_tokens_per_call = 0
 
         self._setup_ui()
         self._update_ui_by_state()
@@ -510,7 +513,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.ocr_progress_bar.set(0)
         self.usage_summary_label = ctk.CTkLabel(
             self.action_frame,
-            text="本次任务累计：Token=0 | JPY=0.0000 | CNY=0.0000",
+            text="成本监控初始化中...",
             font=("Arial", 12),
             justify="left",
             anchor="w"
@@ -592,28 +595,40 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.session_total_tokens = 0
         self.session_cost_jpy = 0.0
         self.session_cost_cny = 0.0
+        self.session_api_call_pages = 0
+        self.session_cache_loaded_pages = 0
+        self.session_max_tokens_per_call = 0
         self._refresh_usage_summary_label()
 
     def _refresh_usage_summary_label(self):
         current_model = self.selected_model_var.get() if hasattr(self, "selected_model_var") else "N/A"
+        avg_tokens = (
+            self.session_total_tokens / self.session_api_call_pages
+            if self.session_api_call_pages > 0 else 0.0
+        )
+        usage_title = f"{type(self).task_short_name} 成本监控"
         self.usage_summary_label.configure(
             text=(
-                f"模型={current_model} | "
-                f"本次任务累计：Token={self.session_total_tokens} | "
-                f"JPY={self.session_cost_jpy:.4f} | "
-                f"CNY={self.session_cost_cny:.4f}"
+                f"{usage_title}\n"
+                f"模型={current_model} | API调用页数={self.session_api_call_pages} | 本地缓存页数={self.session_cache_loaded_pages}\n"
+                f"输入(非缓存)={self.session_prompt_non_cached} | 缓存命中={self.session_cached_tokens} | 输出={self.session_output_tokens}\n"
+                f"总Token={self.session_total_tokens} | 平均/页={avg_tokens:.1f} | 峰值/页={self.session_max_tokens_per_call}\n"
+                f"预估费用：JPY={self.session_cost_jpy:.4f} | CNY={self.session_cost_cny:.4f}"
             )
         )
 
     def _accumulate_usage_summary(self, usage_summary):
         if not usage_summary:
             return
+        current_total = int(usage_summary.get("total_token_count", 0))
         self.session_prompt_non_cached += int(usage_summary.get("prompt_non_cached", 0))
         self.session_cached_tokens += int(usage_summary.get("cached_content_token_count", 0))
         self.session_output_tokens += int(usage_summary.get("candidates_token_count", 0))
-        self.session_total_tokens += int(usage_summary.get("total_token_count", 0))
+        self.session_total_tokens += current_total
         self.session_cost_jpy += float(usage_summary.get("cost_jpy", 0.0))
         self.session_cost_cny += float(usage_summary.get("cost_cny", 0.0))
+        self.session_api_call_pages += 1
+        self.session_max_tokens_per_call = max(self.session_max_tokens_per_call, current_total)
         self._refresh_usage_summary_label()
 
     def _set_ocr_state(self, new_state):
@@ -1027,6 +1042,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self._start_single_page_worker(page_index, pages_text, total_pages)
 
     def _start_single_page_worker(self, page_index, pages_text, total_pages):
+        self._reset_usage_summary()
         self._set_ocr_state(DocumentTaskState.RUNNING)
         self.ocr_task_id += 1
         task_id = self.ocr_task_id
@@ -1149,6 +1165,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             ocr_pages = ["未识别到文本内容。"]
         self._set_ocr_pages(ocr_pages)
         if from_cache:
+            self.session_cache_loaded_pages = max(self.session_cache_loaded_pages, len(ocr_pages))
+            self._refresh_usage_summary_label()
             self.ocr_progress_label.configure(text=self._status_colon("已完成（来自本地缓存）"))
             self.ocr_progress_bar.set(1)
         else:
