@@ -7,6 +7,8 @@ import json
 import threading
 import hashlib
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 from google import genai
@@ -21,7 +23,11 @@ from docx import Document
 
 from components.ui.button import Button
 from config.settings import Color
-from config.api_key_store import load_google_api_key as load_gemini_api_key
+from config.api_key_store import (
+    load_google_api_key as load_gemini_api_key,
+    load_trace_config,
+)
+from utils.gemini_trace_logger import append_trace_event, build_cache_event
 from utils.token_logger import log_gemini_usage
 
 class DocumentTaskState(Enum):
@@ -67,6 +73,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     missing_full_ocr_notice: str = (
         "该PDF文件还未提取OCR文字，请提取并手动校对史料信息"
     )
+    #: 单页 Gemini 请求超时时间（秒）
+    api_request_timeout_sec: int = 120
 
     @abstractmethod
     def get_academic_prompt(self, page_index: int = None) -> str:
@@ -78,6 +86,70 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
     def _status_colon(self, tail: str) -> str:
         return f"{type(self).task_short_name} 状态：{tail}"
+
+    def _load_trace_cfg(self) -> dict:
+        try:
+            cfg = load_trace_config()
+        except Exception:
+            cfg = {"enabled": False, "include_full_text": True}
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "include_full_text": bool(cfg.get("include_full_text", True)),
+        }
+
+    def _trace_text(self, text: str | None, include_full_text: bool) -> str:
+        value = "" if text is None else str(text)
+        return value if include_full_text else value[:1200]
+
+    def _trace_event(self, event: str, payload: dict) -> None:
+        cfg = self._load_trace_cfg()
+        if not cfg["enabled"]:
+            return
+        base_payload = {
+            "event": event,
+            "screen": type(self).__name__,
+            "task": type(self).task_short_name,
+            "selected_pdf_path": self.selected_pdf_path,
+            "trace_include_full_text": cfg["include_full_text"],
+        }
+        base_payload.update(payload or {})
+        append_trace_event(self._project_root, base_payload)
+
+    def _trace_cache_write(self, *, cache_path: str, cache_kind: str, content: str, page_index: int | None) -> None:
+        cfg = self._load_trace_cfg()
+        if not cfg["enabled"]:
+            return
+        event = build_cache_event(
+            project_root=self._project_root,
+            screen_name=type(self).__name__,
+            task_name=type(self).task_short_name,
+            pdf_path=self.selected_pdf_path,
+            page_index=page_index,
+            cache_path=cache_path,
+            cache_kind=cache_kind,
+            content=content,
+            include_full_text=cfg["include_full_text"],
+        )
+        append_trace_event(self._project_root, event)
+
+    def _call_gemini_with_timeout(self, client, *, model_name: str, contents, config):
+        """通过线程超时包装 Gemini 调用，避免单页请求无限阻塞。"""
+        timeout_s = max(1, int(type(self).api_request_timeout_sec))
+
+        def _do_call():
+            return client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_do_call)
+            try:
+                return future.result(timeout=timeout_s)
+            except FuturesTimeoutError:
+                future.cancel()
+                raise RuntimeError(f"Gemini 请求超时（>{timeout_s}s）")
 
     def _hint_no_pdf_selected(self):
         return [type(self).idle_editor_hint]
@@ -219,6 +291,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         )
 
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._project_root = base_dir
         self.download_dir = os.path.join(base_dir, "JACAR_Downloads")
         self.document_cache_dir = os.path.join(base_dir, cls.cache_dir_name)
         self._ocr_cache_dir = os.path.join(base_dir, "OCR_Cache")
@@ -1107,6 +1180,12 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             cache_payload = json.dumps({"format": "paged_v1", "pages": pages_text}, ensure_ascii=False)
             with open(cache_path, "w", encoding="utf-8") as f:
                 f.write(cache_payload)
+            self._trace_cache_write(
+                cache_path=cache_path,
+                cache_kind=type(self).cache_dir_name,
+                content=cache_payload,
+                page_index=page_index,
+            )
 
             def _apply_single_page_success():
                 if task_id != self.ocr_task_id:
@@ -1150,6 +1229,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         except RuntimeError as e:
             err_msg = str(e)
             if str(e) == "DOC_TASK_CANCELLED":
+                self.after(0, lambda: self._handle_ocr_cancelled(task_id))
+                return
+            if self.ocr_cancel_event.is_set():
                 self.after(0, lambda: self._handle_ocr_cancelled(task_id))
                 return
             self.after(0, lambda msg=err_msg: self._handle_ocr_failed(task_id, msg))
@@ -1256,10 +1338,26 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     )
                 marker = type(self).empty_page_marker
                 all_page_texts.append(page_text.strip() if page_text else marker)
+                # 全书任务按页增量写盘，避免中途中断导致前序结果不可见
+                partial_payload = json.dumps({"format": "paged_v1", "pages": all_page_texts}, ensure_ascii=False)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    f.write(partial_payload)
+                self._trace_cache_write(
+                    cache_path=cache_path,
+                    cache_kind=type(self).cache_dir_name,
+                    content=partial_payload,
+                    page_index=page_index,
+                )
 
         cache_payload = json.dumps({"format": "paged_v1", "pages": all_page_texts}, ensure_ascii=False)
         with open(cache_path, "w", encoding="utf-8") as f:
             f.write(cache_payload)
+        self._trace_cache_write(
+            cache_path=cache_path,
+            cache_kind=type(self).cache_dir_name,
+            content=cache_payload,
+            page_index=None,
+        )
         return all_page_texts, False
 
     def _parse_cached_ocr_pages(self, cached_text):
@@ -1384,7 +1482,10 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     def cancel_ocr_task(self, silent=False):
         self.ocr_cancel_event.set()
         if not silent:
-            self.ocr_progress_label.configure(text=self._status_colon("正在取消..."))
+            timeout_s = max(1, int(type(self).api_request_timeout_sec))
+            self.ocr_progress_label.configure(
+                text=self._status_colon(f"正在取消...等待当前页请求结束（最长约 {timeout_s}s）")
+            )
             self.ocr_progress_bar.set(0)
 
     def clear_ocr_cache(self):
@@ -1467,6 +1568,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
         client = genai.Client(api_key=api_key)
         academic_prompt = self.get_academic_prompt(page_index)
+        trace_cfg = self._load_trace_cfg()
+        trace_include_full_text = trace_cfg["include_full_text"]
+        request_started_at = time.perf_counter()
 
         if image_bytes is not None:
             image = Image.open(io.BytesIO(image_bytes))
@@ -1476,9 +1580,23 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 f"{academic_prompt}\n\n【待处理的 OCR 史料底稿】：\n{source_text}"
             ]
 
+        self._trace_event(
+            "request_prepared",
+            {
+                "file_name": file_name,
+                "page_index": page_index,
+                "model_name": model_name,
+                "input_kind": "image" if image_bytes is not None else "text",
+                "prompt_text": self._trace_text(academic_prompt, trace_include_full_text),
+                "source_text": self._trace_text(source_text, trace_include_full_text) if source_text is not None else None,
+                "image_bytes_len": len(image_bytes) if image_bytes is not None else 0,
+            },
+        )
+
         try:
-            response = client.models.generate_content(
-                model=model_name,
+            response = self._call_gemini_with_timeout(
+                client,
+                model_name=model_name,
                 contents=contents,
                 config=types.GenerateContentConfig(
                     safety_settings=[
@@ -1499,11 +1617,12 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                             threshold=types.HarmBlockThreshold.BLOCK_NONE
                         ),
                     ]
-                )
+                ),
             )
             usage_summary = log_gemini_usage(
                 getattr(response, "usage_metadata", None),
                 file_name,
+                type(self).task_short_name,
                 model_name
             )
             self.after(0, lambda s=usage_summary: self._accumulate_usage_summary(s))
@@ -1511,6 +1630,19 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             # 🧮 核心拦截器：动态识别纯文本与 JSON，并双轨处理
             # ==========================================
             raw_text = response.text.strip()
+            elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
+            self._trace_event(
+                "response_received",
+                {
+                    "file_name": file_name,
+                    "page_index": page_index,
+                    "model_name": model_name,
+                    "elapsed_ms": elapsed_ms,
+                    "usage_summary": usage_summary,
+                    "response_text": self._trace_text(raw_text, trace_include_full_text),
+                    "response_len": len(raw_text),
+                },
+            )
 
             # 1. 清理可能存在的 Markdown 代码块标记
             clean_text = raw_text
@@ -1546,6 +1678,12 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
                 with open(json_save_path, "w", encoding="utf-8") as jf:
                     json.dump(data, jf, ensure_ascii=False, indent=2)
+                self._trace_cache_write(
+                    cache_path=json_save_path,
+                    cache_kind="Database_JSON",
+                    content=json.dumps(data, ensure_ascii=False, indent=2),
+                    page_index=page_index,
+                )
 
                 # --- 🥈 UI 轨：直接返回 JSON 字符串（由子类决定如何渲染） ---
                 return json.dumps(data, ensure_ascii=False, indent=2)
@@ -1556,6 +1694,16 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 return raw_text
             
         except Exception as e:
+            self._trace_event(
+                "request_error",
+                {
+                    "file_name": file_name,
+                    "page_index": page_index,
+                    "model_name": model_name,
+                    "error": str(e),
+                    "elapsed_ms": int((time.perf_counter() - request_started_at) * 1000),
+                },
+            )
             raise RuntimeError(f"Gemini API 调用失败: {e}")
 
     def render_page(self):

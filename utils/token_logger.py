@@ -18,16 +18,21 @@ def _get_usage_value(usage_metadata, key, default=0):
 def log_gemini_usage(
     usage_metadata,
     file_name,
+    behavior_name="未知",
     model_name="gemini-3.1-pro-preview",
 ):
     prompt_token_count = _get_usage_value(usage_metadata, "prompt_token_count", 0)
-    candidates_token_count = _get_usage_value(usage_metadata, "candidates_token_count", 0)
     cached_content_token_count = _get_usage_value(usage_metadata, "cached_content_token_count", 0)
+
+    # 1. 优先获取谷歌底层最准确的全局总数（若缺失则兜底为输入量）
     total_token_count = _get_usage_value(
         usage_metadata,
         "total_token_count",
-        prompt_token_count + candidates_token_count,
+        prompt_token_count
     )
+
+    # 2. 利用倒推法获取精准的输出 Token（解决 SDK candidates_token_count 字段漏单问题）
+    candidates_token_count = max(0, total_token_count - prompt_token_count)
 
     prompt_non_cached = max(prompt_token_count - cached_content_token_count, 0)
 
@@ -62,6 +67,7 @@ def log_gemini_usage(
     row = [
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         file_name,
+        behavior_name,
         model_name,
         prompt_non_cached,
         cached_content_token_count,
@@ -79,6 +85,7 @@ def log_gemini_usage(
                 [
                     "时间",
                     "文件名",
+                    "行为类型",
                     "模型名",
                     "输入Token(非缓存)",
                     "缓存命中Token",
@@ -92,7 +99,7 @@ def log_gemini_usage(
         writer.writerow(row)
 
     print(
-        f"[TokenLogger] 已记录: total={total_token_count}, "
+        f"[TokenLogger] 已记录: action={behavior_name}, total={total_token_count}, "
         f"CNY={cost_cny:.4f}, JPY={cost_jpy:.4f}"
     )
 

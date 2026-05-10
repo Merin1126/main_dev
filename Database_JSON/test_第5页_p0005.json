@@ -1,0 +1,45 @@
+{
+  "Historical_Context": {
+    "Date_Written": null,
+    "Author_Sender": "日本驻华情报机构或武官",
+    "Recipient": "参谋本部或外务省",
+    "Document_Type": "情报报告",
+    "Translation_Plugins": [
+      "特务情报"
+    ]
+  },
+  "Entities_and_Concepts": {
+    "Organizations": [
+      "雪恥會",
+      "組織部"
+    ],
+    "Key_Figures": [
+      "蕭子昇",
+      "李宗侗",
+      "譚騰鳴"
+    ],
+    "All_Figures": [
+      "譚騰鳴",
+      "蕭子昇",
+      "査風橋",
+      "査蓮香",
+      "李宗侗",
+      "張祝唐",
+      "胡窗"
+    ],
+    "Locations": [],
+    "Discourse_Keywords": [
+      "情報",
+      "支"
+    ]
+  },
+  "Discourse_Analysis": {
+    "Observation_Info": "日方通过秘密侦察获取了抗日团体“雪耻会”及其组织部的详细干部名单，并将其与编号为“支第廿五”的既往专项情报进行索引关联。",
+    "Core_Judgment": "日方将“雪耻会”定性为具有组织动员能力的重点监控对象，认为其干部构成是评估该组织威胁程度的关键，并已建立了持续性的追踪档案。",
+    "Response_Action": "通过编号化管理对该组织进行长期情报跟踪，并在本次报告中对已详述的内容采取省略处理，仅更新核心人员名单。",
+    "Relevance_Score": 3
+  },
+  "Citation_Metadata": {
+    "Error": "文件名格式已被破坏或不标准，无法自动提取出处。"
+  }
+}
