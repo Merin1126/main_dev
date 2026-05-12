@@ -10,6 +10,11 @@ api_config.json
 # 2. 本地产生的数据文件 (避免仓库变得非常大)
 JACAR_Downloads/
 OCR_Cache/
+Translation_Cache/
+Analysis_Cache/
+Database_JSON/
+Gemini_Trace/
+*.jsonl
 *.pdf
 *.txt
 *.zip
@@ -42,3 +47,4 @@ Thumbs.db
 *.log
 *.md
 api_cost_log.csv
+*_cost_log.csv

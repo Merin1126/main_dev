@@ -5,30 +5,17 @@ import sys
 import subprocess
 import json
 import threading
-import hashlib
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-from google import genai
-from google.genai import types
-import io
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
-import fitz  # PyMuPDF
-from PIL import Image, ImageTk
 from docx import Document
 
 from components.ui.button import Button
 from config.settings import Color
-from config.api_key_store import (
-    load_google_api_key as load_gemini_api_key,
-    load_trace_config,
-)
-from utils.gemini_trace_logger import append_trace_event, build_cache_event
-from utils.token_logger import log_gemini_usage
+from config.api_key_store import load_google_api_key as load_gemini_api_key
+from services import CacheService, LlmService, PdfService
 
 class DocumentTaskState(Enum):
     IDLE = auto()
@@ -87,69 +74,16 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     def _status_colon(self, tail: str) -> str:
         return f"{type(self).task_short_name} 状态：{tail}"
 
-    def _load_trace_cfg(self) -> dict:
-        try:
-            cfg = load_trace_config()
-        except Exception:
-            cfg = {"enabled": False, "include_full_text": True}
-        return {
-            "enabled": bool(cfg.get("enabled", False)),
-            "include_full_text": bool(cfg.get("include_full_text", True)),
-        }
-
-    def _trace_text(self, text: str | None, include_full_text: bool) -> str:
-        value = "" if text is None else str(text)
-        return value if include_full_text else value[:1200]
-
-    def _trace_event(self, event: str, payload: dict) -> None:
-        cfg = self._load_trace_cfg()
-        if not cfg["enabled"]:
-            return
-        base_payload = {
-            "event": event,
-            "screen": type(self).__name__,
-            "task": type(self).task_short_name,
-            "selected_pdf_path": self.selected_pdf_path,
-            "trace_include_full_text": cfg["include_full_text"],
-        }
-        base_payload.update(payload or {})
-        append_trace_event(self._project_root, base_payload)
-
     def _trace_cache_write(self, *, cache_path: str, cache_kind: str, content: str, page_index: int | None) -> None:
-        cfg = self._load_trace_cfg()
-        if not cfg["enabled"]:
-            return
-        event = build_cache_event(
-            project_root=self._project_root,
+        self.llm_service.trace_cache_write(
             screen_name=type(self).__name__,
             task_name=type(self).task_short_name,
-            pdf_path=self.selected_pdf_path,
-            page_index=page_index,
+            selected_pdf_path=self.selected_pdf_path,
             cache_path=cache_path,
             cache_kind=cache_kind,
             content=content,
-            include_full_text=cfg["include_full_text"],
+            page_index=page_index,
         )
-        append_trace_event(self._project_root, event)
-
-    def _call_gemini_with_timeout(self, client, *, model_name: str, contents, config):
-        """通过线程超时包装 Gemini 调用，避免单页请求无限阻塞。"""
-        timeout_s = max(1, int(type(self).api_request_timeout_sec))
-
-        def _do_call():
-            return client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_do_call)
-            try:
-                return future.result(timeout=timeout_s)
-            except FuturesTimeoutError:
-                future.cancel()
-                raise RuntimeError(f"Gemini 请求超时（>{timeout_s}s）")
 
     def _hint_no_pdf_selected(self):
         return [type(self).idle_editor_hint]
@@ -175,10 +109,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
     def _build_ocr_cache_path(self, pdf_path: str) -> str:
         """与 OCR 页相同的哈希规则，定位 OCR_Cache 下的 paged_v1 文件。"""
-        stat = os.stat(pdf_path)
-        cache_key = f"{pdf_path}|{stat.st_mtime_ns}|{stat.st_size}"
-        name = hashlib.sha256(cache_key.encode("utf-8")).hexdigest() + ".txt"
-        return os.path.join(self._ocr_cache_dir, name)
+        return self.cache_service.build_cache_path(pdf_path, self._ocr_cache_dir)
 
     @staticmethod
     def _ocr_cached_plaintext_is_usable(text: str) -> bool:
@@ -197,12 +128,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         cache_path = self._build_ocr_cache_path(pdf_path)
         if not os.path.isfile(cache_path):
             return ""
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                raw = f.read()
-            pages = self._parse_cached_ocr_pages(raw)
-        except Exception:
-            return ""
+        pages = self.cache_service.read_paged_cache(cache_path)
         if page_index < 0 or page_index >= len(pages):
             return ""
         text = (pages[page_index] or "").strip()
@@ -236,8 +162,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         if type(self).requires_image_input:
             return True
         try:
-            with fitz.open(pdf_path) as doc:
-                total = len(doc)
+            total = self.pdf_service.count_pages(pdf_path)
             for pi in range(total):
                 if not self._get_ocr_text_for_page(pdf_path, pi):
                     messagebox.showwarning(
@@ -292,6 +217,13 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self._project_root = base_dir
+        self.cache_service = CacheService()
+        self.pdf_service = PdfService()
+        self.llm_service = LlmService(
+            api_key=self.gemini_api_key,
+            project_root=base_dir,
+            timeout_sec=type(self).api_request_timeout_sec,
+        )
         self.download_dir = os.path.join(base_dir, "JACAR_Downloads")
         self.document_cache_dir = os.path.join(base_dir, cls.cache_dir_name)
         self._ocr_cache_dir = os.path.join(base_dir, "OCR_Cache")
@@ -971,9 +903,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.cancel_ocr_task(silent=True)
 
         if self.current_pdf:
-            self.current_pdf.close()
+            self.pdf_service.close()
         try:
-            self.current_pdf = fitz.open(file_path)
+            self.current_pdf = self.pdf_service.open_pdf(file_path)
             self.current_page = 0
             self.zoom_factor = 1.0
             self.selected_pdf_path = file_path
@@ -1009,9 +941,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         if not os.path.exists(cache_path):
             return False
         try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cached_text = f.read()
-            pages = self._parse_cached_ocr_pages(cached_text)
+            pages = self.cache_service.read_paged_cache(cache_path)
             self._set_ocr_pages(pages)
             self.ocr_progress_label.configure(text=self._status_colon("已自动加载本地缓存"))
             self.ocr_progress_bar.set(1)
@@ -1057,9 +987,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         pages_text = [""] * total_pages
         if os.path.exists(cache_path):
             try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    cached_text = f.read()
-                pages_text = self._parse_cached_ocr_pages(cached_text)
+                pages_text = self.cache_service.read_paged_cache(cache_path)
             except Exception:
                 pages_text = []
 
@@ -1098,9 +1026,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         pages_text = [""] * total_pages
         if os.path.exists(cache_path):
             try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    cached_text = f.read()
-                pages_text = self._parse_cached_ocr_pages(cached_text)
+                pages_text = self.cache_service.read_paged_cache(cache_path)
             except Exception:
                 pages_text = []
 
@@ -1145,14 +1071,13 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 raise RuntimeError(
                     "未检测到 GOOGLE_GEMINI_API_KEY。请先配置该环境变量后再使用本功能。"
                 )
+            self.llm_service.update_api_key(api_key)
 
             file_tag = f"{os.path.basename(self.selected_pdf_path)}_第{page_index + 1}页"
             model_name = self.selected_model_var.get()
 
             if type(self).requires_image_input:
-                page = self.current_pdf[page_index]
-                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
-                image_bytes = pix.tobytes("png")
+                image_bytes = self.pdf_service.get_page_bytes(page_index)
                 result = self._detect_text_from_image(
                     api_key,
                     file_name=file_tag,
@@ -1177,9 +1102,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
             pages_text[page_index] = (result or "").strip() or type(self).empty_page_marker
             cache_path = self._build_cache_path(self.selected_pdf_path)
-            cache_payload = json.dumps({"format": "paged_v1", "pages": pages_text}, ensure_ascii=False)
-            with open(cache_path, "w", encoding="utf-8") as f:
-                f.write(cache_payload)
+            cache_payload = self.cache_service.write_paged_cache(cache_path, pages_text)
             self._trace_cache_write(
                 cache_path=cache_path,
                 cache_kind=type(self).cache_dir_name,
@@ -1285,6 +1208,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             raise RuntimeError(
                 "未检测到 GOOGLE_GEMINI_API_KEY。请先配置该环境变量后再使用本功能。"
             )
+        self.llm_service.update_api_key(api_key)
 
         cache_path = self._build_cache_path(pdf_path)
         if os.path.exists(cache_path):
@@ -1295,63 +1219,56 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 ),
             )
             self.after(0, lambda: self.ocr_progress_bar.set(1))
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cached_text = f.read()
-                return self._parse_cached_ocr_pages(cached_text), True
+            return self.cache_service.read_paged_cache(cache_path), True
 
-        with fitz.open(pdf_path) as doc:
-            if len(doc) == 0:
-                return [""], False
+        if not self.current_pdf or self.selected_pdf_path != pdf_path:
+            self.current_pdf = self.pdf_service.open_pdf(pdf_path)
 
-            all_page_texts = []
-            total_pages = len(doc)
-            for page_index in range(total_pages):
-                self._ensure_active_task(task_id)
-                self._update_ocr_progress(task_id, page_index, total_pages)
-                file_tag = f"{os.path.basename(pdf_path)}_第{page_index + 1}页"
-                model_name = self.selected_model_var.get()
+        if self.pdf_service.get_page_count() == 0:
+            return [""], False
 
-                if type(self).requires_image_input:
-                    page = doc[page_index]
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
-                    image_bytes = pix.tobytes("png")
-                    page_text = self._detect_text_from_image(
-                        api_key,
-                        file_name=file_tag,
-                        model_name=model_name,
-                        image_bytes=image_bytes,
-                        page_index=page_index,
-                    )
-                else:
-                    ocr_src = self._get_ocr_text_for_page(pdf_path, page_index)
-                    if not ocr_src:
-                        raise RuntimeError(
-                            f"第 {page_index + 1} 页缺少可用的 OCR 文本。"
-                            "请先在「史料校对」页面完成 OCR 提取与校对！"
-                        )
-                    page_text = self._detect_text_from_image(
-                        api_key,
-                        file_name=file_tag,
-                        model_name=model_name,
-                        source_text=ocr_src,
-                        page_index=page_index,
-                    )
-                marker = type(self).empty_page_marker
-                all_page_texts.append(page_text.strip() if page_text else marker)
-                # 全书任务按页增量写盘，避免中途中断导致前序结果不可见
-                partial_payload = json.dumps({"format": "paged_v1", "pages": all_page_texts}, ensure_ascii=False)
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    f.write(partial_payload)
-                self._trace_cache_write(
-                    cache_path=cache_path,
-                    cache_kind=type(self).cache_dir_name,
-                    content=partial_payload,
+        all_page_texts = []
+        total_pages = self.pdf_service.get_page_count()
+        for page_index in range(total_pages):
+            self._ensure_active_task(task_id)
+            self._update_ocr_progress(task_id, page_index, total_pages)
+            file_tag = f"{os.path.basename(pdf_path)}_第{page_index + 1}页"
+            model_name = self.selected_model_var.get()
+
+            if type(self).requires_image_input:
+                image_bytes = self.pdf_service.get_page_bytes(page_index)
+                page_text = self._detect_text_from_image(
+                    api_key,
+                    file_name=file_tag,
+                    model_name=model_name,
+                    image_bytes=image_bytes,
                     page_index=page_index,
                 )
+            else:
+                ocr_src = self._get_ocr_text_for_page(pdf_path, page_index)
+                if not ocr_src:
+                    raise RuntimeError(
+                        f"第 {page_index + 1} 页缺少可用的 OCR 文本。"
+                        "请先在「史料校对」页面完成 OCR 提取与校对！"
+                    )
+                page_text = self._detect_text_from_image(
+                    api_key,
+                    file_name=file_tag,
+                    model_name=model_name,
+                    source_text=ocr_src,
+                    page_index=page_index,
+                )
+            marker = type(self).empty_page_marker
+            all_page_texts.append(page_text.strip() if page_text else marker)
+            partial_payload = self.cache_service.write_paged_cache(cache_path, all_page_texts)
+            self._trace_cache_write(
+                cache_path=cache_path,
+                cache_kind=type(self).cache_dir_name,
+                content=partial_payload,
+                page_index=page_index,
+            )
 
-        cache_payload = json.dumps({"format": "paged_v1", "pages": all_page_texts}, ensure_ascii=False)
-        with open(cache_path, "w", encoding="utf-8") as f:
-            f.write(cache_payload)
+        cache_payload = self.cache_service.write_paged_cache(cache_path, all_page_texts)
         self._trace_cache_write(
             cache_path=cache_path,
             cache_kind=type(self).cache_dir_name,
@@ -1361,21 +1278,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         return all_page_texts, False
 
     def _parse_cached_ocr_pages(self, cached_text):
-        try:
-            payload = json.loads(cached_text)
-            if isinstance(payload, dict) and payload.get("format") == "paged_v1":
-                pages = payload.get("pages", [])
-                if isinstance(pages, list) and len(pages) > 0:
-                    return [str(p) for p in pages]
-        except json.JSONDecodeError:
-            pass
-
-        legacy_pattern = r"\n\n===== 第 \d+ / \d+ 页 =====\n"
-        parts = re.split(legacy_pattern, cached_text)
-        page_texts = [part.strip() for part in parts if part.strip()]
-        if page_texts:
-            return page_texts
-        return [cached_text.strip() if cached_text.strip() else "未识别到文本内容。"]
+        return self.cache_service.parse_paged_text(cached_text)
 
     def _set_ocr_pages(self, pages):
         self.ocr_pages = [p if p is not None else "" for p in pages] if pages else [""]
@@ -1450,20 +1353,15 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             return
         cache_path = self._build_cache_path(self.selected_pdf_path)
         pages = ["" if p is None else str(p) for p in self.ocr_pages]
-        payload = {"format": "paged_v1", "pages": pages}
         try:
-            with open(cache_path, "w", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=False))
+            self.cache_service.write_paged_cache(cache_path, pages)
         except OSError as e:
             messagebox.showerror("错误", f"保存失败：{e}")
             return
         messagebox.showinfo("提示", "当前修改已成功保存至本地缓存！")
 
     def _build_cache_path(self, pdf_path):
-        stat = os.stat(pdf_path)
-        cache_key = f"{pdf_path}|{stat.st_mtime_ns}|{stat.st_size}"
-        name = hashlib.sha256(cache_key.encode("utf-8")).hexdigest() + ".txt"
-        return os.path.join(self.document_cache_dir, name)
+        return self.cache_service.build_cache_path(pdf_path, self.document_cache_dir)
 
     def _ensure_active_task(self, task_id):
         if task_id != self.ocr_task_id or self.ocr_cancel_event.is_set():
@@ -1492,29 +1390,15 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         confirmed = messagebox.askyesno("严重警告", self._clear_all_cache_warning_message())
         if not confirmed:
             return
-
-        if not os.path.exists(self.document_cache_dir):
-            os.makedirs(self.document_cache_dir)
-            messagebox.showinfo("提示", "缓存目录不存在，已自动创建。")
-            self._load_file_list()
-            return
-
-        removed_count = 0
-        failed_count = 0
-        for filename in os.listdir(self.document_cache_dir):
-            path = os.path.join(self.document_cache_dir, filename)
-            if not os.path.isfile(path):
-                continue
-            try:
-                os.remove(path)
-                removed_count += 1
-            except OSError:
-                failed_count += 1
+        removed_count, failed_count = self.cache_service.clear_directory(self.document_cache_dir)
 
         if failed_count > 0:
             messagebox.showwarning("提示", f"已清理 {removed_count} 个缓存文件，另有 {failed_count} 个文件删除失败。")
         else:
-            messagebox.showinfo("提示", f"缓存已清空，共删除 {removed_count} 个文件。")
+            if removed_count == 0:
+                messagebox.showinfo("提示", "缓存目录不存在或为空，已确保目录可用。")
+            else:
+                messagebox.showinfo("提示", f"缓存已清空，共删除 {removed_count} 个文件。")
         self._load_file_list()
 
     def clear_current_file_cache(self):
@@ -1563,161 +1447,31 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         source_text: str | None = None,
         page_index: int = None,
     ):
-        if (image_bytes is None) == (source_text is None):
-            raise ValueError("必须且仅能指定 image_bytes 与 source_text 其中之一")
-
-        client = genai.Client(api_key=api_key)
-        academic_prompt = self.get_academic_prompt(page_index)
-        trace_cfg = self._load_trace_cfg()
-        trace_include_full_text = trace_cfg["include_full_text"]
-        request_started_at = time.perf_counter()
-
-        if image_bytes is not None:
-            image = Image.open(io.BytesIO(image_bytes))
-            contents = [academic_prompt, image]
-        else:
-            contents = [
-                f"{academic_prompt}\n\n【待处理的 OCR 史料底稿】：\n{source_text}"
-            ]
-
-        self._trace_event(
-            "request_prepared",
-            {
-                "file_name": file_name,
-                "page_index": page_index,
-                "model_name": model_name,
-                "input_kind": "image" if image_bytes is not None else "text",
-                "prompt_text": self._trace_text(academic_prompt, trace_include_full_text),
-                "source_text": self._trace_text(source_text, trace_include_full_text) if source_text is not None else None,
-                "image_bytes_len": len(image_bytes) if image_bytes is not None else 0,
-            },
+        self.llm_service.update_api_key(api_key)
+        enrich_hook = self.enrich_json_data if hasattr(self, "enrich_json_data") else None
+        result_text, usage_summary = self.llm_service.detect_text(
+            screen_name=type(self).__name__,
+            task_name=type(self).task_short_name,
+            selected_pdf_path=self.selected_pdf_path,
+            file_name=file_name,
+            model_name=model_name,
+            academic_prompt=self.get_academic_prompt(page_index),
+            behavior_name=type(self).task_short_name,
+            page_index=page_index,
+            image_bytes=image_bytes,
+            source_text=source_text,
+            enrich_json_data=enrich_hook,
         )
-
-        try:
-            response = self._call_gemini_with_timeout(
-                client,
-                model_name=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    safety_settings=[
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE
-                        ),
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE
-                        ),
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE
-                        ),
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE
-                        ),
-                    ]
-                ),
-            )
-            usage_summary = log_gemini_usage(
-                getattr(response, "usage_metadata", None),
-                file_name,
-                type(self).task_short_name,
-                model_name
-            )
-            self.after(0, lambda s=usage_summary: self._accumulate_usage_summary(s))
-            # ==========================================
-            # 🧮 核心拦截器：动态识别纯文本与 JSON，并双轨处理
-            # ==========================================
-            raw_text = response.text.strip()
-            elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
-            self._trace_event(
-                "response_received",
-                {
-                    "file_name": file_name,
-                    "page_index": page_index,
-                    "model_name": model_name,
-                    "elapsed_ms": elapsed_ms,
-                    "usage_summary": usage_summary,
-                    "response_text": self._trace_text(raw_text, trace_include_full_text),
-                    "response_len": len(raw_text),
-                },
-            )
-
-            # 1. 清理可能存在的 Markdown 代码块标记
-            clean_text = raw_text
-            if clean_text.startswith("```json"):
-                clean_text = clean_text[7:-3].strip()
-            elif clean_text.startswith("```"):
-                clean_text = clean_text[3:-3].strip()
-
-            try:
-                # 2. 尝试解析为 JSON。如果失败，说明是 OCR/翻译任务，直接跳转 except 放行
-                data = json.loads(clean_text)
-
-                # 3. 🪝 触发钩子：如果子类（如 AnalysisScreen）有元数据注入方法，则调用
-                if hasattr(self, "enrich_json_data") and getattr(self, "selected_pdf_path", None):
-                    data = self.enrich_json_data(data, self.selected_pdf_path)
-
-                # --- 🥇 数据库轨：将纯净 JSON 存档至独立数据库文件夹 ---
-                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                db_dir = os.path.join(base_dir, "Database_JSON")
-                os.makedirs(db_dir, exist_ok=True)
-
-                # 使用解析出的 Document_ID 命名，如果没有则退化为 PDF 的基础文件名
-                doc_id = data.get("Document_ID", file_name.replace(".pdf", ""))
-                safe_doc_id = re.sub(r'[\\/:*?"<>|]+', "_", str(doc_id)).strip("_") or "unknown_document"
-                page_match = re.search(r"第(\d+)页", file_name)
-                if page_match:
-                    page_suffix = f"_p{int(page_match.group(1)):04d}"
-                else:
-                    # 兜底：无页码信息时避免覆盖
-                    page_suffix = f"_seg_{abs(hash(file_name)) % 100000:05d}"
-
-                json_save_path = os.path.join(db_dir, f"{safe_doc_id}{page_suffix}.json")
-
-                with open(json_save_path, "w", encoding="utf-8") as jf:
-                    json.dump(data, jf, ensure_ascii=False, indent=2)
-                self._trace_cache_write(
-                    cache_path=json_save_path,
-                    cache_kind="Database_JSON",
-                    content=json.dumps(data, ensure_ascii=False, indent=2),
-                    page_index=page_index,
-                )
-
-                # --- 🥈 UI 轨：直接返回 JSON 字符串（由子类决定如何渲染） ---
-                return json.dumps(data, ensure_ascii=False, indent=2)
-
-            except json.JSONDecodeError:
-                # 4. 如果大模型吐出的不是合法的 JSON，说明是常规 OCR 或纯文本翻译
-                # 直接原样返回给 UI 和常规 txt 缓存
-                return raw_text
-            
-        except Exception as e:
-            self._trace_event(
-                "request_error",
-                {
-                    "file_name": file_name,
-                    "page_index": page_index,
-                    "model_name": model_name,
-                    "error": str(e),
-                    "elapsed_ms": int((time.perf_counter() - request_started_at) * 1000),
-                },
-            )
-            raise RuntimeError(f"Gemini API 调用失败: {e}")
+        self.after(0, lambda s=usage_summary: self._accumulate_usage_summary(s))
+        return result_text
 
     def render_page(self):
-        if not self.current_pdf: return
-        page = self.current_pdf[self.current_page]
-        self.page_label.configure(text=f"页码: {self.current_page + 1} / {len(self.current_pdf)}")
-        
-        mat = fitz.Matrix(self.zoom_factor, self.zoom_factor)
-        pix = page.get_pixmap(matrix=mat)
-        
-        mode = "RGBA" if pix.alpha else "RGB"
-        img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
-        self.tk_image = ImageTk.PhotoImage(img)
-        
+        if not self.current_pdf:
+            return
+        total_pages = self.pdf_service.get_page_count()
+        self.page_label.configure(text=f"页码: {self.current_page + 1} / {total_pages}")
+        self.tk_image = self.pdf_service.render_page_image(self.current_page, self.zoom_factor)
+
         self.canvas.delete("all")
         self.canvas.update_idletasks()
         cx = self.canvas.winfo_width() // 2
