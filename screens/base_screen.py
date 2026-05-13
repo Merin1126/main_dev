@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import threading
+import time
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 import customtkinter as ctk
@@ -55,6 +56,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     )
     #: 单页 Gemini 请求超时时间（秒）
     api_request_timeout_sec: int = 120
+    #: 页级超时重试总次数（含首次调用）
+    api_timeout_max_attempts: int = 3
 
     @abstractmethod
     def get_academic_prompt(self, page_index: int = None) -> str:
@@ -806,23 +809,33 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
             if type(self).requires_image_input:
                 image_bytes = self.pdf_service.get_page_bytes(page_index)
-                result = self._detect_text_from_image(
-                    api_key,
-                    file_name=file_tag,
-                    model_name=model_name,
-                    image_bytes=image_bytes,
+                result = self._call_page_with_retry(
+                    task_id=task_id,
                     page_index=page_index,
+                    total_pages=total_pages,
+                    invoke_fn=lambda: self._detect_text_from_image(
+                        api_key,
+                        file_name=file_tag,
+                        model_name=model_name,
+                        image_bytes=image_bytes,
+                        page_index=page_index,
+                    ),
                 )
             else:
                 ocr_text = self._get_ocr_text_for_page(self.selected_pdf_path, page_index)
                 if not ocr_text:
                     raise RuntimeError(self.MISSING_OCR_FOR_CURRENT_PAGE_MSG)
-                result = self._detect_text_from_image(
-                    api_key,
-                    file_name=file_tag,
-                    model_name=model_name,
-                    source_text=ocr_text,
+                result = self._call_page_with_retry(
+                    task_id=task_id,
                     page_index=page_index,
+                    total_pages=total_pages,
+                    invoke_fn=lambda: self._detect_text_from_image(
+                        api_key,
+                        file_name=file_tag,
+                        model_name=model_name,
+                        source_text=ocr_text,
+                        page_index=page_index,
+                    ),
                 )
 
             if task_id != self.ocr_task_id:
@@ -920,7 +933,19 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self._set_ocr_state(DocumentTaskState.ERROR)
         self.ocr_progress_label.configure(text=self._status_colon("失败"))
         self.ocr_progress_bar.set(0)
-        messagebox.showerror(f"{type(self).task_short_name} 失败", reason)
+        full_reason = str(reason)
+        if "请求超时" in full_reason:
+            done = 0
+            total = self.pdf_service.get_page_count() if self.current_pdf else 0
+            if self.selected_pdf_path:
+                cache_path = self._build_cache_path(self.selected_pdf_path)
+                done = len(self.cache_service.read_paged_cache(cache_path))
+            full_reason += (
+                f"\n\n网络连接可能无响应，当前已保存进度：{done}/{total} 页。"
+                "\n排查网络后可直接再次点击开始，系统会自动从断点继续。"
+            )
+            self.ocr_progress_label.configure(text=self._status_colon("网络无响应（已保留断点进度）"))
+        messagebox.showerror(f"{type(self).task_short_name} 失败", full_reason)
         self.text_editor.insert(
             "end",
             f"\n\n{type(self).task_short_name} 失败，请检查网络连接和 GOOGLE_GEMINI_API_KEY 配置。",
@@ -938,26 +963,48 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             )
         self.llm_service.update_api_key(api_key)
 
-        cache_path = self._build_cache_path(pdf_path)
-        if os.path.exists(cache_path):
-            self.after(
-                0,
-                lambda: self.ocr_progress_label.configure(
-                    text=self._status_colon("读取本地缓存中...")
-                ),
-            )
-            self.after(0, lambda: self.ocr_progress_bar.set(1))
-            return self.cache_service.read_paged_cache(cache_path), True
-
         if not self.current_pdf or self.selected_pdf_path != pdf_path:
             self.current_pdf = self.pdf_service.open_pdf(pdf_path)
 
-        if self.pdf_service.get_page_count() == 0:
+        total_pages = self.pdf_service.get_page_count()
+        if total_pages == 0:
             return [""], False
 
-        all_page_texts = []
-        total_pages = self.pdf_service.get_page_count()
-        for page_index in range(total_pages):
+        cache_path = self._build_cache_path(pdf_path)
+        all_page_texts = [""] * total_pages
+        start_page = 0
+
+        if os.path.exists(cache_path):
+            cached_pages = self.cache_service.read_paged_cache(cache_path)
+            if cached_pages:
+                usable = min(len(cached_pages), total_pages)
+                all_page_texts[:usable] = cached_pages[:usable]
+
+                first_incomplete = usable
+                for i in range(usable):
+                    if not str(all_page_texts[i]).strip():
+                        first_incomplete = i
+                        break
+
+                if first_incomplete >= total_pages:
+                    self.after(
+                        0,
+                        lambda: self.ocr_progress_label.configure(
+                            text=self._status_colon("已完成（来自本地缓存）")
+                        ),
+                    )
+                    self.after(0, lambda: self.ocr_progress_bar.set(1))
+                    return all_page_texts, True
+
+                start_page = first_incomplete
+                self.after(
+                    0,
+                    lambda s=start_page, t=total_pages: self.ocr_progress_label.configure(
+                        text=self._status_colon(f"检测到断点缓存：已完成 {s}/{t} 页，继续处理中...")
+                    ),
+                )
+
+        for page_index in range(start_page, total_pages):
             self._ensure_active_task(task_id)
             self._update_ocr_progress(task_id, page_index, total_pages)
             file_tag = f"{os.path.basename(pdf_path)}_第{page_index + 1}页"
@@ -965,12 +1012,17 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
             if type(self).requires_image_input:
                 image_bytes = self.pdf_service.get_page_bytes(page_index)
-                page_text = self._detect_text_from_image(
-                    api_key,
-                    file_name=file_tag,
-                    model_name=model_name,
-                    image_bytes=image_bytes,
+                page_text = self._call_page_with_retry(
+                    task_id=task_id,
                     page_index=page_index,
+                    total_pages=total_pages,
+                    invoke_fn=lambda: self._detect_text_from_image(
+                        api_key,
+                        file_name=file_tag,
+                        model_name=model_name,
+                        image_bytes=image_bytes,
+                        page_index=page_index,
+                    ),
                 )
             else:
                 ocr_src = self._get_ocr_text_for_page(pdf_path, page_index)
@@ -979,16 +1031,21 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                         f"第 {page_index + 1} 页缺少可用的 OCR 文本。"
                         "请先在「史料校对」页面完成 OCR 提取与校对！"
                     )
-                page_text = self._detect_text_from_image(
-                    api_key,
-                    file_name=file_tag,
-                    model_name=model_name,
-                    source_text=ocr_src,
+                page_text = self._call_page_with_retry(
+                    task_id=task_id,
                     page_index=page_index,
+                    total_pages=total_pages,
+                    invoke_fn=lambda: self._detect_text_from_image(
+                        api_key,
+                        file_name=file_tag,
+                        model_name=model_name,
+                        source_text=ocr_src,
+                        page_index=page_index,
+                    ),
                 )
             marker = type(self).empty_page_marker
-            all_page_texts.append(page_text.strip() if page_text else marker)
-            partial_payload = self.cache_service.write_paged_cache(cache_path, all_page_texts)
+            all_page_texts[page_index] = page_text.strip() if page_text else marker
+            partial_payload = self.cache_service.write_paged_cache(cache_path, all_page_texts[: page_index + 1])
             self._trace_cache_write(
                 cache_path=cache_path,
                 cache_kind=type(self).cache_dir_name,
@@ -1025,12 +1082,41 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         if hasattr(self, "ocr_page_entry"):
             self.ocr_page_entry.delete(0, "end")
             self.ocr_page_entry.insert(0, str(self.current_ocr_page_index + 1))
+        self._sync_pdf_page_to_text_page()
 
     def _save_current_ocr_page(self):
         if not self.ocr_pages:
             self.ocr_pages = [""]
             self.current_ocr_page_index = 0
         self.ocr_pages[self.current_ocr_page_index] = self.text_editor.get("0.0", "end").strip()
+
+    def _can_bind_pdf_and_text_page(self) -> bool:
+        if not self.current_pdf:
+            return False
+        total_pdf_pages = self.pdf_service.get_page_count()
+        if total_pdf_pages <= 0:
+            return False
+        # 只有当右侧是有效分页结果（页数与 PDF 一致）时才启用双向绑定，避免提示文案干扰。
+        return len(self.ocr_pages) == total_pdf_pages
+
+    def _sync_pdf_page_to_text_page(self) -> None:
+        if not self._can_bind_pdf_and_text_page():
+            return
+        target = max(0, min(self.current_ocr_page_index, self.pdf_service.get_page_count() - 1))
+        if target == self.current_page:
+            return
+        self.current_page = target
+        self.render_page()
+
+    def _sync_text_page_to_pdf_page(self) -> None:
+        if not self._can_bind_pdf_and_text_page():
+            return
+        target = max(0, min(self.current_page, len(self.ocr_pages) - 1))
+        if target == self.current_ocr_page_index:
+            return
+        self._save_current_ocr_page()
+        self.current_ocr_page_index = target
+        self._show_current_ocr_page()
 
     def prev_ocr_page(self):
         if len(self.ocr_pages) <= 1:
@@ -1104,6 +1190,34 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.after(0, lambda: self.ocr_progress_label.configure(text=text))
         ratio = 0 if total_pages <= 0 else ((page_index + 1) / total_pages)
         self.after(0, lambda: self.ocr_progress_bar.set(ratio))
+
+    @staticmethod
+    def _is_timeout_error(err: Exception) -> bool:
+        msg = str(err)
+        return ("请求超时" in msg) or ("timed out" in msg.lower())
+
+    def _call_page_with_retry(self, *, task_id: int, page_index: int, total_pages: int, invoke_fn):
+        max_attempts = max(1, int(type(self).api_timeout_max_attempts))
+        last_err = None
+        for attempt in range(1, max_attempts + 1):
+            self._ensure_active_task(task_id)
+            try:
+                return invoke_fn()
+            except Exception as e:
+                last_err = e
+                if not self._is_timeout_error(e) or attempt >= max_attempts:
+                    raise
+                wait_s = min(8, 2 * attempt)
+                self.after(
+                    0,
+                    lambda a=attempt, w=wait_s: self.ocr_progress_label.configure(
+                        text=self._status_colon(
+                            f"第 {page_index + 1}/{total_pages} 页请求超时，正在进行第 {a + 1} 次重试（{w}s 后）"
+                        )
+                    ),
+                )
+                time.sleep(wait_s)
+        raise last_err
 
     def cancel_ocr_task(self, silent=False):
         self.ocr_cancel_event.set()
@@ -1228,8 +1342,10 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         if self.current_pdf and self.current_page > 0:
             self.current_page -= 1
             self.render_page()
+            self._sync_text_page_to_pdf_page()
 
     def next_page(self):
         if self.current_pdf and self.current_page < len(self.current_pdf) - 1:
             self.current_page += 1
             self.render_page()
+            self._sync_text_page_to_pdf_page()

@@ -6,7 +6,7 @@ import re
 
 import customtkinter as ctk
 
-from config.academic_prompts import ANALYSIS_ACADEMIC_PROMPT
+from config.academic_prompts import render_analysis_prompt
 from config.translation_prompts import TRANSLATION_PLUGINS
 from screens.base_screen import BaseDocumentScreen
 
@@ -385,7 +385,8 @@ class AnalysisScreen(BaseDocumentScreen):
     def get_academic_prompt(self, page_index: int = None) -> str:
         # 将提示词中的占位符替换为真实的插件列表
         plugin_keys = "』、『".join(TRANSLATION_PLUGINS.keys())
-        base_prompt = ANALYSIS_ACADEMIC_PROMPT.replace("__TRANSLATION_PLUGIN_ENUM__", f"『{plugin_keys}』")
+        prev_date = ""
+        inject_text = ""
 
         # 滚动记忆逻辑：如果不是第一页，尝试读取上一页的 JSON
         if page_index is not None and page_index > 0 and self.ocr_pages:
@@ -396,6 +397,9 @@ class AnalysisScreen(BaseDocumentScreen):
                     ctx = prev_data.get("Historical_Context", {})
                     if ctx:
                         date = ctx.get("Date_Written", "未知")
+                        date_text = str(date).strip() if date is not None else ""
+                        if date_text and date_text != "未知":
+                            prev_date = date_text
                         sender = ctx.get("Author_Sender", "未知")
                         recipient = ctx.get("Recipient", "未知")
                         doc_type = ctx.get("Document_Type", "未知")
@@ -408,9 +412,12 @@ class AnalysisScreen(BaseDocumentScreen):
                             f"▶️ 如果本页内容是上一页的延续（未出现新的公文开头），请直接【继承】上述元数据和插件标签填充JSON，以保持同份档案的数据连续性。\n"
                             f"▶️ 如果本页出现了全新的发文落款或切换了公文类型，请提取新的数据覆盖。"
                         )
-                        base_prompt += inject_text
             except Exception:
                 pass
+
+        base_prompt = render_analysis_prompt(f"『{plugin_keys}』", prev_date=prev_date)
+        if inject_text:
+            base_prompt += inject_text
         return base_prompt
 
     def export_document(self) -> None:

@@ -6,8 +6,9 @@ import os
 
 import customtkinter as ctk
 
-from config.translation_prompts import TRANSLATION_BASE_PROMPT, TRANSLATION_PLUGINS
+from config.translation_prompts import TRANSLATION_PLUGINS
 from screens.base_screen import BaseDocumentScreen
+from services.template_service import TemplateService
 
 
 class TranslationScreen(BaseDocumentScreen):
@@ -39,93 +40,58 @@ class TranslationScreen(BaseDocumentScreen):
         )
         self.plugin_status_label.pack(fill="x", padx=10, pady=(0, 4), before=self.text_editor)
 
-    def _build_rag_context(self, analysis_cache_path: str, ocr_cache_path: str, page_index: int) -> tuple[str, str]:
-        """提取知识图谱与滑动窗口，返回 (知识图谱文本, 滑动窗口文本)"""
-        glossary = {
-            "Organizations": set(),
-            "Key_Figures": set(),
-            "Locations": set(),
-            "Discourse_Keywords": set(),
-        }
-        arc_lines = []
-        sliding_window_text = ""
+    def _build_rag_context(self, analysis_cache_path: str, ocr_cache_path: str, page_index: int) -> tuple[str, str, str]:
+        """提取远端摘要与紧邻原文，返回 (context_summary, prev_page_raw, next_page_raw)。"""
+        context_lines = []
+        prev_page_raw = ""
+        next_page_raw = ""
 
-        # 1. 提取全局图谱与大纲
+        # 1) 远端摘要：限制在前后各2页（不含当前页）
         if os.path.exists(analysis_cache_path):
             try:
                 with open(analysis_cache_path, "r", encoding="utf-8") as f:
                     analysis_data = json.loads(f.read())
                 pages = analysis_data.get("pages", [])
-
-                for i, page_str in enumerate(pages):
+                start_idx = max(0, page_index - 2)
+                end_idx = min(len(pages), page_index + 3)
+                for i in range(start_idx, end_idx):
+                    if i == page_index:
+                        continue
+                    page_str = pages[i] if i < len(pages) else ""
                     if not page_str or "未识别到文本" in page_str:
                         continue
                     try:
                         p_data = json.loads(page_str)
-                        # 提炼大纲
                         judgement = p_data.get("Discourse_Analysis", {}).get("Core_Judgment", "")
                         if judgement and "未提及" not in judgement:
-                            arc_lines.append(f"第{i + 1}页：{judgement}")
-
-                        # 提炼词汇去重
-                        ent = p_data.get("Entities_and_Concepts", {})
-                        for k in glossary.keys():
-                            items = ent.get(k, [])
-                            if isinstance(items, list):
-                                for item in items:
-                                    if item and "未提及" not in str(item):
-                                        glossary[k].add(str(item).strip())
+                            context_lines.append(f"第{i + 1}页：{judgement}")
                     except Exception:
                         continue
             except Exception:
                 pass
 
-        # 2. 提取滑动窗口 (前后各2页)
+        # 2) 近端原文：仅提取紧邻页（前1页 + 后1页）
         if os.path.exists(ocr_cache_path):
             try:
                 with open(ocr_cache_path, "r", encoding="utf-8") as f:
                     ocr_data = json.loads(f.read())
                 ocr_pages = ocr_data.get("pages", [])
-
-                start_idx = max(0, page_index - 2)
-                end_idx = min(len(ocr_pages), page_index + 3)
-
-                window_parts = []
-                for i in range(start_idx, end_idx):
-                    if i == page_index:
-                        # 当前页不需要放在窗口中，系统会自动作为原文传入
-                        continue
-                    window_parts.append(f"【第{i + 1}页参考原文】\n{ocr_pages[i]}")
-
-                if window_parts:
-                    sliding_window_text = "\n\n".join(window_parts)
+                if page_index - 1 >= 0 and page_index - 1 < len(ocr_pages):
+                    prev_page_raw = str(ocr_pages[page_index - 1] or "")
+                if page_index + 1 < len(ocr_pages):
+                    next_page_raw = str(ocr_pages[page_index + 1] or "")
             except Exception:
                 pass
 
-        # 3. 格式化并挂载防火墙
-        orgs = "、".join(glossary["Organizations"]) or "无"
-        figs = "、".join(glossary["Key_Figures"]) or "无"
-        locs = "、".join(glossary["Locations"]) or "无"
-        words = "、".join(glossary["Discourse_Keywords"]) or "无"
-        arc_text = "\n".join(arc_lines) if arc_lines else "暂无"
-
-        rag_text = (
-            f"【全局知识图谱（全书统一译名表）】\n"
-            f"人物：{figs}\n组织：{orgs}\n地点：{locs}\n主观词汇：{words}\n\n"
-            f"【全书剧情大纲（事件背景参考）】\n{arc_text}\n\n"
-            f"【⚠️ 文风与事实防火墙 ⚠️】\n"
-            f"以上“剧情大纲”由现代学术助手生成，仅供你作为事实背景、人物关系和事件走向的参考（防止你产生理解歧义）。\n"
-            f"你必须严格坚守『半文半白』与『历史厚重感』的全局翻译法则，绝对不可抄袭或模仿上述大纲中的现代白话文措辞！"
-        )
-
-        return rag_text, sliding_window_text
+        context_summary = "\n".join(context_lines).strip()
+        return context_summary, prev_page_raw, next_page_raw
 
     def get_academic_prompt(self, page_index: int = None) -> str:
-        base_prompt = TRANSLATION_BASE_PROMPT
         active_plugins = []
         context_info = ""
-        rag_context = ""
-        sliding_window_context = ""
+        context_summary = ""
+        prev_page_raw = ""
+        next_page_raw = ""
         prev_translation_context = ""
 
         if self.selected_pdf_path and page_index is not None and page_index >= 0:
@@ -164,17 +130,12 @@ class TranslationScreen(BaseDocumentScreen):
                 except Exception:
                     pass
 
-            # [读取2] 构建 RAG 知识图谱与滑动窗口
-            rag_text, sliding_text = self._build_rag_context(analysis_cache_path, ocr_cache_path, page_index)
-            if rag_text:
-                rag_context = f"\n\n{rag_text}"
-            if sliding_text:
-                sliding_window_context = (
-                    f"\n\n【局部滑动窗口（上下文原文参考）】\n"
-                    f"为保证跨页断句与专有名词的连贯，以下是当前页前后的原文片段：\n"
-                    f"{sliding_text}\n"
-                    f"⚠️ 警告：你【只需要】翻译本次输入给你的当前页文本，严禁翻译上述参考文本！"
-                )
+            # [读取2] 构建“远端摘要 + 近端原文”
+            context_summary, prev_page_raw, next_page_raw = self._build_rag_context(
+                analysis_cache_path,
+                ocr_cache_path,
+                page_index,
+            )
 
             # [读取3] 上一页翻译结果 (防止断句碎裂)
             if page_index > 0 and self.ocr_pages and page_index - 1 < len(self.ocr_pages):
@@ -188,22 +149,29 @@ class TranslationScreen(BaseDocumentScreen):
                     )
 
         # 组装最终 Prompt
-        final_prompt = base_prompt + context_info
         plugin_names = []
+        valid_active_plugins = []
         if active_plugins:
-            plugin_texts = []
             for p in active_plugins:
                 if p in TRANSLATION_PLUGINS:
-                    plugin_texts.append(TRANSLATION_PLUGINS[p])
+                    valid_active_plugins.append(p)
                     plugin_names.append(f"[{p}]")
-            if plugin_texts:
-                final_prompt += "\n\n" + "\n\n".join(plugin_texts)
-
-        final_prompt += rag_context + sliding_window_context + prev_translation_context
+        final_prompt = TemplateService().render_prompt(
+            "translation_prompt.jinja",
+            {
+                "context_info": context_info,
+                "active_plugins": valid_active_plugins,
+                "plugins_map": TRANSLATION_PLUGINS,
+                "context_summary": context_summary,
+                "prev_page_raw": prev_page_raw,
+                "next_page_raw": next_page_raw,
+                "prev_translation_context": prev_translation_context,
+            },
+        )
 
         # 动态更新 UI 反馈标签
         display_names = " + ".join(plugin_names) if plugin_names else "无附加插件 (纯核心底座)"
-        ui_text = f"⚙️ 引擎组装：核心底座 + {display_names} | 🟢 RAG 图谱已注入"
+        ui_text = f"⚙️ 引擎组装：核心底座 + {display_names} | 🟢 远近上下文已注入"
         if hasattr(self, "plugin_status_label"):
             self.after(0, lambda: self.plugin_status_label.configure(text=ui_text))
 

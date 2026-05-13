@@ -102,13 +102,16 @@ class LlmService:
                 config=config,
             )
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_do_call)
-            try:
-                return future.result(timeout=timeout_s)
-            except FuturesTimeoutError:
-                future.cancel()
-                raise RuntimeError(f"Gemini 请求超时（>{timeout_s}s）")
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_do_call)
+        try:
+            return future.result(timeout=timeout_s)
+        except FuturesTimeoutError:
+            future.cancel()
+            raise RuntimeError(f"Gemini 请求超时（>{timeout_s}s）")
+        finally:
+            # 关键：不要在超时后等待后台线程结束，避免主流程被额外阻塞数分钟。
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def detect_text(
         self,

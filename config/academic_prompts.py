@@ -1,32 +1,18 @@
-"""Central place for long-form academic prompts."""
+"""Academic prompt rendering helpers powered by Jinja2 templates."""
 
-ANALYSIS_ACADEMIC_PROMPT = """你是一位专攻日本近代政治与军事档案的顶尖研究者。
+from services.template_service import TemplateService
 
-请仔细阅读以下由 OCR 提取的 1921-1927 年间日本军政档案原文文本。你需要对日方对中国共产党、国民革命及反帝运动的「观察、认识、判断与因应」进行深度解构。
 
-【强制执行规则】：
-必须严格以 JSON 格式输出，绝对不要包含任何 Markdown 标记（如 ```json），直接输出纯 JSON 字符串。请严格遵循以下 JSON 结构与字段定义：
+def render_ocr_prompt() -> str:
+    return TemplateService().render_prompt("ocr_prompt.jinja", {})
 
-{
-  "Historical_Context": {
-    "Date_Written": "提取文件的撰写或发布时间（请转换为 YYYY-MM-DD 格式，若仅有年月则填 YYYY-MM，未知填 null）",
-    "Author_Sender": "提取发文者或报告人的职衔与姓名（如：驻广州总领事、特务机关长）",
-    "Recipient": "提取收文者或呈报对象（如：外务大臣、参谋本部）",
-    "Document_Type": "判断文书类型（如：情报报告、训令、电报、决议草案等）",
-    "Translation_Plugins": ["根据 Document_Type 和文本语境，从以下限定列表中选择 0 到多个最匹配的翻译滤镜，必须绝对使用原词：__TRANSLATION_PLUGIN_ENUM__。若无匹配则输出空数组 []"]
-  },
-  "Entities_and_Concepts": {
-    "Organizations": ["提取文中出现的所有相关组织与机构（如：中国共产党、广州国民政府、省港罢工委员会等）"],
-    "Key_Figures": ["提取文中出现的关键人物（如：陈独秀、鲍罗廷、孙中山等）"],
-    "All_Figures": ["提取文中出现的所有人物姓名"],
-    "Locations": ["提取事件发生的核心地理位置（如：广州、沙面、武汉等）"],
-    "Discourse_Keywords": ["提取日方在公文中使用的具有『强烈主观色彩』或『话语权力』的历史专有名词（如：赤化、排外、暴支、容共、过激派等）"]
-  },
-  "Discourse_Analysis": {
-    "Observation_Info": "（观察与认知）用一句话概括日方通过何种渠道获取了什么具体情报或事实？",
-    "Core_Judgment": "（认识与判断）用一句话精准概括日方对该事件的定性或战略研判（如：认为受赤化思想主导、判断国共必将分裂等）。",
-    "Response_Action": "（因应）用一句话概括日方已经采取或建议采取的具体对策（如无，填写『未提及』）。",
-    "Relevance_Score": 1到5的整数（评估该史料对研究日本军政界应对中国共产革命与反帝运动的价值，1为无关流水账，5为具有极高战略研究价值的核心机密报告）
-  }
-}"""
+
+def render_analysis_prompt(translation_plugin_enum: str, prev_date: str | None = None) -> str:
+    return TemplateService().render_prompt(
+        "analysis_prompt.jinja",
+        {
+            "translation_plugin_enum": translation_plugin_enum,
+            "prev_date": prev_date or "",
+        },
+    )
 

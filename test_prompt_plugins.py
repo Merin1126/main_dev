@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from config.academic_prompts import ANALYSIS_ACADEMIC_PROMPT
+from config.academic_prompts import render_analysis_prompt
 from config.translation_prompts import TRANSLATION_PLUGINS
 
 
@@ -8,8 +8,8 @@ PLACEHOLDER = "__TRANSLATION_PLUGIN_ENUM__"
 
 
 def render_analysis_prompt_with_plugins() -> str:
-    plugin_enum = "、".join([f"『{name}』" for name in TRANSLATION_PLUGINS.keys()])
-    return ANALYSIS_ACADEMIC_PROMPT.replace(PLACEHOLDER, plugin_enum)
+    plugin_enum = "』、『".join(TRANSLATION_PLUGINS.keys())
+    return render_analysis_prompt(f"『{plugin_enum}』")
 
 
 def main() -> int:
