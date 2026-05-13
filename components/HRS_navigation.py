@@ -11,8 +11,9 @@ class Navigation(ctk.CTkFrame):
         self.current_width = self.collapsed_width
         self.is_expanded = False
         self._animating = False
-        self._animation_total_steps = 14
-        self._animation_duration_ms = 180
+        self._animation_total_steps = 10
+        self._animation_duration_ms = 140
+        self._last_applied_width = self.collapsed_width
         self.current_screen = "scraper"
 
         self.nav_config = [
@@ -106,15 +107,17 @@ class Navigation(ctk.CTkFrame):
     def change_appearance_mode_event(self, new_appearance_mode: str):
         """处理主题颜色切换"""
         ctk.set_appearance_mode(new_appearance_mode)
+        if hasattr(self.master, "screen_manager") and hasattr(self.master.screen_manager, "refresh_theme"):
+            self.master.screen_manager.refresh_theme()
 
     def _ensure_initial_collapsed_width(self):
         """确保启动时就使用折叠宽度，避免首次布局抖动。"""
         if self.is_expanded or self._animating:
             return
         self.current_width = self.collapsed_width
+        self._last_applied_width = self.collapsed_width
         self.configure(width=self.collapsed_width)
         self.pack_propagate(False)
-        self.master.update_idletasks()
 
     def on_nav_item_click(self, screen_name: str):
         if self._animating:
@@ -136,8 +139,8 @@ class Navigation(ctk.CTkFrame):
             self._set_button_text_colors(0)
             self.appearance_mode_menu.pack_forget()
         else:
-            # 收起时快速淡出文字，降低拖影感
-            self._animate_label_fade_out(0)
+            # 收起时直接降亮度，避免与宽度动画并发造成掉帧
+            self._set_button_text_colors(0.0)
         self._animate_width(target_width, 0)
 
     def _animate_width(self, target_width, step_index):
@@ -146,13 +149,15 @@ class Navigation(ctk.CTkFrame):
         t = min(1.0, step_index / self._animation_total_steps)
         eased_t = 1 - pow(1 - t, 3)  # ease-out cubic
         self.current_width = int(start_width + (target_width - start_width) * eased_t)
-        self.configure(width=self.current_width)
+        if self.current_width != self._last_applied_width:
+            self.configure(width=self.current_width)
+            self._last_applied_width = self.current_width
         self.pack_propagate(False)
-        self.master.update_idletasks()
 
         if step_index >= self._animation_total_steps:
             self.current_width = target_width
             self.configure(width=self.current_width)
+            self._last_applied_width = self.current_width
             self.is_expanded = (target_width == self.expanded_width)
             self._render_nav_buttons()
             if self.is_expanded:

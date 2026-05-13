@@ -13,7 +13,7 @@ import core_scraper
 class ScraperScreen(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
         # 继承大管家的透明背景
-        super().__init__(master, fg_color=Color.TRANSPARENT, **kwargs)
+        super().__init__(master, fg_color=("#f5f6f8", "#1f1f23"), **kwargs)
         self.master = master
         self.stop_event = threading.Event()
 
@@ -21,11 +21,22 @@ class ScraperScreen(ctk.CTkFrame):
 
     def _setup_ui(self):
         # 页面大标题
-        title_lbl = ctk.CTkLabel(self, text="史料下载控制台", font=("Arial", 28, "bold"))
+        title_lbl = ctk.CTkLabel(
+            self,
+            text="史料下载控制台",
+            font=("Arial", 28, "bold"),
+            text_color=Color.TEXT,
+        )
         title_lbl.pack(pady=(30, 10))
 
         # 中间的圆角主容器 (Main Card Container)
-        container = ctk.CTkFrame(self, corner_radius=15)
+        container = ctk.CTkFrame(
+            self,
+            corner_radius=15,
+            fg_color=("#eceff4", "#2b2b31"),
+            border_width=1,
+            border_color=("#d7dde7", "#3c4452"),
+        )
         container.pack(pady=20, padx=40, fill="both", expand=True)
 
         # ================= 表单输入区 =================
