@@ -6,7 +6,7 @@ import re
 
 import customtkinter as ctk
 
-from config.academic_prompts import render_analysis_prompt
+from config.academic_prompts import render_analysis_system, render_analysis_turn
 from config.translation_prompts import TRANSLATION_PLUGINS
 from screens.base_screen import BaseDocumentScreen
 
@@ -14,6 +14,10 @@ from screens.base_screen import BaseDocumentScreen
 class AnalysisScreen(BaseDocumentScreen):
     requires_image_input = False
     show_single_page_actions = False
+    #: v2.6.6：Analysis 切换为有状态 Chat Session，并通过 SDK 原生 JSON 约束格式
+    use_chat_session = True
+    chat_response_mime_type = "application/json"
+    chat_temperature = 0.3
 
     screen_title = "史料分析"
     cache_dir_name = "Analysis_Cache"
@@ -382,43 +386,23 @@ class AnalysisScreen(BaseDocumentScreen):
 
         self.ocr_pages[self.current_ocr_page_index] = json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def get_academic_prompt(self, page_index: int = None) -> str:
-        # 将提示词中的占位符替换为真实的插件列表
+    # ------------------------------------------------------------------ #
+    # v2.6.6 Chat Session 接入：system_prompt 与逐轮 turn_prompt
+    # ------------------------------------------------------------------ #
+
+    def get_system_prompt(self) -> str:
+        """渲染 Analysis 会话的系统前缀（人物定义 + JSON Schema + 跨页继承法则）。
+
+        过去版本里 `get_academic_prompt` 中"上一页元数据回灌"逻辑现在由 Chat Session 原生
+        历史接管：模型在每一轮都能看到自己上一轮的 JSON 输出，从而自然继承档案元数据。
+        """
         plugin_keys = "』、『".join(TRANSLATION_PLUGINS.keys())
-        prev_date = ""
-        inject_text = ""
+        return render_analysis_system(translation_plugin_enum=f"『{plugin_keys}』")
 
-        # 滚动记忆逻辑：如果不是第一页，尝试读取上一页的 JSON
-        if page_index is not None and page_index > 0 and self.ocr_pages:
-            try:
-                prev_raw = self.ocr_pages[page_index - 1]
-                if prev_raw:
-                    prev_data = json.loads(prev_raw)
-                    ctx = prev_data.get("Historical_Context", {})
-                    if ctx:
-                        date = ctx.get("Date_Written", "未知")
-                        date_text = str(date).strip() if date is not None else ""
-                        if date_text and date_text != "未知":
-                            prev_date = date_text
-                        sender = ctx.get("Author_Sender", "未知")
-                        recipient = ctx.get("Recipient", "未知")
-                        doc_type = ctx.get("Document_Type", "未知")
-                        plugins = ctx.get("Translation_Plugins", [])
-
-                        inject_text = (
-                            f"\n\n【系统附加连贯性指令】：\n"
-                            f"当前正在分析该份档案的第 {page_index + 1} 页。\n"
-                            f"作为参考，上一页提取到的元数据为：时间[{date}]，发文者[{sender}]，收文者[{recipient}]，类型[{doc_type}]，翻译插件标签为{plugins}。\n"
-                            f"▶️ 如果本页内容是上一页的延续（未出现新的公文开头），请直接【继承】上述元数据和插件标签填充JSON，以保持同份档案的数据连续性。\n"
-                            f"▶️ 如果本页出现了全新的发文落款或切换了公文类型，请提取新的数据覆盖。"
-                        )
-            except Exception:
-                pass
-
-        base_prompt = render_analysis_prompt(f"『{plugin_keys}』", prev_date=prev_date)
-        if inject_text:
-            base_prompt += inject_text
-        return base_prompt
+    def get_turn_prompt(self, page_index: int, page_text: str) -> str:
+        """渲染单页 turn_prompt（仅含当前页 OCR 文本的 <SOURCE_TEXT> 包装）。"""
+        page_number = (page_index or 0) + 1
+        return render_analysis_turn(page_number=page_number, page_text=page_text or "")
 
     def export_document(self) -> None:
         self._export_text_pages_default()

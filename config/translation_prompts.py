@@ -1,7 +1,14 @@
 """
 Translation Prompt Configuration
 采用“核心底座 (Base) + 动态插件 (Plugins)”架构，供 TranslationScreen 动态组装调用。
+
+v2.6.6 起，翻译流程切换到有状态 Chat Session：
+- `render_translation_system()`：渲染会话系统前缀（底座法则 + 激活插件 + 全书剧情大纲）。
+- `render_translation_turn()`：渲染每页 turn_prompt（仅含当前页原文与衔接指令）。
+- 历史上下文由 Chat Session 原生托管，不再向模板传 `prev_page_raw` / `prev_translation_context`。
 """
+
+from services.template_service import TemplateService
 
 TRANSLATION_PLUGINS = {
     "外交密电": """【插件激活：外交密电与照会专用】
@@ -27,4 +34,40 @@ TRANSLATION_PLUGINS = {
 * 非正规武装称谓： 遇到“馬賊”、“匪賊”、“不逞鮮人”等词，一律原样保留或译为“匪首”、“韩党武装”，突显其处于法外地带的特殊身份。
 * 情报切片感： 译文需呈现拼图式的碎片感，突出情报的“时间、地点、人物、密谋内容”四大核心，不加任何修饰。"""
 }
+
+
+def render_translation_system(
+    active_plugins: list[str] | None,
+    context_summary: str = "",
+) -> str:
+    """渲染 Translation Chat Session 的系统前缀。
+
+    `active_plugins`：聚合后的本档案需要启用的滤镜插件名列表（可为空）。
+    `context_summary`：全档剧情大纲（建议汇总各页 `Core_Judgment`）。
+    """
+    valid_plugins = [p for p in (active_plugins or []) if p in TRANSLATION_PLUGINS]
+    return TemplateService().render_prompt(
+        "translation_system.jinja",
+        {
+            "active_plugins": valid_plugins,
+            "plugins_map": TRANSLATION_PLUGINS,
+            "context_summary": context_summary or "",
+        },
+    )
+
+
+def render_translation_turn(
+    page_number: int,
+    page_text: str,
+    context_info: str = "",
+) -> str:
+    """渲染 Translation 单页 turn_prompt（仅含当前页原文与跨轮衔接指令）。"""
+    return TemplateService().render_prompt(
+        "translation_turn.jinja",
+        {
+            "page_number": page_number,
+            "page_text": page_text or "",
+            "context_info": context_info or "",
+        },
+    )
 

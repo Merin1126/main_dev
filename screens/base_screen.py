@@ -58,10 +58,35 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     api_request_timeout_sec: int = 120
     #: 页级超时重试总次数（含首次调用）
     api_timeout_max_attempts: int = 3
+    #: v2.6.6 起：是否以有状态 Chat Session 调用 LLM。OCR 走单次调用，Analysis/Translation 启用。
+    use_chat_session: bool = False
+    #: Chat Session 的响应 MIME 类型；Analysis 子类应覆盖为 "application/json"。
+    chat_response_mime_type: str = "text/plain"
+    #: Chat Session 的温度参数（仅在 use_chat_session=True 时生效）。
+    chat_temperature: float = 0.3
 
-    @abstractmethod
     def get_academic_prompt(self, page_index: int = None) -> str:
-        """返回发送给 Gemini 的学术/任务提示词（可含对输出格式的约束）。"""
+        """返回发送给 Gemini 的学术/任务提示词（用于 OCR 单次调用路径）。
+
+        v2.6.6 起，Analysis / Translation 改走 Chat Session（`use_chat_session=True`），
+        系统指令与每轮消息由 `get_system_prompt()` 与 `get_turn_prompt()` 分别提供，
+        本方法对它们不再被调用，可保留默认实现。
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} 未实现 get_academic_prompt；如已切换 Chat Session，请实现 get_system_prompt/get_turn_prompt。"
+        )
+
+    def get_system_prompt(self) -> str:
+        """Chat Session 的系统前缀（仅当 use_chat_session=True 时调用）。子类必须覆盖。"""
+        raise NotImplementedError(
+            f"{type(self).__name__} 开启 use_chat_session 后必须覆盖 get_system_prompt()。"
+        )
+
+    def get_turn_prompt(self, page_index: int, page_text: str) -> str:
+        """Chat Session 单页 turn_prompt（仅当 use_chat_session=True 时调用）。子类必须覆盖。"""
+        raise NotImplementedError(
+            f"{type(self).__name__} 开启 use_chat_session 后必须覆盖 get_turn_prompt()。"
+        )
 
     @abstractmethod
     def export_document(self) -> None:
@@ -241,6 +266,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.current_ocr_state = DocumentTaskState.IDLE
         self.ocr_pages = []
         self.current_ocr_page_index = 0
+        #: v2.6.6 起：有状态 Chat 会话句柄，每次任务开始时通过 _start_new_chat_session() 重建
+        self.current_chat = None
         self.session_prompt_non_cached = 0
         self.session_cached_tokens = 0
         self.session_output_tokens = 0
@@ -632,6 +659,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
     def open_pdf(self, file_path):
         self.cancel_ocr_task(silent=True)
+        # 切换 PDF 即视为新文档：清空旧 Chat Session 上下文。
+        self.current_chat = None
 
         if self.current_pdf:
             self.pdf_service.close()
@@ -806,6 +835,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
             file_tag = f"{os.path.basename(self.selected_pdf_path)}_第{page_index + 1}页"
             model_name = self.selected_model_var.get()
+
+            # 单页任务同样初始化一次 Chat Session（即使只发一轮，也借助 system_instruction 走原生强约束）
+            self._start_new_chat_session(api_key, model_name)
 
             if type(self).requires_image_input:
                 image_bytes = self.pdf_service.get_page_bytes(page_index)
@@ -1003,6 +1035,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                         text=self._status_colon(f"检测到断点缓存：已完成 {s}/{t} 页，继续处理中...")
                     ),
                 )
+
+        # v2.6.6：进入逐页循环前，初始化（或覆盖）Chat Session，作为 Analysis/Translation 的多轮通道。
+        self._start_new_chat_session(api_key, self.selected_model_var.get())
 
         for page_index in range(start_page, total_pages):
             self._ensure_active_task(task_id)
@@ -1277,6 +1312,27 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 pass
         self.start_ocr_recognition()
 
+    def _start_new_chat_session(self, api_key: str, model_name: str) -> None:
+        """在进入逐页循环前调用：渲染 system_prompt 并新建/覆盖 self.current_chat。
+
+        - 仅当 `use_chat_session=True` 时生效；否则将 `self.current_chat` 置空走 OCR 单次通道；
+        - 新文档加载或"重新开始"会自动调用一次，从而覆盖旧会话上下文。
+        """
+        self.current_chat = None
+        if not type(self).use_chat_session:
+            return
+        self.llm_service.update_api_key(api_key)
+        system_prompt = self.get_system_prompt()
+        self.current_chat = self.llm_service.start_chat_session(
+            model_name=model_name,
+            system_instruction=system_prompt,
+            response_mime_type=type(self).chat_response_mime_type,
+            temperature=type(self).chat_temperature,
+            screen_name=type(self).__name__,
+            task_name=type(self).task_short_name,
+            selected_pdf_path=self.selected_pdf_path,
+        )
+
     def _detect_text_from_image(
         self,
         api_key: str,
@@ -1289,19 +1345,38 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     ):
         self.llm_service.update_api_key(api_key)
         enrich_hook = self.enrich_json_data if hasattr(self, "enrich_json_data") else None
-        result_text, usage_summary = self.llm_service.detect_text(
-            screen_name=type(self).__name__,
-            task_name=type(self).task_short_name,
-            selected_pdf_path=self.selected_pdf_path,
-            file_name=file_name,
-            model_name=model_name,
-            academic_prompt=self.get_academic_prompt(page_index),
-            behavior_name=type(self).task_short_name,
-            page_index=page_index,
-            image_bytes=image_bytes,
-            source_text=source_text,
-            enrich_json_data=enrich_hook,
-        )
+
+        if type(self).use_chat_session and self.current_chat is not None:
+            # Analysis / Translation：走有状态 Chat Session 通道
+            turn_prompt = self.get_turn_prompt(page_index, source_text or "")
+            result_text, usage_summary = self.llm_service.send_chat_message(
+                self.current_chat,
+                screen_name=type(self).__name__,
+                task_name=type(self).task_short_name,
+                selected_pdf_path=self.selected_pdf_path,
+                file_name=file_name,
+                model_name=model_name,
+                turn_prompt=turn_prompt,
+                behavior_name=type(self).task_short_name,
+                page_index=page_index,
+                enrich_json_data=enrich_hook,
+            )
+        else:
+            # OCR 或未启用 Chat Session 的子类：单次 generate_content
+            result_text, usage_summary = self.llm_service.detect_text(
+                screen_name=type(self).__name__,
+                task_name=type(self).task_short_name,
+                selected_pdf_path=self.selected_pdf_path,
+                file_name=file_name,
+                model_name=model_name,
+                academic_prompt=self.get_academic_prompt(page_index),
+                behavior_name=type(self).task_short_name,
+                page_index=page_index,
+                image_bytes=image_bytes,
+                source_text=source_text,
+                enrich_json_data=enrich_hook,
+            )
+
         self.after(0, lambda s=usage_summary: self._accumulate_usage_summary(s))
         return result_text
 

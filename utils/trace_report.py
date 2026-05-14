@@ -71,12 +71,15 @@ def convert_current_trace_to_md(project_root: str | Path) -> Path:
         page = e.get("page_index")
         file_name = _safe_text(e.get("file_name"))
         model = _safe_text(e.get("model_name"))
+        session_id = _safe_text(e.get("chat_session_id"))
         lines.append(f"### {idx}. {event}")
         lines.append(f"- 时间：{ts or 'N/A'}")
         lines.append(f"- 任务/页面：{task or 'N/A'} / {screen or 'N/A'}")
         lines.append(f"- 文件与页码：{file_name or 'N/A'} / {page if page is not None else 'N/A'}")
         if model:
             lines.append(f"- 模型：{model}")
+        if session_id:
+            lines.append(f"- 会话ID：`{session_id}`")
         if event == "request_prepared":
             lines.append(f"- 输入类型：{_safe_text(e.get('input_kind')) or 'N/A'}")
             lines.append("")
@@ -99,6 +102,51 @@ def convert_current_trace_to_md(project_root: str | Path) -> Path:
             lines.append("```text")
             lines.append(_safe_text(e.get("response_text")))
             lines.append("```")
+        elif event == "chat_session_started":
+            lines.append(f"- 响应格式：{_safe_text(e.get('response_mime_type')) or 'N/A'}")
+            lines.append(f"- 温度：{_safe_text(e.get('temperature')) or 'N/A'}")
+            lines.append("")
+            lines.append("#### System Instruction")
+            lines.append("```text")
+            lines.append(_safe_text(e.get("system_instruction")))
+            lines.append("```")
+        elif event == "chat_session_observed":
+            lines.append(f"- create后可见history条数：{_safe_text(e.get('observed_history_count')) or '0'}")
+            has_reaction = _safe_text(e.get("has_model_reaction")) or "False"
+            lines.append(f"- 是否观察到模型对 system 的显式反应：{has_reaction}")
+            reaction = _safe_text(e.get("model_reaction_text"))
+            if reaction:
+                lines.append("")
+                lines.append("#### Observed Model Reaction")
+                lines.append("```text")
+                lines.append(reaction)
+                lines.append("```")
+            else:
+                lines.append("")
+                lines.append("> 注：当前 SDK 的 `chats.create(...)` 通常不会立即产出模型文本；system 生效体现在后续 turn 行为中。")
+        elif event == "chat_turn_prepared":
+            lines.append(f"- 输入类型：{_safe_text(e.get('input_kind')) or 'chat_text'}")
+            lines.append(f"- 发送前history条数：{_safe_text(e.get('history_count_before')) or 'N/A'}")
+            lines.append("")
+            lines.append("#### Turn Prompt")
+            lines.append("```text")
+            lines.append(_safe_text(e.get("turn_prompt")))
+            lines.append("```")
+        elif event == "chat_turn_response":
+            lines.append(f"- 耗时(ms)：{_safe_text(e.get('elapsed_ms')) or 'N/A'}")
+            lines.append(
+                f"- history条数(before -> after)："
+                f"{_safe_text(e.get('history_count_before')) or 'N/A'} -> "
+                f"{_safe_text(e.get('history_count_after')) or 'N/A'}"
+            )
+            lines.append(f"- Token摘要：{json.dumps(e.get('usage_summary', {}), ensure_ascii=False)}")
+            lines.append("")
+            lines.append("#### Turn Response")
+            lines.append("```text")
+            lines.append(_safe_text(e.get("response_text")))
+            lines.append("```")
+        elif event == "chat_turn_error":
+            lines.append(f"- 错误：{_safe_text(e.get('error'))}")
         elif event == "cache_write":
             lines.append(f"- 缓存类型：{_safe_text(e.get('cache_kind'))}")
             lines.append(f"- 缓存路径：`{_safe_text(e.get('cache_path'))}`")

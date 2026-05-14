@@ -6,13 +6,20 @@ import os
 
 import customtkinter as ctk
 
-from config.translation_prompts import TRANSLATION_PLUGINS
+from config.translation_prompts import (
+    TRANSLATION_PLUGINS,
+    render_translation_system,
+    render_translation_turn,
+)
 from screens.base_screen import BaseDocumentScreen
-from services.template_service import TemplateService
 
 
 class TranslationScreen(BaseDocumentScreen):
     requires_image_input = False
+    #: v2.6.6：翻译切换为有状态 Chat Session
+    use_chat_session = True
+    chat_response_mime_type = "text/plain"
+    chat_temperature = 0.3
 
     screen_title = "史料翻译"
     cache_dir_name = "Translation_Cache"
@@ -40,142 +47,116 @@ class TranslationScreen(BaseDocumentScreen):
         )
         self.plugin_status_label.pack(fill="x", padx=10, pady=(0, 4), before=self.text_editor)
 
-    def _build_rag_context(self, analysis_cache_path: str, ocr_cache_path: str, page_index: int) -> tuple[str, str, str]:
-        """提取远端摘要与紧邻原文，返回 (context_summary, prev_page_raw, next_page_raw)。"""
-        context_lines = []
-        prev_page_raw = ""
-        next_page_raw = ""
+    # ------------------------------------------------------------------ #
+    # 内部工具：加载本档案的 Analysis JSON 数据并做文档级聚合
+    # ------------------------------------------------------------------ #
 
-        # 1) 远端摘要：限制在前后各2页（不含当前页）
-        if os.path.exists(analysis_cache_path):
+    def _analysis_cache_path_for_selected(self) -> str | None:
+        if not self.selected_pdf_path:
+            return None
+        stat = os.stat(self.selected_pdf_path)
+        cache_key = f"{self.selected_pdf_path}|{stat.st_mtime_ns}|{stat.st_size}"
+        name = hashlib.sha256(cache_key.encode("utf-8")).hexdigest() + ".txt"
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base_dir, "Analysis_Cache", name)
+
+    def _load_analysis_pages(self) -> list[dict]:
+        """返回与本档案对应的 Analysis JSON 每页解析结果（解析失败的页用空 dict 占位）。"""
+        path = self._analysis_cache_path_for_selected()
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                analysis_data = json.loads(f.read())
+        except Exception:
+            return []
+        pages = analysis_data.get("pages", []) or []
+        parsed: list[dict] = []
+        for page_str in pages:
             try:
-                with open(analysis_cache_path, "r", encoding="utf-8") as f:
-                    analysis_data = json.loads(f.read())
-                pages = analysis_data.get("pages", [])
-                start_idx = max(0, page_index - 2)
-                end_idx = min(len(pages), page_index + 3)
-                for i in range(start_idx, end_idx):
-                    if i == page_index:
-                        continue
-                    page_str = pages[i] if i < len(pages) else ""
-                    if not page_str or "未识别到文本" in page_str:
-                        continue
-                    try:
-                        p_data = json.loads(page_str)
-                        judgement = p_data.get("Discourse_Analysis", {}).get("Core_Judgment", "")
-                        if judgement and "未提及" not in judgement:
-                            context_lines.append(f"第{i + 1}页：{judgement}")
-                    except Exception:
-                        continue
+                parsed.append(json.loads(page_str) if page_str else {})
             except Exception:
-                pass
+                parsed.append({})
+        return parsed
 
-        # 2) 近端原文：仅提取紧邻页（前1页 + 后1页）
-        if os.path.exists(ocr_cache_path):
-            try:
-                with open(ocr_cache_path, "r", encoding="utf-8") as f:
-                    ocr_data = json.loads(f.read())
-                ocr_pages = ocr_data.get("pages", [])
-                if page_index - 1 >= 0 and page_index - 1 < len(ocr_pages):
-                    prev_page_raw = str(ocr_pages[page_index - 1] or "")
-                if page_index + 1 < len(ocr_pages):
-                    next_page_raw = str(ocr_pages[page_index + 1] or "")
-            except Exception:
-                pass
+    def _aggregate_active_plugins(self, analysis_pages: list[dict]) -> list[str]:
+        """跨页聚合启用过的翻译滤镜，按 TRANSLATION_PLUGINS 的声明顺序去重输出。"""
+        seen: set[str] = set()
+        for page in analysis_pages:
+            ctx = (page or {}).get("Historical_Context", {}) or {}
+            for name in ctx.get("Translation_Plugins", []) or []:
+                if isinstance(name, str) and name in TRANSLATION_PLUGINS:
+                    seen.add(name)
+        return [k for k in TRANSLATION_PLUGINS.keys() if k in seen]
 
-        context_summary = "\n".join(context_lines).strip()
-        return context_summary, prev_page_raw, next_page_raw
+    def _build_document_context_summary(self, analysis_pages: list[dict]) -> str:
+        """汇总各页 `Core_Judgment` 形成「全书剧情大纲」，作为系统前缀的一部分注入。"""
+        lines: list[str] = []
+        for idx, page in enumerate(analysis_pages):
+            disc = (page or {}).get("Discourse_Analysis", {}) or {}
+            judgement = (disc.get("Core_Judgment") or "").strip()
+            if judgement and "未提及" not in judgement:
+                lines.append(f"第{idx + 1}页：{judgement}")
+        return "\n".join(lines).strip()
 
-    def get_academic_prompt(self, page_index: int = None) -> str:
-        active_plugins = []
-        context_info = ""
-        context_summary = ""
-        prev_page_raw = ""
-        next_page_raw = ""
-        prev_translation_context = ""
-
-        if self.selected_pdf_path and page_index is not None and page_index >= 0:
-            stat = os.stat(self.selected_pdf_path)
-            cache_key = f"{self.selected_pdf_path}|{stat.st_mtime_ns}|{stat.st_size}"
-            name = hashlib.sha256(cache_key.encode("utf-8")).hexdigest() + ".txt"
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-            analysis_cache_path = os.path.join(base_dir, "Analysis_Cache", name)
-            ocr_cache_path = os.path.join(base_dir, "OCR_Cache", name)
-
-            # [读取1] 当前页的精准参数与插件
-            if os.path.exists(analysis_cache_path):
-                try:
-                    with open(analysis_cache_path, "r", encoding="utf-8") as f:
-                        analysis_data = json.loads(f.read())
-                    pages = analysis_data.get("pages", [])
-                    if page_index < len(pages):
-                        page_json_str = pages[page_index]
-                        page_data = json.loads(page_json_str) if page_json_str else {}
-                        ctx = page_data.get("Historical_Context", {})
-
-                        active_plugins = ctx.get("Translation_Plugins", [])
-                        date = ctx.get("Date_Written", "未知")
-                        sender = ctx.get("Author_Sender", "未知")
-                        recipient = ctx.get("Recipient", "未知")
-                        doc_type = ctx.get("Document_Type", "未知")
-
-                        if any(x != "未知" for x in [date, sender, recipient, doc_type]):
-                            context_info = (
-                                f"\n\n【翻译背景参数注入】\n"
-                                f"根据档案上下文，本页文书类型为：{doc_type}。\n"
-                                f"发文时间：{date} | 发文者：{sender} | 收文者：{recipient}。\n"
-                                f"请在翻译时，务必结合上述双方身份地位，精准把握公文敬语、谦语及权力关系。"
-                            )
-                except Exception:
-                    pass
-
-            # [读取2] 构建“远端摘要 + 近端原文”
-            context_summary, prev_page_raw, next_page_raw = self._build_rag_context(
-                analysis_cache_path,
-                ocr_cache_path,
-                page_index,
-            )
-
-            # [读取3] 上一页翻译结果 (防止断句碎裂)
-            if page_index > 0 and self.ocr_pages and page_index - 1 < len(self.ocr_pages):
-                prev_trans = self.ocr_pages[page_index - 1]
-                if prev_trans and "未识别到文本" not in prev_trans:
-                    tail_text = prev_trans[-200:]
-                    prev_translation_context = (
-                        f"\n\n【上一页译文接续参考】\n"
-                        f"上一页的译文结尾如下：\n...{tail_text}\n"
-                        f"请根据此结尾，流畅地接续翻译当前页面的内容。"
-                    )
-
-        # 组装最终 Prompt
-        plugin_names = []
-        valid_active_plugins = []
-        if active_plugins:
-            for p in active_plugins:
-                if p in TRANSLATION_PLUGINS:
-                    valid_active_plugins.append(p)
-                    plugin_names.append(f"[{p}]")
-        final_prompt = TemplateService().render_prompt(
-            "translation_prompt.jinja",
-            {
-                "context_info": context_info,
-                "active_plugins": valid_active_plugins,
-                "plugins_map": TRANSLATION_PLUGINS,
-                "context_summary": context_summary,
-                "prev_page_raw": prev_page_raw,
-                "next_page_raw": next_page_raw,
-                "prev_translation_context": prev_translation_context,
-            },
+    def _build_context_info_for_page(self, analysis_pages: list[dict], page_index: int) -> str:
+        """从本档案 Analysis 数据中提取该页元数据，组装"翻译背景参数注入"小段。"""
+        if page_index < 0 or page_index >= len(analysis_pages):
+            return ""
+        page = analysis_pages[page_index] or {}
+        ctx = page.get("Historical_Context", {}) or {}
+        date = (ctx.get("Date_Written") or "未知")
+        sender = (ctx.get("Author_Sender") or "未知")
+        recipient = (ctx.get("Recipient") or "未知")
+        doc_type = (ctx.get("Document_Type") or "未知")
+        if all(str(x).strip() in ("", "未知") for x in (date, sender, recipient, doc_type)):
+            return ""
+        return (
+            "【翻译背景参数注入】\n"
+            f"根据档案上下文，本页文书类型为：{doc_type}。\n"
+            f"发文时间：{date} | 发文者：{sender} | 收文者：{recipient}。\n"
+            "请在翻译时，务必结合上述双方身份地位，精准把握公文敬语、谦语及权力关系。"
         )
 
-        # 动态更新 UI 反馈标签
-        display_names = " + ".join(plugin_names) if plugin_names else "无附加插件 (纯核心底座)"
-        ui_text = f"⚙️ 引擎组装：核心底座 + {display_names} | 🟢 远近上下文已注入"
+    # ------------------------------------------------------------------ #
+    # v2.6.6 Chat Session 接入：system_prompt（文档级一次性）与 turn_prompt（逐轮）
+    # ------------------------------------------------------------------ #
+
+    def get_system_prompt(self) -> str:
+        """渲染翻译会话的系统前缀：底座 + 文档级聚合插件 + 全书剧情大纲。
+
+        【⚠️ 设计变更】v2.6.6 起：
+        - `active_plugins` 由本档案各页 Analysis 中启用过的滤镜聚合得出；
+        - `context_summary` 改为全书 `Core_Judgment` 汇总，而不是滑动窗口；
+        - `prev_page_raw` / `prev_translation_context` 完全删除：跨页连贯性由 Chat Session 原生历史承担。
+        """
+        analysis_pages = self._load_analysis_pages()
+        active_plugins = self._aggregate_active_plugins(analysis_pages)
+        context_summary = self._build_document_context_summary(analysis_pages)
+        # 缓存数据用于本次会话内 turn_prompt 渲染（避免每页重新读盘）
+        self._cached_analysis_pages = analysis_pages
+        self._cached_active_plugins = active_plugins
+
+        # UI 反馈
+        plugin_names = " + ".join(f"[{p}]" for p in active_plugins) if active_plugins else "无附加插件 (纯核心底座)"
+        ui_text = f"⚙️ 引擎组装：核心底座 + {plugin_names} | 🟢 全书剧情大纲已注入 system"
         if hasattr(self, "plugin_status_label"):
             self.after(0, lambda: self.plugin_status_label.configure(text=ui_text))
 
-        return final_prompt
+        return render_translation_system(
+            active_plugins=active_plugins,
+            context_summary=context_summary,
+        )
+
+    def get_turn_prompt(self, page_index: int, page_text: str) -> str:
+        """渲染单页 turn_prompt：仅当前页原文 + 衔接指令（不再注入相邻页原文/上一页译文）。"""
+        analysis_pages = getattr(self, "_cached_analysis_pages", None) or self._load_analysis_pages()
+        context_info = self._build_context_info_for_page(analysis_pages, page_index or 0)
+        return render_translation_turn(
+            page_number=(page_index or 0) + 1,
+            page_text=page_text or "",
+            context_info=context_info,
+        )
 
     def export_document(self) -> None:
         self._export_text_pages_default()

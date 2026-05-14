@@ -16,6 +16,40 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+
+
+def _wait_dom_ready(driver, timeout=25):
+    """等待页面 DOM 完整就绪，减少首屏元素偶发找不到的问题。"""
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+
+
+def _wait_first_clickable(wait, locators):
+    """按优先级尝试多个定位器，返回第一个可点击元素。"""
+    last_err = None
+    for by, selector in locators:
+        try:
+            return wait.until(EC.element_to_be_clickable((by, selector)))
+        except Exception as e:
+            last_err = e
+    if last_err:
+        raise last_err
+    raise RuntimeError("未提供可用定位器。")
+
+
+def _wait_first_visible(wait, locators):
+    """按优先级尝试多个定位器，返回第一个可见元素。"""
+    last_err = None
+    for by, selector in locators:
+        try:
+            return wait.until(EC.visibility_of_element_located((by, selector)))
+        except Exception as e:
+            last_err = e
+    if last_err:
+        raise last_err
+    raise RuntimeError("未提供可用定位器。")
 
 # ==========================================
 # 🐝 全新后台打工人：纯 API 文件拉取引擎
@@ -195,19 +229,58 @@ def jacar_auto_search(target_keyword, start_year, end_year, update_gui_progress,
     wait = WebDriverWait(driver, 15)
     
     # 👇 删掉外面的中括号和圆括号，只保留纯粹的网址！
-    target_url = "https://www.jacar.archives.go.jp/aj/meta/default"
+    target_url = "https://www.jacar.archives.go.jp/aj/search"
     
     try:
         driver.get(target_url)
+        _wait_dom_ready(driver, timeout=25)
         
         # ---------- 1. 执行搜索 ----------
-        search_box = wait.until(EC.presence_of_element_located((By.ID, "searchbox")))
+        search_box_locators = [
+            (By.ID, "searchbox"),                         # 旧版
+            (By.NAME, "searchbox"),                       # 部分页面变体
+            (By.CSS_SELECTOR, "input#searchbox"),         # 显式 CSS 兜底
+            (By.CSS_SELECTOR, "input[name*='search']"),   # 关键字命名兜底
+            (By.CSS_SELECTOR, "input[type='text']"),      # 最终兜底
+        ]
+
+        # 兼容 Cloudflare / 首屏慢加载：尝试两轮
+        search_box = None
+        for _ in range(2):
+            try:
+                search_box = _wait_first_visible(wait, search_box_locators)
+                break
+            except Exception:
+                title = driver.title or ""
+                page_head = (driver.page_source or "")[:1200]
+                if ("Just a moment" in title) or ("Cloudflare" in page_head):
+                    print("⚠️ 检测到 Cloudflare/风控页面，等待 6 秒后重试入口定位...")
+                    time.sleep(6)
+                    _wait_dom_ready(driver, timeout=25)
+                    continue
+                break
+
+        if search_box is None:
+            raise TimeoutException(
+                "无法定位搜索输入框（已尝试多选择器）。"
+                f"\n当前URL: {driver.current_url}"
+                f"\n页面标题: {driver.title}"
+                "\n可能原因：1) 站点改版导致 ID 变化；2) 网络慢或被风控页拦截。"
+            )
+
         search_box.clear() 
         search_box.send_keys(target_keyword)
         
-        detail_p_tag = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, ".detail_bt1 p")))
+        detail_btn_locators = [
+            (By.CSS_SELECTOR, ".detail_bt1 p"),
+            (By.CSS_SELECTOR, ".detail_bt1"),
+            (By.XPATH, "//a[contains(@class,'detail_bt1')]"),
+            (By.XPATH, "//button[contains(@class,'detail_bt1')]"),
+            (By.XPATH, "//a[contains(., '詳細') or contains(., '条件')]"),
+        ]
+        detail_p_tag = _wait_first_clickable(wait, detail_btn_locators)
         driver.execute_script("arguments[0].click();", detail_p_tag)
-        time.sleep(1.5) 
+        time.sleep(1.5)
         
         from_year_input = wait.until(EC.visibility_of_element_located((By.NAME, "from_yearS11")))
         from_year_input.clear()
@@ -217,7 +290,19 @@ def jacar_auto_search(target_keyword, start_year, end_year, update_gui_progress,
         to_year_input.clear()
         to_year_input.send_keys(end_year)
         
-        search_btn = driver.find_element(By.ID, "search_button")
+        try:
+            search_btn = driver.find_element(By.ID, "search_button")
+        except Exception:
+            search_btn = _wait_first_clickable(
+                wait,
+                [
+                    (By.CSS_SELECTOR, "button#search_button"),
+                    (By.CSS_SELECTOR, "input#search_button"),
+                    (By.CSS_SELECTOR, "button[type='submit']"),
+                    (By.CSS_SELECTOR, "input[type='submit']"),
+                    (By.XPATH, "//button[contains(., '検索') or contains(., '検索する')]"),
+                ],
+            )
         search_btn.click() 
         
         # ---------- 2. 遍历列表、翻页与分发任务 ----------
