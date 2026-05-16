@@ -1,4 +1,5 @@
 import threading
+import os
 import customtkinter as ctk
 from tkinter import messagebox
 from config.settings import Color
@@ -16,6 +17,9 @@ class ScraperScreen(ctk.CTkFrame):
         super().__init__(master, fg_color=("#f5f6f8", "#1f1f23"), **kwargs)
         self.master = master
         self.stop_event = threading.Event()
+        self.monitor_window = None
+        self.monitor_rows: dict[str, dict] = {}
+        self.monitor_list_frame = None
 
         self._setup_ui()
 
@@ -111,11 +115,142 @@ class ScraperScreen(ctk.CTkFrame):
                 self.progress_bar.set(current / total)
         self.after(0, _update)
 
+    def _open_monitor_window(self):
+        if self.monitor_window is not None and self.monitor_window.winfo_exists():
+            self.monitor_window.lift()
+            self.monitor_window.focus_set()
+            return
+        self.monitor_rows = {}
+        self.monitor_window = ctk.CTkToplevel(self)
+        self.monitor_window.title("下载任务监控")
+        self.monitor_window.geometry("980x620")
+        self.monitor_window.attributes("-topmost", True)
+
+        title = ctk.CTkLabel(
+            self.monitor_window,
+            text="本次抓取下载监控",
+            font=("Arial", 18, "bold"),
+            text_color=Color.TEXT,
+        )
+        title.pack(pady=(14, 10))
+
+        head = ctk.CTkLabel(
+            self.monitor_window,
+            text="状态说明：待下载 / 正在下载 / 已下载 / 已中止 / 失败",
+            font=("Arial", 12),
+            text_color=Color.TEXT_MUTED,
+        )
+        head.pack(pady=(0, 8))
+
+        self.monitor_list_frame = ctk.CTkScrollableFrame(
+            self.monitor_window,
+            fg_color=("#f2f4f8", "#252932"),
+            corner_radius=12,
+            border_width=1,
+            border_color=("#d7dde7", "#3c4452"),
+            width=940,
+            height=520,
+        )
+        self.monitor_list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+
+    def _ensure_monitor_row(self, task_id: str, title: str):
+        if not self.monitor_list_frame:
+            return
+        if task_id in self.monitor_rows:
+            return
+        row = ctk.CTkFrame(self.monitor_list_frame, fg_color=("#e8edf5", "#2d3340"), corner_radius=10)
+        row.pack(fill="x", padx=10, pady=8)
+
+        name = ctk.CTkLabel(row, text=title, anchor="w", font=("Arial", 13, "bold"), text_color=Color.TEXT)
+        name.pack(fill="x", padx=12, pady=(10, 2))
+
+        meta = ctk.CTkFrame(row, fg_color=Color.TRANSPARENT)
+        meta.pack(fill="x", padx=12, pady=(0, 4))
+        status_lbl = ctk.CTkLabel(meta, text="待下载", font=("Arial", 12), text_color=Color.TEXT_MUTED)
+        status_lbl.pack(side="left")
+        speed_lbl = ctk.CTkLabel(meta, text="0.00B/s", font=("Arial", 12), text_color=Color.TEXT_MUTED)
+        speed_lbl.pack(side="right")
+
+        bar = ctk.CTkProgressBar(row, height=10, corner_radius=6)
+        bar.set(0)
+        bar.pack(fill="x", padx=12, pady=(2, 10))
+
+        self.monitor_rows[task_id] = {
+            "row": row,
+            "status": status_lbl,
+            "speed": speed_lbl,
+            "bar": bar,
+        }
+
+    def on_task_enqueued(self, task: dict):
+        def _ui():
+            if not self.monitor_window or not self.monitor_window.winfo_exists():
+                self._open_monitor_window()
+            task_id = task.get("task_id") or task.get("save_path") or ""
+            if not task_id:
+                return
+            title = task.get("title") or os.path.basename(task.get("save_path") or task_id)
+            self._ensure_monitor_row(task_id, title)
+            row = self.monitor_rows.get(task_id)
+            if row:
+                status = task.get("status", "待下载")
+                color = Color.TEXT_MUTED
+                if status == "正在下载":
+                    color = Color.PRIMARY
+                elif status == "已下载":
+                    color = Color.TEXT_SUCCESS
+                elif status in {"失败", "已中止"}:
+                    color = Color.RED
+                row["status"].configure(text=status, text_color=color)
+                row["speed"].configure(text=str(task.get("speed_text", "0.00B/s")), text_color=Color.TEXT_MUTED)
+                progress = task.get("progress")
+                if progress is None:
+                    row["bar"].set(0)
+                else:
+                    row["bar"].set(max(0.0, min(1.0, float(progress))))
+        self.after(0, _ui)
+
+    def on_task_update(self, task_id: str, payload: dict):
+        def _ui():
+            if not task_id:
+                return
+            if task_id not in self.monitor_rows:
+                # 兜底：回调先到时创建占位行
+                self._ensure_monitor_row(task_id, os.path.basename(task_id))
+            row = self.monitor_rows.get(task_id)
+            if not row:
+                return
+            status = payload.get("status")
+            progress = payload.get("progress")
+            speed_text = payload.get("speed_text")
+            if status:
+                color = Color.TEXT_MUTED
+                if status == "正在下载":
+                    color = Color.PRIMARY
+                elif status == "已下载":
+                    color = Color.TEXT_SUCCESS
+                elif status in {"失败", "已中止"}:
+                    color = Color.RED
+                row["status"].configure(text=status, text_color=color)
+            if speed_text is not None:
+                row["speed"].configure(text=str(speed_text), text_color=Color.TEXT_MUTED)
+            if progress is None:
+                # 未知总量时保持动画感：不倒退进度
+                current = row["bar"].get()
+                if status == "正在下载" and current < 0.95:
+                    row["bar"].set(min(0.95, current + 0.02))
+            else:
+                p = max(0.0, min(1.0, float(progress)))
+                row["bar"].set(p)
+        self.after(0, _ui)
+
     def finish_scraping(self, message="🎉 任务圆满完成！所有文件已下载。"):
         def _finish():
             self.lbl_status.configure(text=message, text_color=Color.TEXT_SUCCESS)
             self.btn_start.configure(state="normal")
             self.btn_stop.configure(state="disabled")
+            if self.monitor_window and self.monitor_window.winfo_exists():
+                self.monitor_window.attributes("-topmost", False)
             messagebox.showinfo("提示", message)
         self.after(0, _finish)
 
@@ -139,12 +274,17 @@ class ScraperScreen(ctk.CTkFrame):
         self.btn_stop.configure(state="normal")
         self.lbl_status.configure(text="🚀 正在启动浏览器并连接数据库...", text_color=Color.PRIMARY)
         self.progress_bar.set(0)
+        self._open_monitor_window()
 
         # 启动后台爬虫线程
         scraper_thread = threading.Thread(
             target=core_scraper.jacar_auto_search,
             args=(kw, sy, ey, self.update_progress, self.finish_scraping, self.stop_event),
-            kwargs={"headless": bool(self.headless_var.get())}
+            kwargs={
+                "headless": bool(self.headless_var.get()),
+                "on_task_enqueued": self.on_task_enqueued,
+                "on_task_update": self.on_task_update,
+            }
         )
         scraper_thread.daemon = True
         scraper_thread.start()

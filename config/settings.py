@@ -5,7 +5,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 #全局版本号配置
-APP_VERSION = "V2.6.6"
+APP_VERSION = "V2.6.7"
 
 # 保留给未来可能需要的图片组件结构
 imagesTupple = namedtuple("images", ["light", "dark"])
