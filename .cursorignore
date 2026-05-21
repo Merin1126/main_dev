@@ -9,10 +9,7 @@ __pycache__/
 *.pyd
 
 # 2. 爬虫下载的史料与文档 (防止 AI 读取巨量 PDF 导致 Token 爆炸)
-JACAR_Downloads/
-*.pdf
-*.zip
-*.gz
+
 
 # 3. OCR 识别缓存 (AI 不需要读那些生成的纯文本历史文件)
 OCR_Cache/
