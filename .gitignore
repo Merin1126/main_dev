@@ -14,11 +14,20 @@ Translation_Cache/
 Analysis_Cache/
 Database_JSON/
 Gemini_Trace/
+Scraper_Logs/
 *.jsonl
 *.pdf
 *.txt
 *.zip
 *.gz
+
+# 2.1 本地 SQLite 数据库与 WAL/SHM 副本（schema/迁移脚本仍需提交）
+database/*.sqlite3
+database/*.sqlite3-wal
+database/*.sqlite3-shm
+database/*.db
+database/*.db-wal
+database/*.db-shm
 
 # 3. Python 缓存文件
 __pycache__/
