@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -143,3 +144,185 @@ class DbService:
                 finally:
                     self._conn = None  # type: ignore[assignment]
                     self._initialized = False
+
+    # ------------------------------------------------------------------
+    # 领域辅助（阶段 2：抓取去重与状态闭环）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def make_document_id(source: str, native_id: str) -> str:
+        return f"{source}:{native_id}"
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        s = str(value)
+        digits = "".join(ch for ch in s if ch.isdigit())
+        return int(digits) if digits else None
+
+    def get_document_status(self, source: str, native_id: str) -> str | None:
+        row = self.fetchone(
+            "SELECT status FROM documents WHERE source = ? AND native_id = ? LIMIT 1",
+            (source, native_id),
+        )
+        if not row:
+            return None
+        return str(row["status"]) if row["status"] is not None else None
+
+    def upsert_document(
+        self,
+        *,
+        source: str,
+        native_id: str,
+        title: str,
+        repo_name: str | None = None,
+        level2_name: str | None = None,
+        parent_name: str | None = None,
+        scale: Any = None,
+        viewer_url: str | None = None,
+        search_keyword: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        status: str = "discovered",
+    ) -> str:
+        document_id = self.make_document_id(source, native_id)
+        now = self.utc_now_iso()
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO documents(
+                    document_id, source, native_id, title, repo_name, level2_name, parent_name,
+                    scale, viewer_url, search_keyword, metadata_json, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    title=excluded.title,
+                    repo_name=COALESCE(excluded.repo_name, documents.repo_name),
+                    level2_name=COALESCE(excluded.level2_name, documents.level2_name),
+                    parent_name=COALESCE(excluded.parent_name, documents.parent_name),
+                    scale=COALESCE(excluded.scale, documents.scale),
+                    viewer_url=COALESCE(excluded.viewer_url, documents.viewer_url),
+                    search_keyword=COALESCE(excluded.search_keyword, documents.search_keyword),
+                    metadata_json=COALESCE(excluded.metadata_json, documents.metadata_json),
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    document_id,
+                    source,
+                    native_id,
+                    title,
+                    repo_name,
+                    level2_name,
+                    parent_name,
+                    self._safe_int(scale),
+                    viewer_url,
+                    search_keyword,
+                    json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                    status,
+                    now,
+                    now,
+                ),
+            )
+        return document_id
+
+    def mark_document_status(self, source: str, native_id: str, status: str) -> None:
+        now = self.utc_now_iso()
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE documents
+                SET status = ?, updated_at = ?
+                WHERE source = ? AND native_id = ?
+                """,
+                (status, now, source, native_id),
+            )
+
+    def _record_file(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        document_id: str,
+        kind: str,
+        path: str,
+    ) -> None:
+        if not path:
+            return
+        if not os.path.exists(path):
+            return
+        st = os.stat(path)
+        conn.execute(
+            """
+            INSERT INTO files(document_id, kind, path, size, mtime, sha256, verified_at)
+            VALUES (?, ?, ?, ?, ?, NULL, ?)
+            ON CONFLICT(document_id, kind) DO UPDATE SET
+                path = excluded.path,
+                size = excluded.size,
+                mtime = excluded.mtime,
+                verified_at = excluded.verified_at
+            """,
+            (
+                document_id,
+                kind,
+                path,
+                int(st.st_size),
+                int(st.st_mtime),
+                self.utc_now_iso(),
+            ),
+        )
+
+    def mark_downloaded_with_files(
+        self,
+        *,
+        source: str,
+        native_id: str,
+        pdf_path: str | None = None,
+        sidecar_path: str | None = None,
+    ) -> None:
+        document_id = self.make_document_id(source, native_id)
+        now = self.utc_now_iso()
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE documents
+                SET status = ?, updated_at = ?
+                WHERE document_id = ?
+                """,
+                ("downloaded", now, document_id),
+            )
+            if pdf_path:
+                self._record_file(conn, document_id=document_id, kind="pdf", path=pdf_path)
+            if sidecar_path:
+                self._record_file(conn, document_id=document_id, kind="sidecar", path=sidecar_path)
+
+    def upsert_hoover_pending(
+        self,
+        *,
+        native_id: str,
+        title: str,
+        viewer_url: str,
+        metadata: dict[str, Any] | None = None,
+        search_keyword: str | None = None,
+        sidecar_path: str | None = None,
+    ) -> str:
+        document_id = self.upsert_document(
+            source="hoover",
+            native_id=native_id,
+            title=title,
+            viewer_url=viewer_url,
+            search_keyword=search_keyword,
+            metadata=metadata,
+            status="pending_hoover",
+        )
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO hoover_pending(document_id, viewer_url, last_seen_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    viewer_url = excluded.viewer_url,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (document_id, viewer_url, self.utc_now_iso()),
+            )
+            if sidecar_path:
+                self._record_file(conn, document_id=document_id, kind="sidecar", path=sidecar_path)
+        return document_id

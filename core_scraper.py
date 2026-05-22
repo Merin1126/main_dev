@@ -24,6 +24,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+from services import DbService
 
 _PRINT_LOCK = threading.Lock()
 _STATUS_LINE_LEN = 0
@@ -391,6 +392,7 @@ def api_download_worker(
     on_task_update=None,
 ):
     """后台打工人：按域名分流下载策略（直链 / IIIF / 宕机登记）。"""
+    db_service = DbService()
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
@@ -419,6 +421,8 @@ def api_download_worker(
         doc_metadata = task.get("metadata", {}) or {}
         task_mode = task.get("mode", "download_and_sidecar")
         task_id = task.get("task_id") or save_path
+        source = str(task.get("source") or "jacar")
+        native_id = str(task.get("native_id") or doc_metadata.get("Ref_Code") or "Unknown_Ref")
         task_success = False
         task_bytes_downloaded = 0
         task_bytes_total_known = 0
@@ -433,6 +437,12 @@ def api_download_worker(
 
             if task_mode == "sidecar_only":
                 _write_sidecar_metadata(save_path, doc_metadata, logger)
+                db_service.mark_downloaded_with_files(
+                    source=source,
+                    native_id=native_id,
+                    pdf_path=save_path if os.path.exists(save_path) else None,
+                    sidecar_path=os.path.splitext(save_path)[0] + ".json",
+                )
                 _emit(
                     logger,
                     f"  -> ✅ [打工人完工] 检测到 PDF 已存在，仅补写 Sidecar 元数据 JSON: {os.path.basename(save_path)}",
@@ -442,6 +452,24 @@ def api_download_worker(
                     on_task_update,
                     task_id,
                     {"status": "已下载", "progress": 1.0, "speed_text": "N/A"},
+                )
+                continue
+
+            # 物理自愈兜底：数据库状态丢失但 PDF 已存在时，直接修复数据库并跳过网络下载
+            if os.path.exists(save_path):
+                sidecar_path = os.path.splitext(save_path)[0] + ".json"
+                db_service.mark_downloaded_with_files(
+                    source=source,
+                    native_id=native_id,
+                    pdf_path=save_path,
+                    sidecar_path=sidecar_path if os.path.exists(sidecar_path) else None,
+                )
+                _emit(logger, "  -> ♻️ 物理文件已存在，已自动修复数据库状态", logging.INFO)
+                task_success = True
+                _safe_callback(
+                    on_task_update,
+                    task_id,
+                    {"status": "已下载", "progress": 1.0, "speed_text": "完成"},
                 )
                 continue
 
@@ -509,6 +537,12 @@ def api_download_worker(
                             )
                             continue
                 _write_sidecar_metadata(save_path, doc_metadata, logger)
+                db_service.mark_downloaded_with_files(
+                    source=source,
+                    native_id=native_id,
+                    pdf_path=save_path,
+                    sidecar_path=os.path.splitext(save_path)[0] + ".json",
+                )
                 _emit(logger, f"  -> ✅ [打工人完工] 直链下载成功，并已保存元数据 JSON: {os.path.basename(save_path)}")
                 task_success = True
                 _safe_callback(
@@ -694,6 +728,12 @@ def api_download_worker(
                 finally:
                     pdf_doc.close()
                 _write_sidecar_metadata(save_path, doc_metadata, logger)
+                db_service.mark_downloaded_with_files(
+                    source=source,
+                    native_id=native_id,
+                    pdf_path=save_path,
+                    sidecar_path=os.path.splitext(save_path)[0] + ".json",
+                )
                 try:
                     shutil.rmtree(resume_dir, ignore_errors=True)
                 except Exception:
@@ -721,6 +761,14 @@ def api_download_worker(
                 sidecar_exists = os.path.exists(sidecar_path)
 
                 if pending_exists and sidecar_exists:
+                    db_service.upsert_hoover_pending(
+                        native_id=native_id,
+                        title=doc_title,
+                        viewer_url=viewer_url,
+                        metadata=doc_metadata,
+                        search_keyword=str(task.get("search_keyword") or ""),
+                        sidecar_path=sidecar_path,
+                    )
                     _emit(logger, "  -> ⏭️ 胡佛链接与Sidecar均已存在，跳过重复登记。", logging.INFO)
                     task_success = True
                     _safe_callback(
@@ -745,6 +793,14 @@ def api_download_worker(
                     )
                 else:
                     _emit(logger, "  -> 🧾 胡佛任务 Sidecar 已存在，跳过重复写入。", logging.INFO)
+                db_service.upsert_hoover_pending(
+                    native_id=native_id,
+                    title=doc_title,
+                    viewer_url=viewer_url,
+                    metadata=hoover_metadata,
+                    search_keyword=str(task.get("search_keyword") or ""),
+                    sidecar_path=sidecar_path if os.path.exists(sidecar_path) else None,
+                )
                 task_success = True
                 _safe_callback(
                     on_task_update,
@@ -761,6 +817,7 @@ def api_download_worker(
 
         except Exception as e:
             _emit(logger, f"  -> ❌ [打工人报错] {doc_title} 处理失败: {e}", logging.ERROR)
+            db_service.mark_document_status(source, native_id, "failed")
             _safe_callback(
                 on_task_update,
                 task_id,
@@ -799,6 +856,7 @@ def jacar_auto_search(
     on_task_update=None,
 ):
     print("正在初始化网络环境与高并发队列...")
+    db_service = DbService()
 
     if getattr(sys, "frozen", False):
         application_path = os.path.dirname(sys.executable)
@@ -959,6 +1017,27 @@ def jacar_auto_search(
                     except Exception:
                         ref_code = "Unknown_Ref"
 
+                    # 极速 DB 过滤：ref_code 命中已完成状态则直接跳过（不做物理文件 exists 检查）
+                    if ref_code and ref_code != "Unknown_Ref":
+                        status_in_db = db_service.get_document_status("jacar", ref_code)
+                        if (status_in_db or "").strip().lower() in {"completed", "downloaded"}:
+                            task_id = f"jacar:{ref_code}"
+                            _safe_callback(
+                                on_task_enqueued,
+                                {
+                                    "task_id": task_id,
+                                    "title": doc_title,
+                                    "save_path": "",
+                                    "mode": "download_and_sidecar",
+                                    "status": "已下载",
+                                    "progress": 1.0,
+                                    "speed_text": "完成",
+                                },
+                            )
+                            skipped_existing += 1
+                            _emit(logger, f"  -> ⏭️ DB命中已完成状态，跳过: {doc_title}", logging.INFO)
+                            continue
+
                     try:
                         scale_raw = row.find_element(
                             By.XPATH,
@@ -1048,19 +1127,9 @@ def jacar_auto_search(
                     )
                     safe_target_name = _sanitize_filename(raw_target_name)
                     final_save_path = os.path.join(download_dir, safe_target_name + ".pdf")
-                    sidecar_path = os.path.splitext(final_save_path)[0] + ".json"
-                    pdf_exists = os.path.exists(final_save_path)
-                    sidecar_exists = os.path.exists(sidecar_path)
-                    task_id = final_save_path
+                    task_id = f"jacar:{ref_code}" if ref_code and ref_code != "Unknown_Ref" else final_save_path
 
                     # 监控列表：在遍历到结果行时就建立条目，不依赖是否入队下载
-                    preview_status = "待下载"
-                    preview_progress = 0.0
-                    preview_speed = "0.00B/s"
-                    if pdf_exists and sidecar_exists:
-                        preview_status = "已下载"
-                        preview_progress = 1.0
-                        preview_speed = "完成"
                     _safe_callback(
                         on_task_enqueued,
                         {
@@ -1068,9 +1137,9 @@ def jacar_auto_search(
                             "title": doc_title,
                             "save_path": final_save_path,
                             "mode": "download_and_sidecar",
-                            "status": preview_status,
-                            "progress": preview_progress,
-                            "speed_text": preview_speed,
+                            "status": "待下载",
+                            "progress": 0.0,
+                            "speed_text": "0.00B/s",
                         },
                     )
 
@@ -1084,23 +1153,20 @@ def jacar_auto_search(
                         )
                         continue
 
-                    # 状态分流：
-                    # 1) PDF + Sidecar 都存在：跳过两者
-                    # 2) 仅 PDF 存在：跳过下载，仅补写 Sidecar
-                    # 3) 其他情况：执行下载，并在成功后写 Sidecar
-                    if pdf_exists and sidecar_exists:
-                        skipped_existing += 1
-                        _emit(
-                            logger,
-                            f"  -> ⏭️ PDF 与 Sidecar 已完整存在，跳过: {os.path.basename(final_save_path)}",
-                            logging.INFO,
-                        )
-                        continue
-
-                    task_mode = "download_and_sidecar"
-                    if pdf_exists and (not sidecar_exists):
-                        task_mode = "sidecar_only"
-                        sidecar_only_added += 1
+                    # 状态入库（不存在/待处理/失败时 upsert 到 discovered，再交给打工人）
+                    db_service.upsert_document(
+                        source="jacar",
+                        native_id=ref_code,
+                        title=doc_title,
+                        repo_name=repo_name,
+                        level2_name=level2_name,
+                        parent_name=parent_name,
+                        scale=scale,
+                        viewer_url=viewer_url,
+                        search_keyword=target_keyword,
+                        metadata=doc_metadata,
+                        status="discovered",
+                    )
 
                     task_queue.put(
                         {
@@ -1108,8 +1174,11 @@ def jacar_auto_search(
                             "save_path": final_save_path,
                             "title": doc_title,
                             "metadata": doc_metadata,
-                            "mode": task_mode,
+                            "mode": "download_and_sidecar",
                             "task_id": task_id,
+                            "source": "jacar",
+                            "native_id": ref_code,
+                            "search_keyword": target_keyword,
                         }
                     )
                     scheduled_save_paths.add(final_save_path)
@@ -1118,16 +1187,10 @@ def jacar_auto_search(
                     with progress_state["lock"]:
                         progress_state["dispatched"] = int(progress_state.get("dispatched", 0)) + 1
                     _render_global_progress(progress_state)
-                    if task_mode == "sidecar_only":
-                        _emit(
-                            logger,
-                            f"  -> 🧾 仅补写 Sidecar 任务已分发: {doc_title} | 当前积压: {task_queue.qsize()}",
-                        )
-                    else:
-                        _emit(
-                            logger,
-                            f"  -> 📦 下载+Sidecar 任务已分发: {doc_title} | 当前积压: {task_queue.qsize()}",
-                        )
+                    _emit(
+                        logger,
+                        f"  -> 📦 下载+Sidecar 任务已分发: {doc_title} | 当前积压: {task_queue.qsize()}",
+                    )
                     if max_downloads is not None and total_tasks_added >= max_downloads:
                         _emit(logger, f"\n🎯 已达到测试上限 {max_downloads} 份，停止继续分发。")
                         break
