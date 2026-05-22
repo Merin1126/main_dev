@@ -900,6 +900,7 @@ def jacar_auto_search(
     strict_row_validation: bool = False,
     on_task_enqueued=None,
     on_task_update=None,
+    on_run_started=None,
 ):
     print("正在初始化网络环境与高并发队列...")
     db_service = DbService()
@@ -974,6 +975,7 @@ def jacar_auto_search(
             year_to=str(end_year),
             notes=f"headless={bool(headless)}; strict_row_validation={bool(strict_row_validation)}",
         )
+        _safe_callback(on_run_started, run_id)
     except Exception as e:
         _emit(logger, f"⚠️ download_runs 初始化失败（降级继续抓取）: {e}", logging.WARNING)
 

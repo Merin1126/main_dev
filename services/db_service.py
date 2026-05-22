@@ -503,3 +503,66 @@ class DbService:
                 )
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # 监控查询（阶段 4：GUI 监控弹窗由 DB 驱动）
+    # ------------------------------------------------------------------
+    def get_latest_run_id(self, prefer_active: bool = True) -> int | None:
+        try:
+            if prefer_active:
+                row = self.fetchone(
+                    "SELECT id FROM download_runs WHERE finished_at IS NULL ORDER BY id DESC LIMIT 1"
+                )
+                if row:
+                    return int(row["id"])
+            row = self.fetchone("SELECT id FROM download_runs ORDER BY id DESC LIMIT 1")
+            return int(row["id"]) if row else None
+        except Exception:
+            return None
+
+    def get_run_summary(self, run_id: int) -> dict[str, Any] | None:
+        try:
+            row = self.fetchone(
+                """
+                SELECT id, started_at, finished_at, keyword, year_from, year_to,
+                       dispatched, completed, succeeded, failed, sidecar_only, notes
+                FROM download_runs
+                WHERE id = ?
+                """,
+                (int(run_id),),
+            )
+            return dict(row) if row else None
+        except Exception:
+            return None
+
+    def get_run_monitor_rows(self, run_id: int) -> list[dict[str, Any]]:
+        """返回某次 run 的任务监控行（documents JOIN latest download_events）。"""
+        try:
+            rows = self.fetchall(
+                """
+                WITH latest_events AS (
+                    SELECT de.document_id, MAX(de.id) AS last_id
+                    FROM download_events de
+                    WHERE de.run_id = ? AND de.document_id IS NOT NULL
+                    GROUP BY de.document_id
+                )
+                SELECT
+                    d.document_id AS task_id,
+                    d.title AS title,
+                    d.status AS doc_status,
+                    d.source AS source,
+                    d.native_id AS native_id,
+                    d.viewer_url AS viewer_url,
+                    e.event_type AS event_type,
+                    e.message AS message,
+                    e.timestamp AS event_ts
+                FROM latest_events le
+                JOIN download_events e ON e.id = le.last_id
+                JOIN documents d ON d.document_id = le.document_id
+                ORDER BY e.id ASC
+                """,
+                (int(run_id),),
+            )
+            return [dict(r) for r in rows]
+        except Exception:
+            return []

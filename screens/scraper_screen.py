@@ -1,8 +1,8 @@
 import threading
-import os
 import customtkinter as ctk
 from tkinter import messagebox
 from config.settings import Color
+from services import DbService
 
 # 导入咱们刚移植过来的高级 UI 组件
 from components.ui.button import Button
@@ -17,9 +17,13 @@ class ScraperScreen(ctk.CTkFrame):
         super().__init__(master, fg_color=("#f5f6f8", "#1f1f23"), **kwargs)
         self.master = master
         self.stop_event = threading.Event()
+        self.db_service = DbService()
+        self.current_run_id: int | None = None
         self.monitor_window = None
         self.monitor_rows: dict[str, dict] = {}
         self.monitor_list_frame = None
+        self.monitor_title = None
+        self.monitor_poll_job = None
 
         self._setup_ui()
 
@@ -119,20 +123,22 @@ class ScraperScreen(ctk.CTkFrame):
         if self.monitor_window is not None and self.monitor_window.winfo_exists():
             self.monitor_window.lift()
             self.monitor_window.focus_set()
+            self._start_monitor_polling()
             return
         self.monitor_rows = {}
         self.monitor_window = ctk.CTkToplevel(self)
         self.monitor_window.title("下载任务监控")
         self.monitor_window.geometry("980x620")
         self.monitor_window.attributes("-topmost", True)
+        self.monitor_window.protocol("WM_DELETE_WINDOW", self._close_monitor_window)
 
-        title = ctk.CTkLabel(
+        self.monitor_title = ctk.CTkLabel(
             self.monitor_window,
             text="本次抓取下载监控",
             font=("Arial", 18, "bold"),
             text_color=Color.TEXT,
         )
-        title.pack(pady=(14, 10))
+        self.monitor_title.pack(pady=(14, 10))
 
         head = ctk.CTkLabel(
             self.monitor_window,
@@ -152,6 +158,125 @@ class ScraperScreen(ctk.CTkFrame):
             height=520,
         )
         self.monitor_list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        self._bootstrap_monitor_run()
+        self._start_monitor_polling()
+
+    def _close_monitor_window(self):
+        if self.monitor_poll_job is not None:
+            try:
+                self.after_cancel(self.monitor_poll_job)
+            except Exception:
+                pass
+            self.monitor_poll_job = None
+        if self.monitor_window is not None and self.monitor_window.winfo_exists():
+            self.monitor_window.destroy()
+        self.monitor_window = None
+        self.monitor_list_frame = None
+        self.monitor_title = None
+        self.monitor_rows = {}
+
+    def _bootstrap_monitor_run(self):
+        if self.current_run_id is None:
+            self.current_run_id = self.db_service.get_latest_run_id(prefer_active=True)
+        self._refresh_monitor_from_db()
+
+    def _status_from_db(self, doc_status: str | None, event_type: str | None) -> str:
+        s = (event_type or "").strip().lower()
+        d = (doc_status or "").strip().lower()
+        if s == "downloading" or d == "downloading":
+            return "正在下载"
+        if s == "queued" or d in {"discovered", "pending", "queued"}:
+            return "待下载"
+        if s == "failed" or d in {"failed", "error"}:
+            return "失败"
+        if s == "aborted":
+            return "已中止"
+        if s == "succeeded" or d in {"downloaded", "completed", "pending_hoover"}:
+            return "已下载"
+        return "待下载"
+
+    def _apply_monitor_state(self, task_id: str, title: str, status: str, speed_text: str, progress: float | None):
+        self._ensure_monitor_row(task_id, title)
+        row = self.monitor_rows.get(task_id)
+        if not row:
+            return
+        color = Color.TEXT_MUTED
+        if status == "正在下载":
+            color = Color.PRIMARY
+        elif status == "已下载":
+            color = Color.TEXT_SUCCESS
+        elif status in {"失败", "已中止"}:
+            color = Color.RED
+        row["status"].configure(text=status, text_color=color)
+        row["speed"].configure(text=speed_text, text_color=Color.TEXT_MUTED)
+        if progress is None:
+            current = row["bar"].get()
+            if status == "正在下载" and current < 0.95:
+                row["bar"].set(min(0.95, current + 0.02))
+        else:
+            row["bar"].set(max(0.0, min(1.0, float(progress))))
+
+    def _refresh_monitor_from_db(self):
+        if not self.monitor_window or not self.monitor_window.winfo_exists():
+            return
+        run_id = self.current_run_id
+        if run_id is None:
+            if self.monitor_title:
+                self.monitor_title.configure(text="下载任务监控（暂无运行记录）")
+            return
+
+        summary = self.db_service.get_run_summary(run_id)
+        if self.monitor_title:
+            if summary:
+                kw = summary.get("keyword") or "-"
+                done = summary.get("completed") or 0
+                total = summary.get("dispatched") or 0
+                self.monitor_title.configure(text=f"下载任务监控 · Run #{run_id} · 关键词 {kw} · {done}/{total}")
+            else:
+                self.monitor_title.configure(text=f"下载任务监控 · Run #{run_id}")
+
+        rows = self.db_service.get_run_monitor_rows(run_id)
+        for item in rows:
+            task_id = str(item.get("task_id") or "")
+            if not task_id:
+                continue
+            title = str(item.get("title") or task_id)
+            status = self._status_from_db(item.get("doc_status"), item.get("event_type"))
+            speed_text = "N/A"
+            progress = None
+            et = (item.get("event_type") or "").strip().lower()
+            if status == "待下载":
+                speed_text = "0.00B/s"
+                progress = 0.0
+            elif status == "已下载":
+                speed_text = "完成"
+                progress = 1.0
+            elif status in {"失败", "已中止"}:
+                speed_text = str(item.get("message") or "0.00B/s")
+                progress = None
+            elif et == "downloading":
+                speed_text = "运行中"
+                progress = None
+            self._apply_monitor_state(task_id, title, status, speed_text, progress)
+
+    def _start_monitor_polling(self):
+        if not self.monitor_window or not self.monitor_window.winfo_exists():
+            return
+        if self.monitor_poll_job is not None:
+            try:
+                self.after_cancel(self.monitor_poll_job)
+            except Exception:
+                pass
+            self.monitor_poll_job = None
+
+        def _tick():
+            self._refresh_monitor_from_db()
+            if self.monitor_window and self.monitor_window.winfo_exists():
+                self.monitor_poll_job = self.after(1200, _tick)
+            else:
+                self.monitor_poll_job = None
+
+        self.monitor_poll_job = self.after(100, _tick)
 
     def _ensure_monitor_row(self, task_id: str, title: str):
         if not self.monitor_list_frame:
@@ -183,65 +308,19 @@ class ScraperScreen(ctk.CTkFrame):
         }
 
     def on_task_enqueued(self, task: dict):
-        def _ui():
-            if not self.monitor_window or not self.monitor_window.winfo_exists():
-                self._open_monitor_window()
-            task_id = task.get("task_id") or task.get("save_path") or ""
-            if not task_id:
-                return
-            title = task.get("title") or os.path.basename(task.get("save_path") or task_id)
-            self._ensure_monitor_row(task_id, title)
-            row = self.monitor_rows.get(task_id)
-            if row:
-                status = task.get("status", "待下载")
-                color = Color.TEXT_MUTED
-                if status == "正在下载":
-                    color = Color.PRIMARY
-                elif status == "已下载":
-                    color = Color.TEXT_SUCCESS
-                elif status in {"失败", "已中止"}:
-                    color = Color.RED
-                row["status"].configure(text=status, text_color=color)
-                row["speed"].configure(text=str(task.get("speed_text", "0.00B/s")), text_color=Color.TEXT_MUTED)
-                progress = task.get("progress")
-                if progress is None:
-                    row["bar"].set(0)
-                else:
-                    row["bar"].set(max(0.0, min(1.0, float(progress))))
-        self.after(0, _ui)
+        # 阶段 4 起监控由 DB 驱动，此回调保留为兼容空实现
+        return
 
     def on_task_update(self, task_id: str, payload: dict):
+        # 阶段 4 起监控由 DB 驱动，此回调保留为兼容空实现
+        return
+
+    def on_run_started(self, run_id: int):
         def _ui():
-            if not task_id:
-                return
-            if task_id not in self.monitor_rows:
-                # 兜底：回调先到时创建占位行
-                self._ensure_monitor_row(task_id, os.path.basename(task_id))
-            row = self.monitor_rows.get(task_id)
-            if not row:
-                return
-            status = payload.get("status")
-            progress = payload.get("progress")
-            speed_text = payload.get("speed_text")
-            if status:
-                color = Color.TEXT_MUTED
-                if status == "正在下载":
-                    color = Color.PRIMARY
-                elif status == "已下载":
-                    color = Color.TEXT_SUCCESS
-                elif status in {"失败", "已中止"}:
-                    color = Color.RED
-                row["status"].configure(text=status, text_color=color)
-            if speed_text is not None:
-                row["speed"].configure(text=str(speed_text), text_color=Color.TEXT_MUTED)
-            if progress is None:
-                # 未知总量时保持动画感：不倒退进度
-                current = row["bar"].get()
-                if status == "正在下载" and current < 0.95:
-                    row["bar"].set(min(0.95, current + 0.02))
-            else:
-                p = max(0.0, min(1.0, float(progress)))
-                row["bar"].set(p)
+            self.current_run_id = int(run_id)
+            if self.monitor_window and self.monitor_window.winfo_exists():
+                self._refresh_monitor_from_db()
+                self._start_monitor_polling()
         self.after(0, _ui)
 
     def finish_scraping(self, message="🎉 任务圆满完成！所有文件已下载。"):
@@ -274,6 +353,7 @@ class ScraperScreen(ctk.CTkFrame):
         self.btn_stop.configure(state="normal")
         self.lbl_status.configure(text="🚀 正在启动浏览器并连接数据库...", text_color=Color.PRIMARY)
         self.progress_bar.set(0)
+        self.current_run_id = None
         self._open_monitor_window()
 
         # 启动后台爬虫线程
@@ -284,6 +364,7 @@ class ScraperScreen(ctk.CTkFrame):
                 "headless": bool(self.headless_var.get()),
                 "on_task_enqueued": self.on_task_enqueued,
                 "on_task_update": self.on_task_update,
+                "on_run_started": self.on_run_started,
             }
         )
         scraper_thread.daemon = True
