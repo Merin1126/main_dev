@@ -54,7 +54,9 @@ CREATE INDEX IF NOT EXISTS idx_files_kind     ON files(kind);
 CREATE TABLE IF NOT EXISTS download_runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at   TEXT NOT NULL,
+    started_at_local TEXT,
     finished_at  TEXT,
+    finished_at_local TEXT,
     keyword      TEXT,
     year_from    TEXT,
     year_to      TEXT,

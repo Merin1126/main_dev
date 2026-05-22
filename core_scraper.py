@@ -801,6 +801,13 @@ def api_download_worker(
                         search_keyword=str(task.get("search_keyword") or ""),
                         sidecar_path=sidecar_path,
                     )
+                    db_service.add_download_event(
+                        native_id,
+                        "succeeded",
+                        message="hoover pending already exists",
+                        run_id=int(run_id) if run_id is not None else None,
+                        source="hoover",
+                    )
                     _emit(logger, "  -> ⏭️ 胡佛链接与Sidecar均已存在，跳过重复登记。", logging.INFO)
                     task_success = True
                     _safe_callback(
@@ -1075,11 +1082,17 @@ def jacar_auto_search(
                     except Exception:
                         ref_code = "Unknown_Ref"
 
-                    # 极速 DB 过滤：ref_code 命中已完成状态则直接跳过（不做物理文件 exists 检查）
+                    is_hoover_link = "hojishinbun.hoover.org" in viewer_url
+                    source_for_task = "hoover" if is_hoover_link else "jacar"
+
+                    # 极速 DB 过滤：命中已处理状态则直接跳过（不做物理文件 exists 检查）
                     if ref_code and ref_code != "Unknown_Ref":
-                        status_in_db = db_service.get_document_status("jacar", ref_code)
-                        if (status_in_db or "").strip().lower() in {"completed", "downloaded"}:
-                            task_id = f"jacar:{ref_code}"
+                        status_in_db = db_service.get_document_status(source_for_task, ref_code)
+                        skip_statuses = {"completed", "downloaded"}
+                        if source_for_task == "hoover":
+                            skip_statuses.add("pending_hoover")
+                        if (status_in_db or "").strip().lower() in skip_statuses:
+                            task_id = f"{source_for_task}:{ref_code}"
                             _safe_callback(
                                 on_task_enqueued,
                                 {
@@ -1201,7 +1214,7 @@ def jacar_auto_search(
                     )
                     safe_target_name = _sanitize_filename(raw_target_name)
                     final_save_path = os.path.join(download_dir, safe_target_name + ".pdf")
-                    task_id = f"jacar:{ref_code}" if ref_code and ref_code != "Unknown_Ref" else final_save_path
+                    task_id = f"{source_for_task}:{ref_code}" if ref_code and ref_code != "Unknown_Ref" else final_save_path
 
                     # 监控列表：在遍历到结果行时就建立条目，不依赖是否入队下载
                     _safe_callback(
@@ -1229,7 +1242,7 @@ def jacar_auto_search(
 
                     # 状态入库（不存在/待处理/失败时 upsert 到 discovered，再交给打工人）
                     db_service.upsert_document(
-                        source="jacar",
+                        source=source_for_task,
                         native_id=ref_code,
                         title=doc_title,
                         repo_name=repo_name,
@@ -1250,7 +1263,7 @@ def jacar_auto_search(
                             "metadata": doc_metadata,
                             "mode": "download_and_sidecar",
                             "task_id": task_id,
-                            "source": "jacar",
+                            "source": source_for_task,
                             "native_id": ref_code,
                             "search_keyword": target_keyword,
                             "run_id": run_id,
@@ -1260,7 +1273,7 @@ def jacar_auto_search(
                         ref_code,
                         "queued",
                         run_id=run_id,
-                        source="jacar",
+                        source=source_for_task,
                     )
                     scheduled_save_paths.add(final_save_path)
                     scheduled_viewer_urls.add(viewer_url)

@@ -3,6 +3,7 @@ ALTER TABLE download_events ADD COLUMN ref_code TEXT;
 ALTER TABLE download_events ADD COLUMN event_type TEXT;
 ALTER TABLE download_events ADD COLUMN message TEXT;
 ALTER TABLE download_events ADD COLUMN timestamp TEXT;
+ALTER TABLE download_events ADD COLUMN timestamp_local TEXT;
 
 -- 将已有历史数据尽可能回填到新字段，便于统一查询
 UPDATE download_events
@@ -24,3 +25,10 @@ WHERE message IS NULL;
 UPDATE download_events
 SET timestamp = recorded_at
 WHERE timestamp IS NULL;
+
+UPDATE download_events
+SET timestamp_local = (
+    strftime('%Y-%m-%dT%H:%M:%S', datetime(COALESCE(timestamp, recorded_at), '+8 hours')) || '+08:00'
+)
+WHERE timestamp_local IS NULL
+  AND COALESCE(timestamp, recorded_at) IS NOT NULL;

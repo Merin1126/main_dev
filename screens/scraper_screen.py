@@ -216,6 +216,16 @@ class ScraperScreen(ctk.CTkFrame):
         else:
             row["bar"].set(max(0.0, min(1.0, float(progress))))
 
+    def _clear_monitor_rows(self):
+        for item in list(self.monitor_rows.values()):
+            row_widget = item.get("row")
+            try:
+                if row_widget is not None:
+                    row_widget.destroy()
+            except Exception:
+                pass
+        self.monitor_rows = {}
+
     def _refresh_monitor_from_db(self):
         if not self.monitor_window or not self.monitor_window.winfo_exists():
             return
@@ -236,10 +246,12 @@ class ScraperScreen(ctk.CTkFrame):
                 self.monitor_title.configure(text=f"下载任务监控 · Run #{run_id}")
 
         rows = self.db_service.get_run_monitor_rows(run_id)
+        active_task_ids: set[str] = set()
         for item in rows:
             task_id = str(item.get("task_id") or "")
             if not task_id:
                 continue
+            active_task_ids.add(task_id)
             title = str(item.get("title") or task_id)
             status = self._status_from_db(item.get("doc_status"), item.get("event_type"))
             speed_text = "N/A"
@@ -258,6 +270,19 @@ class ScraperScreen(ctk.CTkFrame):
                 speed_text = "运行中"
                 progress = None
             self._apply_monitor_state(task_id, title, status, speed_text, progress)
+
+        # 清理不属于当前 run 的旧行，避免显示上一次任务残留
+        stale_task_ids = [tid for tid in self.monitor_rows.keys() if tid not in active_task_ids]
+        for tid in stale_task_ids:
+            item = self.monitor_rows.pop(tid, None)
+            if not item:
+                continue
+            row_widget = item.get("row")
+            try:
+                if row_widget is not None:
+                    row_widget.destroy()
+            except Exception:
+                pass
 
     def _start_monitor_polling(self):
         if not self.monitor_window or not self.monitor_window.winfo_exists():
@@ -317,7 +342,10 @@ class ScraperScreen(ctk.CTkFrame):
 
     def on_run_started(self, run_id: int):
         def _ui():
-            self.current_run_id = int(run_id)
+            new_run_id = int(run_id)
+            if self.current_run_id != new_run_id:
+                self._clear_monitor_rows()
+            self.current_run_id = new_run_id
             if self.monitor_window and self.monitor_window.winfo_exists():
                 self._refresh_monitor_from_db()
                 self._start_monitor_polling()

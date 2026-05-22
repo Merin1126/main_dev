@@ -25,6 +25,10 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _local_now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 class DbService:
     """HRS 全局 SQLite 访问服务（Singleton）。"""
 
@@ -127,6 +131,10 @@ class DbService:
     @staticmethod
     def utc_now_iso() -> str:
         return _utc_now_iso()
+
+    @staticmethod
+    def local_now_iso() -> str:
+        return _local_now_iso()
 
     # ------------------------------------------------------------------
     # 健康检查
@@ -360,6 +368,7 @@ class DbService:
         source: str = "jacar",
     ) -> None:
         now = self.utc_now_iso()
+        now_local = self.local_now_iso()
         document_id = self.make_document_id(source, ref_code) if ref_code else None
         if document_id is not None:
             row = self.fetchone("SELECT 1 FROM documents WHERE document_id = ? LIMIT 1", (document_id,))
@@ -370,9 +379,9 @@ class DbService:
                 """
                 INSERT INTO download_events(
                     run_id, document_id, branch, status, bytes_downloaded, duration_ms, error_message, recorded_at,
-                    ref_code, event_type, message, timestamp
+                    ref_code, event_type, message, timestamp, timestamp_local
                 )
-                VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -385,6 +394,7 @@ class DbService:
                     event_type,
                     message or "",
                     now,
+                    now_local,
                 ),
             )
 
@@ -423,14 +433,15 @@ class DbService:
         notes: str = "",
     ) -> int:
         now = self.utc_now_iso()
+        now_local = self.local_now_iso()
         with self.transaction() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO download_runs(
-                    started_at, keyword, year_from, year_to, notes
-                ) VALUES (?, ?, ?, ?, ?)
+                    started_at, started_at_local, keyword, year_from, year_to, notes
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (now, keyword, year_from, year_to, notes),
+                (now, now_local, keyword, year_from, year_to, notes),
             )
             return int(cur.lastrowid)
 
@@ -446,11 +457,13 @@ class DbService:
         notes: str = "",
     ) -> None:
         now = self.utc_now_iso()
+        now_local = self.local_now_iso()
         with self.transaction() as conn:
             conn.execute(
                 """
                 UPDATE download_runs
                 SET finished_at = ?,
+                    finished_at_local = ?,
                     dispatched = ?,
                     completed = ?,
                     succeeded = ?,
@@ -464,6 +477,7 @@ class DbService:
                 """,
                 (
                     now,
+                    now_local,
                     int(dispatched),
                     int(completed),
                     int(succeeded),
@@ -524,7 +538,7 @@ class DbService:
         try:
             row = self.fetchone(
                 """
-                SELECT id, started_at, finished_at, keyword, year_from, year_to,
+                SELECT id, started_at, started_at_local, finished_at, finished_at_local, keyword, year_from, year_to,
                        dispatched, completed, succeeded, failed, sidecar_only, notes
                 FROM download_runs
                 WHERE id = ?
@@ -555,7 +569,8 @@ class DbService:
                     d.viewer_url AS viewer_url,
                     e.event_type AS event_type,
                     e.message AS message,
-                    e.timestamp AS event_ts
+                    e.timestamp AS event_ts,
+                    e.timestamp_local AS event_ts_local
                 FROM latest_events le
                 JOIN download_events e ON e.id = le.last_id
                 JOIN documents d ON d.document_id = le.document_id
