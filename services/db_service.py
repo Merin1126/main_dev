@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import json
+import queue
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -66,6 +67,12 @@ class DbService:
             "schema",
         )
         apply_migrations(self._conn, schema_dir)
+
+        # 下载事件采用异步入队，避免阻塞抓取下载线程
+        self._event_queue: "queue.Queue[dict[str, Any] | None]" = queue.Queue(maxsize=10000)
+        self._event_worker_stop = threading.Event()
+        self._event_worker = threading.Thread(target=self._event_worker_loop, daemon=True)
+        self._event_worker.start()
 
         self._initialized = True
 
@@ -140,10 +147,26 @@ class DbService:
         with self._lock:
             if self._conn is not None:
                 try:
+                    self._event_worker_stop.set()
+                    try:
+                        self._event_queue.put_nowait(None)
+                    except Exception:
+                        pass
                     self._conn.close()
                 finally:
                     self._conn = None  # type: ignore[assignment]
                     self._initialized = False
+
+    def _event_worker_loop(self) -> None:
+        while not self._event_worker_stop.is_set():
+            payload = self._event_queue.get()
+            if payload is None:
+                break
+            try:
+                self._insert_download_event_sync(**payload)
+            except Exception:
+                # 事件审计失败不能影响主流程
+                pass
 
     # ------------------------------------------------------------------
     # 领域辅助（阶段 2：抓取去重与状态闭环）
@@ -326,3 +349,157 @@ class DbService:
             if sidecar_path:
                 self._record_file(conn, document_id=document_id, kind="sidecar", path=sidecar_path)
         return document_id
+
+    def _insert_download_event_sync(
+        self,
+        *,
+        ref_code: str,
+        event_type: str,
+        message: str = "",
+        run_id: int | None = None,
+        source: str = "jacar",
+    ) -> None:
+        now = self.utc_now_iso()
+        document_id = self.make_document_id(source, ref_code) if ref_code else None
+        if document_id is not None:
+            row = self.fetchone("SELECT 1 FROM documents WHERE document_id = ? LIMIT 1", (document_id,))
+            if row is None:
+                document_id = None
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO download_events(
+                    run_id, document_id, branch, status, bytes_downloaded, duration_ms, error_message, recorded_at,
+                    ref_code, event_type, message, timestamp
+                )
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    document_id,
+                    source,
+                    event_type,
+                    message or "",
+                    now,
+                    ref_code,
+                    event_type,
+                    message or "",
+                    now,
+                ),
+            )
+
+    def add_download_event(
+        self,
+        ref_code: str,
+        event_type: str,
+        message: str = "",
+        *,
+        run_id: int | None = None,
+        source: str = "jacar",
+    ) -> None:
+        """异步记录下载轨迹；异常吞掉，不影响下载主流程。"""
+        payload = {
+            "ref_code": ref_code or "",
+            "event_type": event_type or "",
+            "message": message or "",
+            "run_id": run_id,
+            "source": source or "jacar",
+        }
+        try:
+            self._event_queue.put_nowait(payload)
+        except Exception:
+            # 队列满时降级同步写；同步写也需异常保护
+            try:
+                self._insert_download_event_sync(**payload)
+            except Exception:
+                pass
+
+    def begin_download_run(
+        self,
+        *,
+        keyword: str,
+        year_from: str,
+        year_to: str,
+        notes: str = "",
+    ) -> int:
+        now = self.utc_now_iso()
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO download_runs(
+                    started_at, keyword, year_from, year_to, notes
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (now, keyword, year_from, year_to, notes),
+            )
+            return int(cur.lastrowid)
+
+    def finish_download_run(
+        self,
+        run_id: int,
+        *,
+        dispatched: int,
+        completed: int,
+        succeeded: int,
+        failed: int,
+        sidecar_only: int,
+        notes: str = "",
+    ) -> None:
+        now = self.utc_now_iso()
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE download_runs
+                SET finished_at = ?,
+                    dispatched = ?,
+                    completed = ?,
+                    succeeded = ?,
+                    failed = ?,
+                    sidecar_only = ?,
+                    notes = CASE
+                        WHEN ? = '' THEN notes
+                        ELSE ?
+                    END
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    int(dispatched),
+                    int(completed),
+                    int(succeeded),
+                    int(failed),
+                    int(sidecar_only),
+                    notes,
+                    notes,
+                    int(run_id),
+                ),
+            )
+
+    def add_failed_row(
+        self,
+        *,
+        run_id: int | None,
+        reason: str,
+        page_index: int | None,
+        row_index: int | None,
+        payload: dict[str, Any],
+        ts: str | None = None,
+    ) -> None:
+        try:
+            with self.transaction() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO failed_rows(run_id, ts, reason, page_index, row_index, payload_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        ts or self.utc_now_iso(),
+                        reason,
+                        page_index,
+                        row_index,
+                        json.dumps(payload or {}, ensure_ascii=False),
+                    ),
+                )
+        except Exception:
+            pass

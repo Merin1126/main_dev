@@ -423,6 +423,7 @@ def api_download_worker(
         task_id = task.get("task_id") or save_path
         source = str(task.get("source") or "jacar")
         native_id = str(task.get("native_id") or doc_metadata.get("Ref_Code") or "Unknown_Ref")
+        run_id = task.get("run_id")
         task_success = False
         task_bytes_downloaded = 0
         task_bytes_total_known = 0
@@ -434,6 +435,12 @@ def api_download_worker(
                 task_id,
                 {"status": "正在下载", "progress": 0.0, "speed_text": "0.00B/s"},
             )
+            db_service.add_download_event(
+                native_id,
+                "downloading",
+                run_id=int(run_id) if run_id is not None else None,
+                source=source,
+            )
 
             if task_mode == "sidecar_only":
                 _write_sidecar_metadata(save_path, doc_metadata, logger)
@@ -442,6 +449,12 @@ def api_download_worker(
                     native_id=native_id,
                     pdf_path=save_path if os.path.exists(save_path) else None,
                     sidecar_path=os.path.splitext(save_path)[0] + ".json",
+                )
+                db_service.add_download_event(
+                    native_id,
+                    "succeeded",
+                    run_id=int(run_id) if run_id is not None else None,
+                    source=source,
                 )
                 _emit(
                     logger,
@@ -463,6 +476,13 @@ def api_download_worker(
                     native_id=native_id,
                     pdf_path=save_path,
                     sidecar_path=sidecar_path if os.path.exists(sidecar_path) else None,
+                )
+                db_service.add_download_event(
+                    native_id,
+                    "succeeded",
+                    message="物理文件已存在，已自动修复数据库状态",
+                    run_id=int(run_id) if run_id is not None else None,
+                    source=source,
                 )
                 _emit(logger, "  -> ♻️ 物理文件已存在，已自动修复数据库状态", logging.INFO)
                 task_success = True
@@ -542,6 +562,12 @@ def api_download_worker(
                     native_id=native_id,
                     pdf_path=save_path,
                     sidecar_path=os.path.splitext(save_path)[0] + ".json",
+                )
+                db_service.add_download_event(
+                    native_id,
+                    "succeeded",
+                    run_id=int(run_id) if run_id is not None else None,
+                    source=source,
                 )
                 _emit(logger, f"  -> ✅ [打工人完工] 直链下载成功，并已保存元数据 JSON: {os.path.basename(save_path)}")
                 task_success = True
@@ -734,6 +760,12 @@ def api_download_worker(
                     pdf_path=save_path,
                     sidecar_path=os.path.splitext(save_path)[0] + ".json",
                 )
+                db_service.add_download_event(
+                    native_id,
+                    "succeeded",
+                    run_id=int(run_id) if run_id is not None else None,
+                    source=source,
+                )
                 try:
                     shutil.rmtree(resume_dir, ignore_errors=True)
                 except Exception:
@@ -801,6 +833,13 @@ def api_download_worker(
                     search_keyword=str(task.get("search_keyword") or ""),
                     sidecar_path=sidecar_path if os.path.exists(sidecar_path) else None,
                 )
+                db_service.add_download_event(
+                    native_id,
+                    "succeeded",
+                    message="hoover pending",
+                    run_id=int(run_id) if run_id is not None else None,
+                    source="hoover",
+                )
                 task_success = True
                 _safe_callback(
                     on_task_update,
@@ -818,6 +857,13 @@ def api_download_worker(
         except Exception as e:
             _emit(logger, f"  -> ❌ [打工人报错] {doc_title} 处理失败: {e}", logging.ERROR)
             db_service.mark_document_status(source, native_id, "failed")
+            db_service.add_download_event(
+                native_id,
+                "failed",
+                message=str(e),
+                run_id=int(run_id) if run_id is not None else None,
+                source=source,
+            )
             _safe_callback(
                 on_task_update,
                 task_id,
@@ -920,6 +966,16 @@ def jacar_auto_search(
     else:
         _emit(logger, f"🧪 当前为测试下载模式，最大下载数：{max_downloads}")
     _emit(logger, f"🔎 严格行校验模式：{'开启' if strict_row_validation else '关闭'}")
+    run_id: int | None = None
+    try:
+        run_id = db_service.begin_download_run(
+            keyword=str(target_keyword),
+            year_from=str(start_year),
+            year_to=str(end_year),
+            notes=f"headless={bool(headless)}; strict_row_validation={bool(strict_row_validation)}",
+        )
+    except Exception as e:
+        _emit(logger, f"⚠️ download_runs 初始化失败（降级继续抓取）: {e}", logging.WARNING)
 
     try:
         # 1) 直接拼接 URL 访问列表页（不再模拟首页点击）
@@ -1119,6 +1175,22 @@ def jacar_auto_search(
                                         "scale": scale,
                                     },
                                 )
+                            db_service.add_failed_row(
+                                run_id=run_id,
+                                reason="strict_validation_failed",
+                                page_index=current_page,
+                                row_index=idx,
+                                payload={
+                                    "doc_title": doc_title,
+                                    "viewer_url": viewer_url,
+                                    "ref_code": ref_code,
+                                    "repo_name": repo_name,
+                                    "level2_name": level2_name,
+                                    "parent_name": parent_name,
+                                    "scale": scale,
+                                    "missing_fields": missing,
+                                },
+                            )
                             continue
 
                     raw_target_name = (
@@ -1179,7 +1251,14 @@ def jacar_auto_search(
                             "source": "jacar",
                             "native_id": ref_code,
                             "search_keyword": target_keyword,
+                            "run_id": run_id,
                         }
+                    )
+                    db_service.add_download_event(
+                        ref_code,
+                        "queued",
+                        run_id=run_id,
+                        source="jacar",
                     )
                     scheduled_save_paths.add(final_save_path)
                     scheduled_viewer_urls.add(viewer_url)
@@ -1197,6 +1276,7 @@ def jacar_auto_search(
                 except Exception as row_e:
                     _emit(logger, f"  -> ⚠️ 行解析失败，已跳过。简略报错: {str(row_e).splitlines()[0]}", logging.WARNING)
                     failed_rows_count += 1
+                    row_text = ""
                     if failed_rows_path:
                         try:
                             row_text = row.text.strip()[:400]
@@ -1213,6 +1293,16 @@ def jacar_auto_search(
                                 "row_text_preview": row_text,
                             },
                         )
+                    db_service.add_failed_row(
+                        run_id=run_id,
+                        reason="row_parse_exception",
+                        page_index=current_page,
+                        row_index=idx,
+                        payload={
+                            "error": str(row_e),
+                            "row_text_preview": row_text,
+                        },
+                    )
                     continue
 
             # 3) 翻页：存在下一页按钮则继续，否则结束
@@ -1265,6 +1355,16 @@ def jacar_auto_search(
                 msg += f"\n失败行证据：{failed_rows_path}"
             with _PRINT_LOCK:
                 _clear_status_line_locked()
+            if run_id is not None:
+                db_service.finish_download_run(
+                    run_id,
+                    dispatched=total_tasks_added,
+                    completed=int(progress_state.get("completed", 0)),
+                    succeeded=int(progress_state.get("succeeded", 0)),
+                    failed=int(progress_state.get("failed", 0)),
+                    sidecar_only=sidecar_only_added,
+                    notes="stopped",
+                )
             finish_scraping(msg)
         else:
             msg = (
@@ -1282,6 +1382,16 @@ def jacar_auto_search(
                 msg += f"\n失败行证据：{failed_rows_path}"
             with _PRINT_LOCK:
                 _clear_status_line_locked()
+            if run_id is not None:
+                db_service.finish_download_run(
+                    run_id,
+                    dispatched=total_tasks_added,
+                    completed=int(progress_state.get("completed", 0)),
+                    succeeded=int(progress_state.get("succeeded", 0)),
+                    failed=int(progress_state.get("failed", 0)),
+                    sidecar_only=sidecar_only_added,
+                    notes="completed",
+                )
             finish_scraping(msg)
 
     except Exception:
@@ -1292,6 +1402,17 @@ def jacar_auto_search(
             msg += f"\n运行日志：{log_path}"
         with _PRINT_LOCK:
             _clear_status_line_locked()
+        if run_id is not None:
+            sidecar_only_value = int(locals().get("sidecar_only_added", 0))
+            db_service.finish_download_run(
+                run_id,
+                dispatched=0,
+                completed=int(progress_state.get("completed", 0)),
+                succeeded=int(progress_state.get("succeeded", 0)),
+                failed=int(progress_state.get("failed", 0)),
+                sidecar_only=sidecar_only_value,
+                notes="fatal_error",
+            )
         finish_scraping(msg)
     finally:
         for _ in workers:
