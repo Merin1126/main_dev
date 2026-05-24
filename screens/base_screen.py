@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -141,6 +142,17 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             return False
         return True
 
+    @staticmethod
+    def _extract_transcription_text(text: str) -> str:
+        """兼容 OCR XML 输出：优先抽取 <transcription> 内容，无标签时回退原文。"""
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        match = re.search(r"<transcription>\s*(.*?)\s*</transcription>", raw, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return raw
+        return (match.group(1) or "").strip()
+
     def _get_ocr_text_for_page(self, pdf_path: str, page_index: int) -> str:
         """
         读取 OCR_Cache 中对应 PDF 的 paged_v1，返回该页已校对底稿。
@@ -152,10 +164,16 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         pages = self.cache_service.read_paged_cache(cache_path)
         if page_index < 0 or page_index >= len(pages):
             return ""
-        text = (pages[page_index] or "").strip()
-        if not self._ocr_cached_plaintext_is_usable(text):
+        raw_text = (pages[page_index] or "").strip()
+        normalized = self._extract_transcription_text(raw_text)
+        if self._ocr_cached_plaintext_is_usable(normalized):
+            return normalized
+        # 容错：若 XML 抽取失败或标签为空，回退旧版纯文本缓存。
+        if self._ocr_cached_plaintext_is_usable(raw_text):
+            return raw_text
+        if not self._ocr_cached_plaintext_is_usable(normalized):
             return ""
-        return text
+        return normalized
 
     def _pdf_has_complete_ocr_baseline(self, pdf_path: str, page_count: int) -> bool:
         """与全书翻译/甄别预检一致：每一页在 OCR_Cache 中均有可用文本。"""
@@ -803,6 +821,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     def _start_single_page_worker(self, page_index, pages_text, total_pages):
         self._reset_usage_summary()
         self._set_ocr_state(DocumentTaskState.RUNNING)
+        # 关键修复：单页任务开始前必须清空历史取消状态，
+        # 否则会被 _ensure_active_task() 立即判定为 DOC_TASK_CANCELLED。
+        self.ocr_cancel_event = threading.Event()
         self.ocr_task_id += 1
         task_id = self.ocr_task_id
         self.ocr_progress_label.configure(
