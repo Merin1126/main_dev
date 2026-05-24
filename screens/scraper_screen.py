@@ -200,6 +200,24 @@ class ScraperScreen(ctk.CTkFrame):
             return "已下载"
         return "待下载"
 
+    @staticmethod
+    def _format_event_message(raw_message: str | None) -> str:
+        """
+        统一展示事件消息：
+        - 若形如 `CODE | 中文说明 | detail=...`，优先展示 `CODE` 与中文说明；
+        - 否则按原始文本兜底。
+        """
+        text = str(raw_message or "").strip()
+        if not text:
+            return "0.00B/s"
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) >= 2 and parts[0].startswith(("E_", "A_")):
+            msg = f"{parts[0]} {parts[1]}"
+            if len(parts) >= 3 and parts[2]:
+                msg += f" ({parts[2]})"
+            return msg
+        return text
+
     def _apply_monitor_state(self, task_id: str, title: str, status: str, speed_text: str, progress: float | None):
         self._ensure_monitor_row(task_id, title)
         row = self.monitor_rows.get(task_id)
@@ -269,7 +287,7 @@ class ScraperScreen(ctk.CTkFrame):
                 speed_text = "完成"
                 progress = 1.0
             elif status in {"失败", "已中止"}:
-                speed_text = str(item.get("message") or "0.00B/s")
+                speed_text = self._format_event_message(item.get("message"))
                 progress = None
             elif et == "downloading":
                 speed_text = "运行中"

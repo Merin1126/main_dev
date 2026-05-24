@@ -29,6 +29,32 @@ from services import DbService
 _PRINT_LOCK = threading.Lock()
 _STATUS_LINE_LEN = 0
 
+_DOWNLOAD_EVENT_CODE_TEXT = {
+    "E_JACAR_CONTENT_LIST_MISSING": "JACAR 页面缺少 najContentList",
+    "E_JACAR_CONTENT_LIST_PARSE": "JACAR najContentList 解析失败",
+    "E_JACAR_CONTENT_LIST_EMPTY": "JACAR najContentList 为空",
+    "E_JACAR_REL_PATH_MISSING": "JACAR 首条缺少 path/source",
+    "E_TOYO_OPAC_RESOLVE_FAILED": "OPAC 跳板解析失败",
+    "E_TOYO_MANIFEST_MISSING": "Toyo Bunko manifest 缺失",
+    "E_TOYO_CANVASES_EMPTY": "Toyo Bunko canvases 为空",
+    "E_TOYO_IIIF_INCOMPLETE": "IIIF 组装未完成",
+    "E_TOYO_IIIF_ZERO_PAGES": "IIIF 未提取到有效页",
+    "E_UNSUPPORTED_DOMAIN": "未支持的来源域名",
+    "E_TASK_EXCEPTION": "任务处理异常",
+    "A_MANUAL_STOP_DIRECT": "手动停止：直链下载中止",
+    "A_MANUAL_STOP_IIIF": "手动停止：IIIF 组装中止",
+}
+
+
+def _event_message(code: str, detail: str | None = None) -> str:
+    """
+    统一事件消息格式：CODE | 中文说明 | detail。
+    便于 GUI 与后续脚本按 code 聚合。
+    """
+    text = _DOWNLOAD_EVENT_CODE_TEXT.get(code, "未知事件")
+    suffix = f" | detail={detail}" if detail else ""
+    return f"{code} | {text}{suffix}"
+
 
 def _clear_status_line_locked():
     """清理当前终端状态行（需在 _PRINT_LOCK 内调用）。"""
@@ -428,6 +454,24 @@ def api_download_worker(
         task_bytes_downloaded = 0
         task_bytes_total_known = 0
 
+        def _mark_task_terminal_state(event_type: str, message: str = "", doc_status: str | None = None):
+            """为非异常早退路径补齐状态闭环，避免任务长期停留在 downloading。"""
+            if doc_status:
+                try:
+                    db_service.mark_document_status(source, native_id, doc_status)
+                except Exception:
+                    pass
+            try:
+                db_service.add_download_event(
+                    native_id,
+                    event_type,
+                    message=message,
+                    run_id=int(run_id) if run_id is not None else None,
+                    source=source,
+                )
+            except Exception:
+                pass
+
         try:
             _emit(logger, f"  -> 🐝 [打工人接单] {doc_title} | mode={task_mode}")
             _safe_callback(
@@ -502,20 +546,40 @@ def api_download_worker(
                 m = re.search(r"var\s+najContentList\s*=\s*(\[.*?\]);", html, re.DOTALL)
                 if not m:
                     _emit(logger, "  -> ⚠️ [打工人] 未找到 najContentList，跳过该条。", logging.WARNING)
+                    _mark_task_terminal_state(
+                        "failed",
+                        _event_message("E_JACAR_CONTENT_LIST_MISSING"),
+                        doc_status="failed",
+                    )
                     continue
                 try:
                     payload = json.loads(m.group(1))
                 except Exception as e:
                     _emit(logger, f"  -> ⚠️ [打工人] najContentList JSON 解析失败: {e}", logging.WARNING)
+                    _mark_task_terminal_state(
+                        "failed",
+                        _event_message("E_JACAR_CONTENT_LIST_PARSE", str(e)),
+                        doc_status="failed",
+                    )
                     continue
 
                 if not isinstance(payload, list) or not payload:
                     _emit(logger, "  -> ⚠️ [打工人] najContentList 为空，跳过该条。", logging.WARNING)
+                    _mark_task_terminal_state(
+                        "failed",
+                        _event_message("E_JACAR_CONTENT_LIST_EMPTY"),
+                        doc_status="failed",
+                    )
                     continue
                 first = payload[0] if isinstance(payload[0], dict) else {}
                 rel_path = first.get("path") or first.get("source")
                 if not rel_path:
                     _emit(logger, "  -> ⚠️ [打工人] 首项缺少 path/source，跳过该条。", logging.WARNING)
+                    _mark_task_terminal_state(
+                        "failed",
+                        _event_message("E_JACAR_REL_PATH_MISSING"),
+                        doc_status="failed",
+                    )
                     continue
 
                 if str(rel_path).startswith(("http://", "https://")):
@@ -550,6 +614,11 @@ def api_download_worker(
                         task_bytes_total_known += (total_known or 0)
                         if aborted:
                             _emit(logger, f"  -> ⏹️ [打工人] 手动停止已触发，中止当前直链下载: {doc_title}")
+                            _mark_task_terminal_state(
+                                "aborted",
+                                _event_message("A_MANUAL_STOP_DIRECT"),
+                                doc_status="discovered",
+                            )
                             _safe_callback(
                                 on_task_update,
                                 task_id,
@@ -590,6 +659,11 @@ def api_download_worker(
                         _emit(logger, f"  -> ✅ 成功解析 OPAC 跳板地址: {viewer_url}")
                     else:
                         _emit(logger, "  -> ⚠️ 未能在 OPAC 页面找到 Digital Version 链接", logging.WARNING)
+                        _mark_task_terminal_state(
+                            "failed",
+                            _event_message("E_TOYO_OPAC_RESOLVE_FAILED"),
+                            doc_status="failed",
+                        )
                         continue
 
                 page = session.get(viewer_url, headers=headers, timeout=20).text
@@ -599,6 +673,11 @@ def api_download_worker(
                 )
                 if not mm:
                     _emit(logger, "  -> ⚠️ [打工人] 未抓到 Toyo Bunko manifest URL，跳过。", logging.WARNING)
+                    _mark_task_terminal_state(
+                        "failed",
+                        _event_message("E_TOYO_MANIFEST_MISSING"),
+                        doc_status="failed",
+                    )
                     continue
                 manifest_url = mm.group(1)
                 manifest = session.get(manifest_url, headers=headers, timeout=20).json()
@@ -610,6 +689,11 @@ def api_download_worker(
                 )
                 if not canvases:
                     _emit(logger, "  -> ⚠️ [打工人] manifest canvases 为空，跳过。", logging.WARNING)
+                    _mark_task_terminal_state(
+                        "failed",
+                        _event_message("E_TOYO_CANVASES_EMPTY"),
+                        doc_status="failed",
+                    )
                     continue
 
                 pdf_doc = fitz.open()
@@ -729,6 +813,11 @@ def api_download_worker(
                                 )
                             continue
                     if stop_event.is_set() or aborted_iiif:
+                        _mark_task_terminal_state(
+                            "aborted",
+                            _event_message("A_MANUAL_STOP_IIIF"),
+                            doc_status="discovered",
+                        )
                         _emit(
                             logger,
                             f"  -> 📌 [打工人] IIIF 已保存断点：{img_count}/{total_pages} 页（复用 {iiif_resume_hits} 页）",
@@ -741,6 +830,11 @@ def api_download_worker(
                         )
                         continue
                     if img_count < total_pages:
+                        _mark_task_terminal_state(
+                            "failed",
+                            _event_message("E_TOYO_IIIF_INCOMPLETE", f"{img_count}/{total_pages}"),
+                            doc_status="failed",
+                        )
                         _emit(
                             logger,
                             f"  -> ⚠️ [打工人] IIIF 未完成（{img_count}/{total_pages} 页），已保留断点，下次将续传。",
@@ -749,6 +843,11 @@ def api_download_worker(
                         continue
                     if img_count == 0:
                         _emit(logger, "  -> ⚠️ [打工人] 未提取到可用图像页，跳过。", logging.WARNING)
+                        _mark_task_terminal_state(
+                            "failed",
+                            _event_message("E_TOYO_IIIF_ZERO_PAGES"),
+                            doc_status="failed",
+                        )
                         continue
                     pdf_doc.save(save_path)
                 finally:
@@ -860,6 +959,11 @@ def api_download_worker(
             # ------------------------------------------
             else:
                 _emit(logger, f"  -> ⚠️ [打工人] 未支持的域名，跳过: {viewer_url}", logging.WARNING)
+                _mark_task_terminal_state(
+                    "failed",
+                    _event_message("E_UNSUPPORTED_DOMAIN", viewer_url),
+                    doc_status="failed",
+                )
 
         except Exception as e:
             _emit(logger, f"  -> ❌ [打工人报错] {doc_title} 处理失败: {e}", logging.ERROR)
@@ -867,7 +971,7 @@ def api_download_worker(
             db_service.add_download_event(
                 native_id,
                 "failed",
-                message=str(e),
+                message=_event_message("E_TASK_EXCEPTION", str(e)),
                 run_id=int(run_id) if run_id is not None else None,
                 source=source,
             )

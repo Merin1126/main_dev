@@ -152,22 +152,45 @@ class DbService:
     # 生命周期
     # ------------------------------------------------------------------
     def close(self) -> None:
+        worker = None
+        with self._lock:
+            if self._conn is None:
+                return
+            self._event_worker_stop.set()
+            worker = self._event_worker
+            # sentinel 放到队尾，尽量让已入队事件先落盘
+            for _ in range(10):
+                try:
+                    self._event_queue.put(None, timeout=0.2)
+                    break
+                except queue.Full:
+                    # 队列临时满：等待 worker 消费后重试
+                    continue
+                except Exception:
+                    break
+
+        if worker is not None and worker.is_alive():
+            try:
+                worker.join(timeout=2.0)
+            except Exception:
+                pass
+
         with self._lock:
             if self._conn is not None:
                 try:
-                    self._event_worker_stop.set()
-                    try:
-                        self._event_queue.put_nowait(None)
-                    except Exception:
-                        pass
                     self._conn.close()
                 finally:
                     self._conn = None  # type: ignore[assignment]
                     self._initialized = False
 
     def _event_worker_loop(self) -> None:
-        while not self._event_worker_stop.is_set():
-            payload = self._event_queue.get()
+        while True:
+            try:
+                payload = self._event_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._event_worker_stop.is_set():
+                    break
+                continue
             if payload is None:
                 break
             try:

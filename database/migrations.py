@@ -47,6 +47,41 @@ def discover_migrations(schema_dir: str) -> list[tuple[int, str, str]]:
     return items
 
 
+def _is_ignorable_migration_error(stmt: str, err: sqlite3.OperationalError) -> bool:
+    """仅对已知可恢复的迁移异常降级处理（如重复加列）。"""
+    msg = str(err).lower()
+    normalized = stmt.strip().upper()
+    if "duplicate column name" in msg and "ALTER TABLE" in normalized and "ADD COLUMN" in normalized:
+        return True
+    return False
+
+
+def _execute_migration_sql(conn: sqlite3.Connection, sql: str) -> None:
+    """
+    顺序执行 migration SQL。
+    - 使用 sqlite3.complete_statement 做语句切分；
+    - 遇到「重复加列」这类幂等冲突时忽略并继续，保证后续 UPDATE 可执行。
+    """
+    buf = ""
+    for line in sql.splitlines(keepends=True):
+        buf += line
+        if not sqlite3.complete_statement(buf):
+            continue
+        stmt = buf.strip()
+        buf = ""
+        if not stmt:
+            continue
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as e:
+            if _is_ignorable_migration_error(stmt, e):
+                continue
+            raise
+    trailing = buf.strip()
+    if trailing:
+        conn.execute(trailing)
+
+
 def apply_migrations(conn: sqlite3.Connection, schema_dir: str) -> list[int]:
     """按版本顺序应用迁移脚本，返回本次新应用的版本号列表。
 
@@ -61,7 +96,7 @@ def apply_migrations(conn: sqlite3.Connection, schema_dir: str) -> list[int]:
             continue
         with open(path, "r", encoding="utf-8") as f:
             sql = f.read()
-        conn.executescript(sql)
+        _execute_migration_sql(conn, sql)
         conn.execute(
             "INSERT INTO schema_version(version, name, applied_at) VALUES (?, ?, ?)",
             (version, name, _utc_now_iso()),
