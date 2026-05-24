@@ -845,7 +845,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     task_id=task_id,
                     page_index=page_index,
                     total_pages=total_pages,
-                    invoke_fn=lambda: self._detect_text_from_image(
+                    invoke_fn=lambda: self._request_page_text(
                         api_key,
                         file_name=file_tag,
                         model_name=model_name,
@@ -861,7 +861,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     task_id=task_id,
                     page_index=page_index,
                     total_pages=total_pages,
-                    invoke_fn=lambda: self._detect_text_from_image(
+                    invoke_fn=lambda: self._request_page_text(
                         api_key,
                         file_name=file_tag,
                         model_name=model_name,
@@ -1051,7 +1051,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     task_id=task_id,
                     page_index=page_index,
                     total_pages=total_pages,
-                    invoke_fn=lambda: self._detect_text_from_image(
+                    invoke_fn=lambda: self._request_page_text(
                         api_key,
                         file_name=file_tag,
                         model_name=model_name,
@@ -1070,7 +1070,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     task_id=task_id,
                     page_index=page_index,
                     total_pages=total_pages,
-                    invoke_fn=lambda: self._detect_text_from_image(
+                    invoke_fn=lambda: self._request_page_text(
                         api_key,
                         file_name=file_tag,
                         model_name=model_name,
@@ -1333,7 +1333,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             selected_pdf_path=self.selected_pdf_path,
         )
 
-    def _detect_text_from_image(
+    def _request_page_text(
         self,
         api_key: str,
         file_name: str = "未知",
@@ -1379,6 +1379,26 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
         self.after(0, lambda s=usage_summary: self._accumulate_usage_summary(s))
         return result_text
+
+    def _detect_text_from_image(
+        self,
+        api_key: str,
+        file_name: str = "未知",
+        model_name: str = "gemini-3.1-pro-preview",
+        *,
+        image_bytes: bytes | None = None,
+        source_text: str | None = None,
+        page_index: int = None,
+    ):
+        """兼容旧调用名，统一转发到 `_request_page_text`。"""
+        return self._request_page_text(
+            api_key=api_key,
+            file_name=file_name,
+            model_name=model_name,
+            image_bytes=image_bytes,
+            source_text=source_text,
+            page_index=page_index,
+        )
 
     def render_page(self):
         if not self.current_pdf:

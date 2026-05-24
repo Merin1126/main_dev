@@ -19,6 +19,7 @@ class ScraperScreen(ctk.CTkFrame):
         self.stop_event = threading.Event()
         self.db_service = DbService()
         self.current_run_id: int | None = None
+        self.awaiting_run_id = False
         self.monitor_window = None
         self.monitor_rows: dict[str, dict] = {}
         self.monitor_list_frame = None
@@ -176,6 +177,10 @@ class ScraperScreen(ctk.CTkFrame):
         self.monitor_rows = {}
 
     def _bootstrap_monitor_run(self):
+        if self.awaiting_run_id:
+            if self.monitor_title:
+                self.monitor_title.configure(text="下载任务监控（等待任务启动...）")
+            return
         if self.current_run_id is None:
             self.current_run_id = self.db_service.get_latest_run_id(prefer_active=True)
         self._refresh_monitor_from_db()
@@ -343,6 +348,7 @@ class ScraperScreen(ctk.CTkFrame):
     def on_run_started(self, run_id: int):
         def _ui():
             new_run_id = int(run_id)
+            self.awaiting_run_id = False
             if self.current_run_id != new_run_id:
                 self._clear_monitor_rows()
             self.current_run_id = new_run_id
@@ -381,6 +387,7 @@ class ScraperScreen(ctk.CTkFrame):
         self.btn_stop.configure(state="normal")
         self.lbl_status.configure(text="🚀 正在启动浏览器并连接数据库...", text_color=Color.PRIMARY)
         self.progress_bar.set(0)
+        self.awaiting_run_id = True
         self.current_run_id = None
         self._open_monitor_window()
 

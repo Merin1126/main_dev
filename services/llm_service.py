@@ -384,7 +384,7 @@ class LlmService:
 
         if image_bytes is not None:
             contents = [
-                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                 academic_prompt,
             ]
         else:
