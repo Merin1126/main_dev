@@ -1,0 +1,17 @@
+{
+  "generated_at": "2026-05-25T15:44:52",
+  "project_root": "/Users/merin/本地文稿/Historical Records Scraper/main_dev",
+  "output_dir": "/Users/merin/本地文稿/Historical Records Scraper/main_dev/Reports/comparison_docx",
+  "selected_documents": 1,
+  "success_documents": 1,
+  "failed_documents": 0,
+  "rows": [
+    {
+      "pdf_rel_path": "JACAR_Downloads/反帝國主義/外交彙報附録月報・外務省月報・外務省報：「外務省報第百三十号（昭和二年五月一日）／図書受入」、JACAR Ref. B13091531900（第1—5画像目）、『外務省報　第十二巻』（日本外交史料館）.pdf",
+      "ready": true,
+      "issues": [],
+      "status": "ok",
+      "output_docx": "/Users/merin/本地文稿/Historical Records Scraper/main_dev/Reports/comparison_docx/外交彙報附録月報・外務省月報・外務省報：「外務省報第百三十号（昭和二年五月一日）／図書受入」、JACAR Ref. B13091531900（第1—5画像目）、『外務省報　第十二巻』（日本外交史料館）_按页对照报告.docx"
+    }
+  ]
+}

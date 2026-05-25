@@ -463,7 +463,7 @@ class ReportSummaryWindow(ctk.CTkToplevel):
                 0,
                 lambda: messagebox.showinfo(
                     "内容2导出完成",
-                    f"成功 {result.success}，失败 {result.failed}\nManifest:\n{result.manifest_path}",
+                    f"成功 {result.success}，失败 {result.failed}，跳过 {result.skipped}\nManifest:\n{result.manifest_path}",
                 ),
             )
 
@@ -498,7 +498,7 @@ class ReportSummaryWindow(ctk.CTkToplevel):
                     (
                         f"内容1：成功 {result1.success}，失败 {result1.failed}\n"
                         f"Manifest: {result1.manifest_path}\n\n"
-                        f"内容2：成功 {result2.success}，失败 {result2.failed}\n"
+                        f"内容2：成功 {result2.success}，失败 {result2.failed}，跳过 {result2.skipped}\n"
                         f"Manifest: {result2.manifest_path}"
                     ),
                 ),

@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-05-25T15:25:28",
+  "generated_at": "2026-05-25T15:44:32",
   "project_root": "/Users/merin/本地文稿/Historical Records Scraper/main_dev",
   "pdf_root": "/Users/merin/本地文稿/Historical Records Scraper/main_dev/JACAR_Downloads",
   "total_documents": 71,
-  "ready_documents": 0,
+  "ready_documents": 1,
   "entries": [
     {
       "pdf_path": "/Users/merin/本地文稿/Historical Records Scraper/main_dev/JACAR_Downloads/中国共産党/戦前期外務省記録：「分割３」、JACAR Ref. B08090329600（第1—96画像目）、『大正十四年支那暴動一件／五・三十事件／調書　第一巻』（日本外交史料館）.pdf",
@@ -624,16 +624,13 @@
       "page_count": 5,
       "ocr_cache_path": "/Users/merin/本地文稿/Historical Records Scraper/main_dev/OCR_Cache/2ad164f27566f4d3349ac17324f836aa3acba12d4b13b90f607ea15ce58c2f2a.txt",
       "analysis_cache_path": "/Users/merin/本地文稿/Historical Records Scraper/main_dev/Analysis_Cache/2ad164f27566f4d3349ac17324f836aa3acba12d4b13b90f607ea15ce58c2f2a.txt",
-      "ocr_pages": 0,
-      "analysis_pages": 0,
-      "ocr_complete": false,
-      "analysis_complete": false,
-      "analysis_json_pages": 0,
-      "ready": false,
-      "issues": [
-        "OCR 页数不匹配: 0/5",
-        "Analysis 页数不匹配: 0/5"
-      ]
+      "ocr_pages": 5,
+      "analysis_pages": 5,
+      "ocr_complete": true,
+      "analysis_complete": true,
+      "analysis_json_pages": 5,
+      "ready": true,
+      "issues": []
     },
     {
       "pdf_path": "/Users/merin/本地文稿/Historical Records Scraper/main_dev/JACAR_Downloads/反帝國主義/太政官・内閣関係：「北京ニ於ケル主要思想団体」、JACAR Ref. A03023733600（第1—6画像目）、『各種情報資料・参情報』（国立公文書館）.pdf",

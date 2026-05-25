@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
@@ -31,6 +32,7 @@ ProgressCallback = Callable[[int, int, str], None]
 class ExportResult:
     success: int
     failed: int
+    skipped: int
     manifest_path: str
     rows: list[dict[str, Any]]
 
@@ -221,7 +223,7 @@ class ReportService:
         }
         manifest_path = os.path.join(output_dir, self._manifest_name("comparison"))
         write_json(manifest_path, manifest)
-        return ExportResult(success=success, failed=failed, manifest_path=manifest_path, rows=rows)
+        return ExportResult(success=success, failed=failed, skipped=0, manifest_path=manifest_path, rows=rows)
 
     def _render_single_docx(
         self,
@@ -278,9 +280,66 @@ class ReportService:
             )
 
     @staticmethod
-    def _build_analysis_bundle(analysis_pages: list[str], *, max_chars: int) -> tuple[str, bool]:
-        blocks: list[str] = []
-        total = 0
+    def _render_partial_summary_prompt(
+        *,
+        doc_name: str,
+        page_count: int,
+        chunk_index: int,
+        chunk_total: int,
+        page_start: int,
+        page_end: int,
+    ) -> str:
+        return (
+            f"你将收到《{doc_name}》的 Analysis 分段数据（第 {chunk_index}/{chunk_total} 批，"
+            f"对应原文第 {page_start}-{page_end} 页，共 {page_count} 页中的一部分）。\n"
+            "请输出该批次的小结（Markdown）：\n"
+            "1) 该批次核心观察与判断；\n"
+            "2) 关键组织/人物/关键词；\n"
+            "3) 该批次的研究价值与证据页码。\n"
+            "要求：只基于本批次内容，不要臆测全局结论。"
+        )
+
+    @staticmethod
+    def _is_retryable_error(err: Exception) -> bool:
+        msg = str(err).lower()
+        keys = [
+            "请求超时",
+            "timed out",
+            "timeout",
+            "429",
+            "rate limit",
+            "503",
+            "500",
+            "connection reset",
+            "temporarily unavailable",
+            "network",
+        ]
+        return any(k in msg for k in keys)
+
+    def _call_with_retry(self, fn: Callable[[], tuple[str, dict[str, Any]]], *, retry_attempts: int) -> tuple[str, dict[str, Any], int]:
+        attempts = max(1, int(retry_attempts))
+        last_err: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                text, usage = fn()
+                return text, usage, attempt
+            except Exception as e:
+                last_err = e
+                if attempt >= attempts or not self._is_retryable_error(e):
+                    raise
+                wait_s = min(16, 2 ** attempt)
+                time.sleep(wait_s)
+        assert last_err is not None
+        raise last_err
+
+    @staticmethod
+    def _build_analysis_chunks(
+        analysis_pages: list[str],
+        *,
+        max_chars_per_chunk: int,
+        chunk_pages: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        units: list[tuple[int, str]] = []
         truncated = False
         for idx, page_raw in enumerate(analysis_pages, start=1):
             parsed, cleaned = parse_analysis_page_json(page_raw)
@@ -302,16 +361,46 @@ class ReportService:
                     "Response_Action": disc.get("Response_Action"),
                     "Relevance_Score": disc.get("Relevance_Score"),
                 }
-                chunk = f"[PAGE {idx}]\n{json.dumps(obj, ensure_ascii=False, indent=2)}"
+                page_chunk = f"[PAGE {idx}]\n{json.dumps(obj, ensure_ascii=False, indent=2)}"
             else:
-                chunk = f"[PAGE {idx}]\n{cleaned[:2500]}"
+                page_chunk = f"[PAGE {idx}]\n{cleaned[:2500]}"
+            units.append((idx, page_chunk))
 
-            if total + len(chunk) > max_chars:
+        chunks: list[dict[str, Any]] = []
+        current_units: list[str] = []
+        current_pages: list[int] = []
+        max_chars = max(5000, int(max_chars_per_chunk))
+        max_pages = max(1, int(chunk_pages))
+
+        def flush_current() -> None:
+            if not current_units:
+                return
+            chunks.append(
+                {
+                    "text": "\n\n".join(current_units),
+                    "page_start": current_pages[0],
+                    "page_end": current_pages[-1],
+                    "page_count": len(current_pages),
+                }
+            )
+            current_units.clear()
+            current_pages.clear()
+
+        for page_no, unit in units:
+            if len(unit) > max_chars:
                 truncated = True
-                break
-            blocks.append(chunk)
-            total += len(chunk)
-        return "\n\n".join(blocks), truncated
+                unit = unit[:max_chars]
+            should_flush = False
+            if current_units and len(current_pages) >= max_pages:
+                should_flush = True
+            elif current_units and (len("\n\n".join(current_units)) + 2 + len(unit) > max_chars):
+                should_flush = True
+            if should_flush:
+                flush_current()
+            current_units.append(unit)
+            current_pages.append(page_no)
+        flush_current()
+        return chunks, truncated
 
     def generate_summaries(
         self,
@@ -323,6 +412,9 @@ class ReportService:
         model_name: str = "gemini-3.1-pro-preview",
         include_incomplete: bool = False,
         max_source_chars: int = 120000,
+        chunk_pages: int = 20,
+        retry_attempts: int = 3,
+        skip_existing: bool = True,
         progress_cb: ProgressCallback | None = None,
     ) -> ExportResult:
         output_dir = os.path.abspath(output_dir or self.default_summary_dir())
@@ -350,6 +442,7 @@ class ReportService:
         rows: list[dict[str, Any]] = []
         success = 0
         failed = 0
+        skipped = 0
         total = len(selected)
         for i, entry in enumerate(selected, start=1):
             if progress_cb:
@@ -361,39 +454,91 @@ class ReportService:
                 "model": model_name,
             }
             try:
-                analysis_pages = self.cache_service.read_paged_cache(entry["analysis_cache_path"])
-                page_count = int(entry.get("page_count", 0))
-                bundle, truncated = self._build_analysis_bundle(
-                    analysis_pages,
-                    max_chars=max(5000, int(max_source_chars)),
-                )
-                if not bundle.strip():
-                    raise RuntimeError("Analysis 缓存为空，无法生成总结。")
                 doc_name = os.path.basename(entry["pdf_path"])
-                prompt = self._render_summary_prompt(doc_name=doc_name, page_count=page_count)
-                summary_text, usage_summary = llm.detect_text(
-                    screen_name="ReportSummaryUI",
-                    task_name="进度汇报总结",
-                    selected_pdf_path=entry["pdf_path"],
-                    file_name=f"{doc_name}_summary",
-                    model_name=model_name,
-                    academic_prompt=prompt,
-                    behavior_name="进度汇报总结",
-                    page_index=None,
-                    source_text=bundle,
-                )
                 out_name = safe_filename(os.path.splitext(doc_name)[0]) + ".summary.md"
                 out_path = os.path.join(output_dir, out_name)
+                if skip_existing and os.path.isfile(out_path):
+                    row["status"] = "skipped_existing"
+                    row["output_summary"] = out_path
+                    row["skip_reason"] = "summary_exists"
+                    skipped += 1
+                    rows.append(row)
+                    continue
+
+                analysis_pages = self.cache_service.read_paged_cache(entry["analysis_cache_path"])
+                page_count = int(entry.get("page_count", 0))
+                chunks, source_truncated = self._build_analysis_chunks(
+                    analysis_pages,
+                    max_chars_per_chunk=max(5000, int(max_source_chars)),
+                    chunk_pages=chunk_pages,
+                )
+                if not chunks:
+                    raise RuntimeError("Analysis 缓存为空，无法生成总结。")
+
+                partial_texts: list[str] = []
+                partial_attempts: list[int] = []
+                chunk_total = len(chunks)
+                for ci, chunk in enumerate(chunks, start=1):
+                    if progress_cb:
+                        progress_cb(i, total, f"内容2分段总结：{entry.get('pdf_rel_path')} [{ci}/{chunk_total}]")
+                    partial_prompt = self._render_partial_summary_prompt(
+                        doc_name=doc_name,
+                        page_count=page_count,
+                        chunk_index=ci,
+                        chunk_total=chunk_total,
+                        page_start=int(chunk["page_start"]),
+                        page_end=int(chunk["page_end"]),
+                    )
+                    partial_text, _partial_usage, attempt_used = self._call_with_retry(
+                        lambda pp=partial_prompt, ct=chunk["text"]: llm.detect_text(
+                            screen_name="ReportSummaryUI",
+                            task_name="进度汇报总结-分段",
+                            selected_pdf_path=entry["pdf_path"],
+                            file_name=f"{doc_name}_summary_chunk_{ci}",
+                            model_name=model_name,
+                            academic_prompt=pp,
+                            behavior_name="进度汇报总结-分段",
+                            page_index=None,
+                            source_text=ct,
+                        ),
+                        retry_attempts=retry_attempts,
+                    )
+                    partial_attempts.append(attempt_used)
+                    partial_texts.append(
+                        f"[CHUNK {ci} | p{chunk['page_start']}-{chunk['page_end']}]\n{partial_text.strip()}"
+                    )
+
+                final_source = "\n\n".join(partial_texts)
+                final_prompt = self._render_summary_prompt(doc_name=doc_name, page_count=page_count)
+                summary_text, usage_summary, final_attempt = self._call_with_retry(
+                    lambda: llm.detect_text(
+                        screen_name="ReportSummaryUI",
+                        task_name="进度汇报总结",
+                        selected_pdf_path=entry["pdf_path"],
+                        file_name=f"{doc_name}_summary",
+                        model_name=model_name,
+                        academic_prompt=final_prompt,
+                        behavior_name="进度汇报总结",
+                        page_index=None,
+                        source_text=final_source,
+                    ),
+                    retry_attempts=retry_attempts,
+                )
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(f"# {doc_name}｜分析总结\n\n")
-                    if truncated:
-                        f.write("> 注：源数据超长，已按上限截断后生成本总结。\n\n")
+                    if source_truncated:
+                        f.write("> 注：源数据超长，分段时存在截断。\n\n")
+                    if chunk_total > 1:
+                        f.write(f"> 注：本总结由 {chunk_total} 个分段小结二次汇总生成。\n\n")
                     f.write(summary_text.strip() + "\n")
 
                 row["status"] = "ok"
                 row["output_summary"] = out_path
                 row["analysis_pages"] = len(analysis_pages)
-                row["source_truncated"] = truncated
+                row["source_truncated"] = source_truncated
+                row["chunk_count"] = chunk_total
+                row["partial_attempts"] = partial_attempts
+                row["final_attempt"] = final_attempt
                 row["usage_summary"] = usage_summary
                 success += 1
             except Exception as e:
@@ -409,8 +554,9 @@ class ReportService:
             "selected_documents": total,
             "success_documents": success,
             "failed_documents": failed,
+            "skipped_documents": skipped,
             "rows": rows,
         }
         manifest_path = os.path.join(output_dir, self._manifest_name("summary"))
         write_json(manifest_path, manifest)
-        return ExportResult(success=success, failed=failed, manifest_path=manifest_path, rows=rows)
+        return ExportResult(success=success, failed=failed, skipped=skipped, manifest_path=manifest_path, rows=rows)
