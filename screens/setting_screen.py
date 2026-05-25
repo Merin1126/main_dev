@@ -4,6 +4,7 @@ from tkinter import messagebox
 
 from components.ui.button import Button
 from config.settings import Color
+from screens.report_summary_window import ReportSummaryWindow
 from utils.trace_report import convert_current_trace_to_md, delete_current_converted_trace_md
 from config.api_key_store import (
     load_google_api_key as load_gemini_api_key,
@@ -20,11 +21,12 @@ class SettingScreen(ctk.CTkFrame):
         super().__init__(master, fg_color=Color.TRANSPARENT, **kwargs)
         self.master = master
         self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.report_window = None
         self._setup_ui()
         self._load_config()
 
     def _setup_ui(self):
-        container = ctk.CTkFrame(self, corner_radius=10)
+        container = ctk.CTkScrollableFrame(self, corner_radius=10)
         container.pack(fill="both", expand=True, padx=20, pady=20)
 
         ctk.CTkLabel(
@@ -134,6 +136,20 @@ class SettingScreen(ctk.CTkFrame):
             command=self.delete_current_trace_report,
         ).pack(anchor="w", padx=16, pady=(0, 12))
 
+        ctk.CTkLabel(
+            container,
+            text="进度汇报与总结",
+            font=("Arial", 14),
+        ).pack(anchor="w", padx=16, pady=(10, 6))
+
+        Button(
+            container,
+            text="打开总结页面",
+            width=220,
+            height=40,
+            command=self.open_report_window,
+        ).pack(anchor="w", padx=16, pady=(0, 12))
+
     def _load_config(self):
         key = load_gemini_api_key()
         if key:
@@ -205,3 +221,12 @@ class SettingScreen(ctk.CTkFrame):
             messagebox.showinfo("提示", "未找到可删除的已转化 Trace 报告（.md）。")
             return
         messagebox.showinfo("成功", f"已删除：\n{removed}")
+
+    def open_report_window(self):
+        if self.report_window is not None and self.report_window.winfo_exists():
+            self.report_window.lift()
+            self.report_window.focus_set()
+            return
+        self.report_window = ReportSummaryWindow(self, project_root=self.project_root)
+        self.report_window.transient(self.winfo_toplevel())
+        self.report_window.focus_set()
