@@ -10,13 +10,12 @@ from enum import Enum, auto
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from docx import Document
-
 from components.ui.button import Button
 from config.settings import Color
 from config.api_key_store import load_google_api_key as load_gemini_api_key
 from services import CacheService, LlmService, PdfService
 from utils.app_state import AppState
+from utils.docx_export import write_pages_to_docx
 
 class DocumentTaskState(Enum):
     IDLE = auto()
@@ -216,10 +215,15 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
     def _export_text_pages_default(self, dialog_title: str | None = None) -> None:
         self._save_current_ocr_page()
-        text_content = "\n\n".join([page.strip() for page in self.ocr_pages if page.strip()]).strip()
-        if not text_content:
+        export_pages = [
+            self._extract_transcription_text(str(page or ""))
+            for page in (self.ocr_pages or [])
+        ]
+        export_pages = [p for p in export_pages if p.strip()]
+        if not export_pages:
             messagebox.showwarning("提示", "导出内容为空！")
             return
+        text_content = "\n\n".join(export_pages).strip()
         title = dialog_title or type(self).export_dialog_title
         file_path = filedialog.asksaveasfilename(
             defaultextension=".docx",
@@ -233,9 +237,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 with open(file_path, "w", encoding="utf-8") as f:
                     f.write(text_content)
             elif file_path.endswith(".docx"):
-                doc = Document()
-                doc.add_paragraph(text_content)
-                doc.save(file_path)
+                write_pages_to_docx(file_path, export_pages)
             messagebox.showinfo("成功", f"文件已成功保存至:\n{file_path}")
         except Exception as e:
             messagebox.showerror("导出失败", f"保存出错:\n{e}")
