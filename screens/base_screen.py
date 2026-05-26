@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+import random
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 import customtkinter as ctk
@@ -58,6 +59,16 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     api_request_timeout_sec: int = 120
     #: 页级超时重试总次数（含首次调用）
     api_timeout_max_attempts: int = 3
+    #: 非超时类瞬时错误（503/429/断连）重试总次数（含首次调用）
+    api_retryable_max_attempts: int = 2
+    #: 非超时类重试退避基准秒数
+    api_retry_backoff_base_sec: int = 2
+    #: 非超时类重试退避上限秒数
+    api_retry_backoff_cap_sec: int = 6
+    #: 非超时类重试退避抖动上限秒数（用于错开并发重试）
+    api_retry_backoff_jitter_sec: float = 0.8
+    #: 连续 API 请求最小间隔秒数（软限流，0 表示不限制）
+    api_min_request_interval_sec: float = 0.0
     #: v2.6.6 起：是否以有状态 Chat Session 调用 LLM。OCR 走单次调用，Analysis/Translation 启用。
     use_chat_session: bool = False
     #: Chat Session 的响应 MIME 类型；Analysis 子类应覆盖为 "application/json"。
@@ -264,6 +275,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             api_key=self.gemini_api_key,
             project_root=base_dir,
             timeout_sec=type(self).api_request_timeout_sec,
+            min_interval_sec=type(self).api_min_request_interval_sec,
         )
         self.download_dir = os.path.join(base_dir, "JACAR_Downloads")
         self.document_cache_dir = os.path.join(base_dir, cls.cache_dir_name)
@@ -1254,23 +1266,72 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         msg = str(err)
         return ("请求超时" in msg) or ("timed out" in msg.lower())
 
+    @classmethod
+    def _is_retryable_error(cls, err: Exception) -> bool:
+        if cls._is_timeout_error(err):
+            return True
+        msg = str(err).lower()
+        keywords = (
+            "503",
+            "unavailable",
+            "429",
+            "resource_exhausted",
+            "rate limit",
+            "server disconnected without sending a response",
+            "connection reset",
+            "connection aborted",
+            "temporarily unavailable",
+        )
+        return any(k in msg for k in keywords)
+
     def _call_page_with_retry(self, *, task_id: int, page_index: int, total_pages: int, invoke_fn):
-        max_attempts = max(1, int(type(self).api_timeout_max_attempts))
+        timeout_max_attempts = max(1, int(type(self).api_timeout_max_attempts))
+        retryable_max_attempts = max(1, int(type(self).api_retryable_max_attempts))
+        retry_base = max(1, int(type(self).api_retry_backoff_base_sec))
+        retry_cap = max(retry_base, int(type(self).api_retry_backoff_cap_sec))
+        retry_jitter = max(0.0, float(type(self).api_retry_backoff_jitter_sec))
+        timeout_attempts = 0
+        retryable_attempts = 0
         last_err = None
-        for attempt in range(1, max_attempts + 1):
+        while True:
             self._ensure_active_task(task_id)
             try:
                 return invoke_fn()
             except Exception as e:
                 last_err = e
-                if not self._is_timeout_error(e) or attempt >= max_attempts:
+                is_timeout = self._is_timeout_error(e)
+                if is_timeout:
+                    timeout_attempts += 1
+                    if timeout_attempts >= timeout_max_attempts:
+                        raise
+                    wait_s = min(retry_cap, retry_base * (2 ** max(0, timeout_attempts - 1)))
+                    if retry_jitter > 0:
+                        wait_s += random.uniform(0.0, retry_jitter)
+                    self.after(
+                        0,
+                        lambda a=timeout_attempts, w=wait_s: self.ocr_progress_label.configure(
+                            text=self._status_colon(
+                                f"第 {page_index + 1}/{total_pages} 页请求超时，正在进行第 {a + 1} 次重试（{w}s 后）"
+                            )
+                        ),
+                    )
+                    time.sleep(wait_s)
+                    continue
+
+                if not type(self)._is_retryable_error(e):
                     raise
-                wait_s = min(8, 2 * attempt)
+
+                retryable_attempts += 1
+                if retryable_attempts >= retryable_max_attempts:
+                    raise
+                wait_s = min(retry_cap, retry_base * (2 ** max(0, retryable_attempts - 1)))
+                if retry_jitter > 0:
+                    wait_s += random.uniform(0.0, retry_jitter)
                 self.after(
                     0,
-                    lambda a=attempt, w=wait_s: self.ocr_progress_label.configure(
+                    lambda a=retryable_attempts, w=wait_s: self.ocr_progress_label.configure(
                         text=self._status_colon(
-                            f"第 {page_index + 1}/{total_pages} 页请求超时，正在进行第 {a + 1} 次重试（{w}s 后）"
+                            f"第 {page_index + 1}/{total_pages} 页服务繁忙/连接中断，正在进行第 {a + 1} 次重试（{w}s 后）"
                         )
                     ),
                 )

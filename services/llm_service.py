@@ -45,13 +45,28 @@ class LlmService:
         ),
     ]
 
-    def __init__(self, api_key: str, project_root: str, timeout_sec: int = 120) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        project_root: str,
+        timeout_sec: int = 120,
+        min_interval_sec: float = 0.0,
+    ) -> None:
         self.api_key = api_key or ""
         self.project_root = project_root
         self.timeout_sec = timeout_sec
+        self.min_interval_sec = 0.0
+        self._last_request_started_at = 0.0
+        self.set_min_interval(min_interval_sec)
         self._client: genai.Client | None = None
         if self.api_key:
             self._client = genai.Client(api_key=self.api_key)
+
+    def set_min_interval(self, min_interval_sec: float) -> None:
+        try:
+            self.min_interval_sec = max(0.0, float(min_interval_sec or 0.0))
+        except (TypeError, ValueError):
+            self.min_interval_sec = 0.0
 
     def update_api_key(self, api_key: str) -> None:
         new_key = (api_key or "").strip()
@@ -146,6 +161,33 @@ class LlmService:
             raise RuntimeError(f"Gemini 请求超时（>{timeout_s}s）")
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+
+    def _apply_request_rate_gate(self) -> None:
+        """软限流：控制相邻请求最小间隔，降低突发频率导致的 429/503。"""
+        min_gap = max(0.0, float(self.min_interval_sec or 0.0))
+        if min_gap <= 0:
+            self._last_request_started_at = time.monotonic()
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_request_started_at
+        if elapsed < min_gap:
+            time.sleep(min_gap - elapsed)
+        self._last_request_started_at = time.monotonic()
+
+    @staticmethod
+    def _classify_error(err: Exception) -> str:
+        msg = str(err).lower()
+        if "timed out" in msg or "请求超时" in msg:
+            return "timeout"
+        if "503" in msg or "unavailable" in msg:
+            return "service_unavailable"
+        if "429" in msg or "resource_exhausted" in msg or "rate limit" in msg:
+            return "rate_limited"
+        if "server disconnected without sending a response" in msg:
+            return "server_disconnected"
+        if "connection reset" in msg or "connection aborted" in msg:
+            return "connection_reset"
+        return "unknown"
 
     @staticmethod
     def _safe_chat_history(chat) -> list[Any]:
@@ -292,6 +334,7 @@ class LlmService:
         )
 
         try:
+            self._apply_request_rate_gate()
             response = self._run_with_timeout(lambda: chat.send_message(turn_prompt))
         except Exception as e:
             self._trace_event(
@@ -306,6 +349,7 @@ class LlmService:
                     "chat_session_id": session_id,
                     "history_count_before": len(history_before),
                     "error": str(e),
+                    "error_category": self._classify_error(e),
                     "elapsed_ms": int((time.perf_counter() - request_started_at) * 1000),
                 },
             )
@@ -411,6 +455,7 @@ class LlmService:
         )
 
         try:
+            self._apply_request_rate_gate()
             response = self._run_with_timeout(
                 lambda: self.client.models.generate_content(
                     model=model_name,
@@ -461,6 +506,7 @@ class LlmService:
                     "page_index": page_index,
                     "model_name": model_name,
                     "error": str(e),
+                    "error_category": self._classify_error(e),
                     "elapsed_ms": int((time.perf_counter() - request_started_at) * 1000),
                 },
             )

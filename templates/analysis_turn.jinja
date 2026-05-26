@@ -1,3 +1,12 @@
+{% if context_capsule %}
+<RECOVERY_CONTEXT>
+{{ context_capsule }}
+</RECOVERY_CONTEXT>
+
+{% endif %}<INSTRUCTION>
+如果文本中出现 Markdown 版式符号（如 #、-、|、**），请忽略版式标记，仅依据语义内容完成抽取。
+</INSTRUCTION>
+
 <SOURCE_TEXT page="{{ page_number }}">
 {{ page_text }}
 </SOURCE_TEXT>

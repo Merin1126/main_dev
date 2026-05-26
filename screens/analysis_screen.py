@@ -14,6 +14,14 @@ from screens.base_screen import BaseDocumentScreen
 class AnalysisScreen(BaseDocumentScreen):
     requires_image_input = False
     show_single_page_actions = False
+    # 分析任务优先保障“可快速回馈错误弹窗”：单页超时不做额外重试，避免长时间卡住。
+    api_timeout_max_attempts = 1
+    # 503/429/断连仅做一次短退避重试，失败后让用户手动继续断点任务。
+    api_retryable_max_attempts = 2
+    api_retry_backoff_base_sec = 2
+    api_retry_backoff_cap_sec = 6
+    api_retry_backoff_jitter_sec = 0.8
+    api_min_request_interval_sec = 0.3
     #: v2.6.6：Analysis 切换为有状态 Chat Session，并通过 SDK 原生 JSON 约束格式
     use_chat_session = True
     chat_response_mime_type = "application/json"
@@ -400,9 +408,55 @@ class AnalysisScreen(BaseDocumentScreen):
         return render_analysis_system(translation_plugin_enum=f"『{plugin_keys}』")
 
     def get_turn_prompt(self, page_index: int, page_text: str) -> str:
-        """渲染单页 turn_prompt（仅含当前页 OCR 文本的 <SOURCE_TEXT> 包装）。"""
+        """渲染单页 turn_prompt（包含断点恢复上下文 capsule + 当前页 <SOURCE_TEXT>）。"""
         page_number = (page_index or 0) + 1
-        return render_analysis_turn(page_number=page_number, page_text=page_text or "")
+        context_capsule = self._build_recovery_context_capsule(page_index or 0)
+        return render_analysis_turn(
+            page_number=page_number,
+            page_text=page_text or "",
+            context_capsule=context_capsule,
+        )
+
+    def _build_recovery_context_capsule(self, page_index: int, window_size: int = 3) -> str:
+        """从本地 Analysis 缓存回收最近若干页的关键字段，缓解会话重建后的继承漂移。"""
+        if not self.selected_pdf_path or page_index <= 0:
+            return ""
+        cache_path = self._build_cache_path(self.selected_pdf_path)
+        if not os.path.exists(cache_path):
+            return ""
+        try:
+            pages = self.cache_service.read_paged_cache(cache_path)
+        except Exception:
+            return ""
+        if not pages:
+            return ""
+
+        start = max(0, page_index - max(1, int(window_size)))
+        lines: list[str] = []
+        for idx in range(start, min(page_index, len(pages))):
+            raw = str(pages[idx] or "").strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            ctx = payload.get("Historical_Context", {}) or {}
+            disc = payload.get("Discourse_Analysis", {}) or {}
+            lines.append(
+                (
+                    f"第{idx + 1}页 | Date={ctx.get('Date_Written') or '未知'} | "
+                    f"Sender={ctx.get('Author_Sender') or '未知'} | "
+                    f"Recipient={ctx.get('Recipient') or '未知'} | "
+                    f"Type={ctx.get('Document_Type') or '未知'} | "
+                    f"Judgment={disc.get('Core_Judgment') or '未提及'}"
+                )
+            )
+        if not lines:
+            return ""
+        return "\n".join(lines)
 
     def export_document(self) -> None:
         self._export_text_pages_default()

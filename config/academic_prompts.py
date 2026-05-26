@@ -20,12 +20,13 @@ def render_analysis_system(translation_plugin_enum: str) -> str:
     )
 
 
-def render_analysis_turn(page_number: int, page_text: str) -> str:
+def render_analysis_turn(page_number: int, page_text: str, context_capsule: str = "") -> str:
     """渲染 Analysis 每一轮的 turn_prompt（仅含当前页 OCR 文本的包装标签）。"""
     return TemplateService().render_prompt(
         "analysis_turn.jinja",
         {
             "page_number": page_number,
             "page_text": page_text or "",
+            "context_capsule": context_capsule or "",
         },
     )
