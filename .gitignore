@@ -55,3 +55,7 @@ Thumbs.db
 *.md
 api_cost_log.csv
 *_cost_log.csv
+
+# 8. 本地参考文档（勿提交上游仓库副本）
+cookbook-main/
+python-genai-main/
