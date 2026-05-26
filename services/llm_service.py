@@ -12,7 +12,7 @@ from google import genai
 from google.genai import types
 
 from config.api_key_store import load_trace_config
-from utils.gemini_trace_logger import append_trace_event, build_cache_event
+from utils.gemini_trace_logger import append_trace_event, build_cache_event, build_context_cache_event
 from utils.token_logger import log_context_cache_event, log_gemini_usage
 
 DEBUG_LOG_PATH = "/Users/merin/本地文稿/Historical Records Scraper/main_dev/.cursor/debug-b75604.log"
@@ -170,6 +170,40 @@ class LlmService:
             include_full_text=cfg["include_full_text"],
         )
         append_trace_event(self.project_root, event)
+
+    def trace_context_cache_lifecycle(
+        self,
+        *,
+        screen_name: str,
+        task_name: str,
+        selected_pdf_path: str | None,
+        event: str,
+        cache_name: str,
+        model_name: str | None = None,
+        ttl_seconds: int | None = None,
+        source_fingerprint: str | None = None,
+        reason: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        """记录 context cache 生命周期事件（仅观测链路，不影响业务流程）。"""
+        cfg = self._load_trace_cfg()
+        if not cfg["enabled"]:
+            return
+        payload = build_context_cache_event(
+            project_root=self.project_root,
+            screen_name=screen_name,
+            task_name=task_name,
+            pdf_path=selected_pdf_path,
+            event=event,
+            cache_name=cache_name,
+            model_name=model_name,
+            ttl_seconds=ttl_seconds,
+            source_fingerprint=source_fingerprint,
+            reason=reason,
+            extra_payload=extra_payload,
+        )
+        payload["trace_include_full_text"] = cfg["include_full_text"]
+        append_trace_event(self.project_root, payload)
 
     def _run_with_timeout(self, fn: Callable[[], Any], *, timeout_override: int | None = None) -> Any:
         """阻塞执行 `fn`，超时立即放弃后台线程（避免线程清理拖延主流程）。
@@ -335,6 +369,21 @@ class LlmService:
         except Exception as e:
             raise RuntimeError(f"Gemini context cache 获取失败: {e}")
 
+    def list_context_caches(self) -> list[Any]:
+        """列出账号下所有 context cache（带短超时保护）。
+
+        失败/超时时返回空列表，调用方需自行处理"无法判断"的语义。
+        主要用于启动巡检反向比对：找远端有但本地 sidecar 已丢的孤儿。
+        """
+        try:
+            result = self._run_with_timeout(
+                lambda: list(self.client.caches.list()),
+                timeout_override=self._CACHE_LIFECYCLE_TIMEOUT_SEC,
+            )
+            return list(result or [])
+        except Exception:
+            return []
+
     def update_context_cache_ttl(
         self,
         *,
@@ -361,6 +410,15 @@ class LlmService:
                         "cache_name": cache_name,
                         "ttl_seconds": int(ttl_seconds or 0),
                     },
+                )
+                self.trace_context_cache_lifecycle(
+                    screen_name=screen_name,
+                    task_name=task_name,
+                    selected_pdf_path=selected_pdf_path,
+                    event="context_cache_refreshed",
+                    cache_name=cache_name,
+                    ttl_seconds=int(ttl_seconds or 0),
+                    reason="update_context_cache_ttl",
                 )
             return result
         except Exception as e:
@@ -391,6 +449,14 @@ class LlmService:
                     selected_pdf_path=selected_pdf_path,
                     event="context_cache_deleted",
                     payload={"cache_name": cache_name},
+                )
+                self.trace_context_cache_lifecycle(
+                    screen_name=screen_name,
+                    task_name=task_name,
+                    selected_pdf_path=selected_pdf_path,
+                    event="context_cache_deleted",
+                    cache_name=cache_name,
+                    reason="delete_context_cache",
                 )
         except Exception as e:
             raise RuntimeError(f"Gemini context cache 删除失败: {e}")
@@ -606,8 +672,15 @@ class LlmService:
         response_mime_type: str = "text/plain",
         temperature: float = 0.3,
         cached_content: str | None = None,
+        system_instruction: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """单次文本生成通道：支持 cached_content（无状态 Analysis 主通道）。"""
+        """单次文本生成通道：支持 cached_content（无状态 Analysis 主通道）。
+
+        【cached_content vs system_instruction 互斥】
+        Gemini API 在 `cached_content` 与 `system_instruction` 同时存在时会报错；
+        本函数自动处理互斥：若传入 `cached_content`，则忽略 `system_instruction`；
+        若 `cached_content` 为空，则使用 `system_instruction`（用于 cache fallback 降级路径）。
+        """
         if not self.api_key:
             raise RuntimeError("未检测到 GOOGLE_GEMINI_API_KEY。请先配置后再调用 Gemini。")
 
@@ -615,6 +688,7 @@ class LlmService:
         include_full_text = cfg["include_full_text"]
         request_started_at = time.perf_counter()
         clean_prompt = (prompt_text or "").strip()
+        effective_system_instruction = (system_instruction or "").strip() if not cached_content else ""
 
         self._trace_event(
             screen_name=screen_name,
@@ -627,18 +701,22 @@ class LlmService:
                 "model_name": model_name,
                 "input_kind": "stateless_text",
                 "cached_content": cached_content or "",
+                "system_instruction_used": bool(effective_system_instruction),
                 "response_mime_type": response_mime_type,
                 "temperature": temperature,
                 "prompt_text": self._trace_text(clean_prompt, include_full_text),
             },
         )
 
-        config = types.GenerateContentConfig(
-            safety_settings=self.DEFAULT_SAFETY_SETTINGS,
-            response_mime_type=response_mime_type,
-            temperature=temperature,
-            cached_content=(cached_content or None),
-        )
+        config_kwargs: dict[str, Any] = {
+            "safety_settings": self.DEFAULT_SAFETY_SETTINGS,
+            "response_mime_type": response_mime_type,
+            "temperature": temperature,
+            "cached_content": (cached_content or None),
+        }
+        if effective_system_instruction:
+            config_kwargs["system_instruction"] = effective_system_instruction
+        config = types.GenerateContentConfig(**config_kwargs)
         try:
             self._apply_request_rate_gate()
             response = self._run_with_timeout(

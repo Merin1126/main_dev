@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import glob
 import json
 import re
 import hashlib
@@ -369,6 +370,12 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.session_api_call_pages = 0
         self.session_cache_loaded_pages = 0
         self.session_max_tokens_per_call = 0
+
+        #: 任务级 cache rebuild 计数（每次 _prepare_task_context 重置）。
+        #: 配合 `_MAX_CACHE_REBUILDS_PER_TASK` 用于防雪崩：超限后改走 plain prompt，
+        #: 避免因 cache 反复失效导致每页都付一次 cache write 费。
+        self._task_cache_rebuild_count: int = 0
+        self._task_cache_disabled: bool = False
 
         self._setup_ui()
         self._update_ui_by_state()
@@ -916,6 +923,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
     def _run_single_page_worker(self, page_index, pages_text, total_pages, task_id):
         pdf_path_for_task = self.selected_pdf_path
+        # 默认任务收尾会删除远端 cache；retryable 错误下保留以便断点续传命中复用。
+        preserve_for_resume = False
         try:
             if not self.current_pdf or not self.selected_pdf_path:
                 raise RuntimeError("当前未加载有效的 PDF 文件。")
@@ -997,6 +1006,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
             self.after(0, _apply_single_page_success)
         except Exception as e:
+            preserve_for_resume = type(self)._is_retryable_error(e)
             def _apply_single_page_error(err=e):
                 if task_id != self.ocr_task_id:
                     return
@@ -1012,13 +1022,15 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
             self.after(0, _apply_single_page_error)
         finally:
-            self._cleanup_task_context_cache(pdf_path_for_task)
+            self._cleanup_task_context_cache(pdf_path_for_task, preserve_for_resume=preserve_for_resume)
 
     def _start_ocr_worker(self, file_path, task_id):
         worker = threading.Thread(target=self._run_ocr_worker, args=(file_path, task_id), daemon=True)
         worker.start()
 
     def _run_ocr_worker(self, file_path, task_id):
+        # 默认任务收尾会删除远端 cache；retryable 错误下保留以便断点续传命中复用。
+        preserve_for_resume = False
         try:
             ocr_pages, from_cache = self._extract_text_with_gemini_ocr(file_path, task_id)
             self.after(0, lambda: self._show_ocr_text_result(ocr_pages, task_id, from_cache))
@@ -1030,12 +1042,14 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             if self.ocr_cancel_event.is_set():
                 self.after(0, lambda: self._handle_ocr_cancelled(task_id))
                 return
+            preserve_for_resume = type(self)._is_retryable_error(e)
             self.after(0, lambda msg=err_msg: self._handle_ocr_failed(task_id, msg))
         except Exception as e:
             err_msg = str(e)
+            preserve_for_resume = type(self)._is_retryable_error(e)
             self.after(0, lambda msg=err_msg: self._handle_ocr_failed(task_id, msg))
         finally:
-            self._cleanup_task_context_cache(file_path)
+            self._cleanup_task_context_cache(file_path, preserve_for_resume=preserve_for_resume)
 
     def _show_ocr_text_result(self, ocr_pages, task_id, from_cache):
         if task_id != self.ocr_task_id:
@@ -1354,6 +1368,33 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             ttl = 7200
         return max(300, ttl)
 
+    #: 命中复用时若远端 cache 剩余 TTL 低于该阈值（秒），主动续期至完整 TTL，
+    #: 避免长任务中途过期触发 CACHED_CONTENT_INVALID 雪崩式重建。
+    _CONTEXT_CACHE_TTL_HEADROOM_SEC: int = 1800  # 30 分钟
+
+    #: 单次任务允许的 cache rebuild 次数上限。超过后改走 plain prompt（带 system_instruction、
+    #: 不带 cached_content），避免每页都付一次 cache write 费的雪崩成本。
+    _MAX_CACHE_REBUILDS_PER_TASK: int = 2
+
+    @classmethod
+    def _remaining_seconds_to_expire(cls, expire_iso: str) -> int | None:
+        """解析 ISO 时间字符串，返回距当前的剩余秒数；解析失败返回 None。"""
+        if not expire_iso:
+            return None
+        text = str(expire_iso).strip()
+        if not text:
+            return None
+        try:
+            # 兼容尾部 'Z' 的 UTC 标记
+            normalized = text.replace("Z", "+00:00") if text.endswith("Z") else text
+            expire_dt = datetime.fromisoformat(normalized)
+        except Exception:
+            return None
+        if expire_dt.tzinfo is None:
+            expire_dt = expire_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return int((expire_dt - now).total_seconds())
+
     def _build_context_cache_payload_text(self, pdf_path: str) -> str:
         """拼接 OCR 全文作为 explicit cache 的静态上下文。
 
@@ -1383,21 +1424,38 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         system_prompt: str,
         source_text: str,
     ) -> str:
+        """计算用于复用判定的 fingerprint。
+
+        【设计原则】fingerprint 仅基于"同一份内容"维度，**不**包含 `pdf_path`：
+        - `source_text` 已经覆盖了 OCR 全文实际内容；
+        - `st_mtime_ns + st_size` 用作内容微变动的快速判别；
+        - `model_name + system_prompt` 保证模型/指令变更时强制重建。
+
+        这样用户把同一份 PDF 移动到另一个目录、或重命名后，仍能复用之前的
+        cache，避免白付一次 cache write 费。
+        """
         stat = os.stat(pdf_path)
         system_hash = hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()
         source_hash = hashlib.sha256((source_text or "").encode("utf-8")).hexdigest()
         seed = (
-            f"{pdf_path}|{stat.st_mtime_ns}|{stat.st_size}|"
+            f"{stat.st_mtime_ns}|{stat.st_size}|"
             f"{model_name}|{system_hash}|{source_hash}"
         )
         return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
     def _clear_context_cache_for_pdf(self, pdf_path: str, *, try_remote_delete: bool) -> None:
+        """清理某 PDF 对应的本地 sidecar + 远端 cache。
+
+        【孤儿防护】当 `try_remote_delete=True` 且远端删除失败时（网络异常/超时/SDK 报错），
+        **不再删除本地 sidecar**，而是把它就地改写为 `pending_delete=true`，等启动巡检
+        （`patrol_orphan_context_caches`）兜底再删一次，避免静默泄漏远端 cache 持续计费。
+        """
         if not pdf_path:
             return
         cache_path = self._build_cache_path(pdf_path)
         meta = self.cache_service.read_context_meta(cache_path)
         cache_name = str(meta.get("cache_name", "")).strip() if isinstance(meta, dict) else ""
+        remote_delete_failed = False
         if try_remote_delete and cache_name:
             try:
                 self.llm_service.delete_context_cache(
@@ -1407,8 +1465,19 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     selected_pdf_path=pdf_path,
                 )
             except Exception:
+                remote_delete_failed = True
+        if try_remote_delete and remote_delete_failed and cache_name and isinstance(meta, dict):
+            # 远端删除失败：保留 sidecar 并打 pending_delete 标记 + 时间戳，启动巡检会兜底再删一次。
+            try:
+                marked_meta = dict(meta)
+                marked_meta["pending_delete"] = True
+                marked_meta["pending_delete_marked_at"] = self._iso_utc_now()
+                self.cache_service.write_context_meta(cache_path, marked_meta)
+            except Exception:
+                # 即便 sidecar 改写失败也无需阻塞业务流，启动巡检的"远端列表反向比对"路径仍能兜底。
                 pass
-        self.cache_service.delete_context_meta(cache_path)
+        else:
+            self.cache_service.delete_context_meta(cache_path)
         if self.selected_pdf_path == pdf_path:
             self.current_context_cache_name = ""
             self.current_context_cache_meta = {}
@@ -1445,8 +1514,12 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             old_model = str(old_meta.get("model", "")).strip()
             old_fingerprint = str(old_meta.get("source_fingerprint", "")).strip()
             old_prompt_ver = str(old_meta.get("system_prompt_version", "")).strip()
+            # `pending_delete=true` 的 sidecar 表示远端 cache 已尝试删除但失败，
+            # 远端状态不可信（可能已删/可能仍在/可能损坏），一律不复用，等巡检兜底清理。
+            old_pending_delete = bool(old_meta.get("pending_delete"))
             if (
                 old_cache_name
+                and not old_pending_delete
                 and old_model == model_name
                 and old_fingerprint == source_fingerprint
                 and old_prompt_ver == system_prompt_version
@@ -1454,14 +1527,28 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 try:
                     self.llm_service.update_api_key(api_key)
                     cache_obj = self.llm_service.get_context_cache(cache_name=old_cache_name)
-                    if ANALYSIS_CACHE_AUTO_REFRESH_TTL:
-                        cache_obj = self.llm_service.update_context_cache_ttl(
-                            cache_name=old_cache_name,
-                            ttl_seconds=ttl_seconds,
-                            screen_name=type(self).__name__,
-                            task_name=type(self).task_short_name,
-                            selected_pdf_path=self.selected_pdf_path,
-                        )
+                    expire_iso = self._to_iso_datetime(getattr(cache_obj, "expire_time", ""))
+                    remaining_sec = self._remaining_seconds_to_expire(expire_iso)
+                    headroom = int(self._CONTEXT_CACHE_TTL_HEADROOM_SEC)
+                    needs_refresh = bool(
+                        ANALYSIS_CACHE_AUTO_REFRESH_TTL
+                        or (remaining_sec is not None and remaining_sec < headroom)
+                    )
+                    if needs_refresh:
+                        # 续期失败不应该把"已经能用"的旧 cache 拖垮，因此用独立 try 包裹；
+                        # 失败时退化为"仅使用 get 拿到的旧 cache_obj"，远端会按原 TTL 自然过期。
+                        try:
+                            refreshed_obj = self.llm_service.update_context_cache_ttl(
+                                cache_name=old_cache_name,
+                                ttl_seconds=ttl_seconds,
+                                screen_name=type(self).__name__,
+                                task_name=type(self).task_short_name,
+                                selected_pdf_path=self.selected_pdf_path,
+                            )
+                            cache_obj = refreshed_obj or cache_obj
+                        except Exception:
+                            # 续期失败：保留旧 cache_obj 继续复用，避免整体重建带来的 cache write 费。
+                            pass
                     refreshed_meta = {
                         "cache_name": old_cache_name,
                         "model": model_name,
@@ -1473,6 +1560,20 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     self.cache_service.write_context_meta(cache_path, refreshed_meta)
                     self.current_context_cache_name = old_cache_name
                     self.current_context_cache_meta = refreshed_meta
+                    try:
+                        self.llm_service.trace_context_cache_lifecycle(
+                            screen_name=type(self).__name__,
+                            task_name=type(self).task_short_name,
+                            selected_pdf_path=self.selected_pdf_path,
+                            event="context_cache_reused",
+                            cache_name=old_cache_name,
+                            model_name=model_name,
+                            ttl_seconds=ttl_seconds,
+                            source_fingerprint=source_fingerprint,
+                            reason="meta_fingerprint_hit",
+                        )
+                    except Exception:
+                        pass
                     try:
                         log_context_cache_event(
                             event="reuse",
@@ -1487,6 +1588,19 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                         pass
                     return old_cache_name
                 except Exception:
+                    try:
+                        self.llm_service.trace_context_cache_lifecycle(
+                            screen_name=type(self).__name__,
+                            task_name=type(self).task_short_name,
+                            selected_pdf_path=self.selected_pdf_path,
+                            event="context_cache_invalidated",
+                            cache_name=old_cache_name,
+                            model_name=model_name,
+                            source_fingerprint=source_fingerprint,
+                            reason="stale_or_remote_lookup_failed",
+                        )
+                    except Exception:
+                        pass
                     try:
                         self.llm_service.delete_context_cache(
                             cache_name=old_cache_name,
@@ -1519,6 +1633,21 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.cache_service.write_context_meta(cache_path, new_meta)
         self.current_context_cache_name = new_cache_name
         self.current_context_cache_meta = new_meta
+        try:
+            self.llm_service.trace_context_cache_lifecycle(
+                screen_name=type(self).__name__,
+                task_name=type(self).task_short_name,
+                selected_pdf_path=self.selected_pdf_path,
+                event="context_cache_created",
+                cache_name=new_cache_name,
+                model_name=model_name,
+                ttl_seconds=ttl_seconds,
+                source_fingerprint=source_fingerprint,
+                reason="create_new_context_cache",
+                extra_payload={"system_prompt_version": system_prompt_version},
+            )
+        except Exception:
+            pass
         return new_cache_name
 
     def _ensure_active_task(self, task_id):
@@ -1704,6 +1833,34 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         raise last_err
 
     def cancel_ocr_task(self, silent=False):
+        """取消当前任务。
+
+        【R3 弹窗确认】仅当用户主动点击「取消任务」按钮（`silent=False`）、
+        且当前正在运行的是会产生远端 context cache 的 Analysis 任务时，
+        先弹窗明确告知后果（远端 cache 删除 + 下次重新分析需重付 cache write 费），
+        用户确认后才继续取消。`silent=True`（如 `open_pdf` 切换文件时的静默取消）
+        不弹窗，保留原有行为。
+        """
+        is_running = self.current_ocr_state == DocumentTaskState.RUNNING
+        if (
+            not silent
+            and is_running
+            and self._uses_stateless_analysis_generation()
+        ):
+            confirmed = messagebox.askyesno(
+                "⚠️ 取消确认",
+                (
+                    f"取消当前「{type(self).task_short_name}」任务将立即触发以下操作：\n\n"
+                    "• 删除 Google 端的 explicit context cache；\n"
+                    "• 本地已完成页的分析结果保留（可作为断点续传起点）；\n"
+                    "• 下一次重新开始分析时，需要重新支付一次 cache write 费用，"
+                    "并占用一段 cache storage 时段。\n\n"
+                    "若是临时网络波动，建议等待自动重试；\n"
+                    "若确实需要中止，请点击「是」。"
+                ),
+            )
+            if not confirmed:
+                return
         self.ocr_cancel_event.set()
         if not silent:
             timeout_s = max(1, int(type(self).api_request_timeout_sec))
@@ -1792,6 +1949,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         """
         self.current_chat = None
         self.current_context_cache_name = ""
+        # 每次任务起点重置 rebuild 计数与 plain-prompt 降级标志。
+        self._task_cache_rebuild_count = 0
+        self._task_cache_disabled = False
         if self._uses_stateless_analysis_generation():
             self._prepare_analysis_context_cache(api_key, model_name)
             return
@@ -1819,7 +1979,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         except RuntimeError as e:
             if cached_content and "CACHED_CONTENT_INVALID" in str(e):
                 # 显式缓存过期/失效后仅重建一次，避免无限重试。
-                self._clear_context_cache_for_pdf(self.selected_pdf_path, try_remote_delete=False)
+                # 尝试同步删除远端旧 cache（15s 短超时保护）：即使删除失败也不会阻塞重建，
+                # 但能减少远端孤儿 + 重复 storage 计费的概率。
+                self._clear_context_cache_for_pdf(self.selected_pdf_path, try_remote_delete=True)
                 rebuilt_cache = self._resolve_context_cache_name(
                     api_key=api_key,
                     model_name=model_name,
@@ -1847,13 +2009,187 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         """
         self._prepare_task_context(api_key, model_name)
 
-    def _cleanup_task_context_cache(self, pdf_path: str | None) -> None:
-        """任务收尾：无论结果如何，Analysis 任务都主动清理远端 context cache。"""
+    # ------------------------------------------------------------------ #
+    # R1: 启动孤儿 cache 巡检
+    # ------------------------------------------------------------------ #
+
+    #: 启动后延迟多少毫秒再触发巡检（让 UI 先就绪，避免和初次渲染抢线程）。
+    _ORPHAN_PATROL_START_DELAY_MS: int = 5000
+
+    def schedule_orphan_context_cache_patrol(self) -> None:
+        """登记一次后台巡检：清理本机/远端遗留的孤儿 context cache。
+
+        - 仅在子类启用 Analysis stateless cache 链路时实际跑（其它任务无 sidecar）；
+        - 用 `after` 延迟 + 守护线程执行，**绝不阻塞 UI 启动**；
+        - 任何异常都被静默吞掉，巡检失败不影响后续业务。
+        """
+        if not self._is_analysis_context_cache_enabled():
+            return
+        try:
+            self.after(
+                int(self._ORPHAN_PATROL_START_DELAY_MS),
+                lambda: threading.Thread(
+                    target=self._run_orphan_patrol_safely,
+                    daemon=True,
+                ).start(),
+            )
+        except Exception:
+            pass
+
+    def _run_orphan_patrol_safely(self) -> None:
+        """巡检线程入口：先加载 API key，再执行 `patrol_orphan_context_caches`。"""
+        try:
+            api_key = (
+                os.getenv("GOOGLE_GEMINI_API_KEY", "").strip()
+                or os.getenv("GOOGLE_VISION_API_KEY", "").strip()
+                or load_gemini_api_key()
+            )
+            if not api_key:
+                return
+            self.llm_service.update_api_key(api_key)
+            stats = self.patrol_orphan_context_caches()
+            _debug_log(
+                "run_patrol",
+                "R1",
+                "screens/base_screen.py:patrol_orphan_context_caches",
+                "orphan context cache patrol finished",
+                stats,
+            )
+        except Exception as e:
+            _debug_log(
+                "run_patrol",
+                "R1",
+                "screens/base_screen.py:patrol_orphan_context_caches",
+                "orphan patrol failed silently",
+                {"error": str(e)[:240]},
+            )
+
+    def patrol_orphan_context_caches(self) -> dict[str, int]:
+        """巡检并清理孤儿 context cache。
+
+        步骤：
+        1. 扫 `document_cache_dir` 下所有 `*.context.json` sidecar；
+        2. 对 `pending_delete=true` 的 sidecar：再次尝试远端 delete，成功则连本地一起删；
+        3. 对正常 sidecar：`get_context_cache` 验证远端状态：
+           - 远端 404/异常 → 删本地 sidecar（防止下次错误命中）；
+           - 远端存在 → 计入 known set，等下一次正常复用；
+        4. 反向扫 `list_context_caches`，找远端有但 `display_name` 是 Analysis 创建且
+           不在 known set 中的远端孤儿（极少数：进程崩溃前 cache 已创建但 sidecar 未落盘），
+           直接删除。
+        """
+        stats: dict[str, int] = {
+            "scanned_sidecars": 0,
+            "removed_dead_local": 0,
+            "completed_pending_delete": 0,
+            "removed_remote_orphan": 0,
+            "errors": 0,
+        }
+        if not self._is_analysis_context_cache_enabled():
+            return stats
+        cache_dir = self.document_cache_dir
+        if not cache_dir or not os.path.isdir(cache_dir):
+            return stats
+
+        known_cache_names: set[str] = set()
+        sidecar_paths = glob.glob(os.path.join(cache_dir, "*.context.json"))
+        for sidecar_path in sidecar_paths:
+            stats["scanned_sidecars"] += 1
+            try:
+                with open(sidecar_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if not isinstance(meta, dict):
+                    continue
+                cache_name = str(meta.get("cache_name", "")).strip()
+                if not cache_name:
+                    continue
+                pending = bool(meta.get("pending_delete"))
+
+                if pending:
+                    # 上一次 delete 失败留下的 pending：再试一次。
+                    try:
+                        self.llm_service.delete_context_cache(
+                            cache_name=cache_name,
+                            screen_name=type(self).__name__,
+                            task_name=type(self).task_short_name,
+                            selected_pdf_path=None,
+                        )
+                        try:
+                            os.remove(sidecar_path)
+                        except OSError:
+                            pass
+                        stats["completed_pending_delete"] += 1
+                    except Exception:
+                        # 仍然失败：保留 sidecar，下次启动再试。
+                        stats["errors"] += 1
+                    continue
+
+                # 正常 sidecar：验证远端存活。
+                try:
+                    self.llm_service.get_context_cache(cache_name=cache_name)
+                    known_cache_names.add(cache_name)
+                except Exception:
+                    # 远端 404 / 不可达 → 清掉死 sidecar，避免后续误命中。
+                    try:
+                        os.remove(sidecar_path)
+                    except OSError:
+                        pass
+                    stats["removed_dead_local"] += 1
+            except Exception:
+                stats["errors"] += 1
+                continue
+
+        # 反向扫远端，找游离的远端 cache。
+        try:
+            all_remote = self.llm_service.list_context_caches()
+            for remote_cache in all_remote:
+                name = str(getattr(remote_cache, "name", "")).strip()
+                display = str(getattr(remote_cache, "display_name", "") or "").strip()
+                if not name or name in known_cache_names:
+                    continue
+                # 仅清理 Analysis 自己创建的（前缀约定见 `_resolve_context_cache_name`）。
+                if not display.startswith("analysis:"):
+                    continue
+                try:
+                    self.llm_service.delete_context_cache(
+                        cache_name=name,
+                        screen_name=type(self).__name__,
+                        task_name=type(self).task_short_name,
+                        selected_pdf_path=None,
+                    )
+                    stats["removed_remote_orphan"] += 1
+                except Exception:
+                    stats["errors"] += 1
+        except Exception:
+            # list 失败（无权限 / 配额 / 网络）：忽略，下次启动再试。
+            pass
+
+        return stats
+
+    def _cleanup_task_context_cache(
+        self,
+        pdf_path: str | None,
+        *,
+        preserve_for_resume: bool = False,
+    ) -> None:
+        """任务收尾：Analysis 任务的远端 context cache 清理。
+
+        - `preserve_for_resume=False`（默认）：删除远端 cache + 本地 sidecar，
+          适用于"成功完成 / 用户主动取消 / 非 retryable 错误"等场景；
+        - `preserve_for_resume=True`：仅清理内存中的引用，**保留 sidecar 与远端 cache**，
+          专为"网络/超时等 retryable 错误"设计，方便下一次断点续传直接命中复用，
+          避免重复支付 cache write 费。
+        """
         if not self._uses_stateless_analysis_generation():
             return
         target_pdf = pdf_path or self.selected_pdf_path
         self.current_chat = None
         if not target_pdf:
+            return
+        if preserve_for_resume:
+            # 仅切断 in-memory 引用，sidecar 与远端 cache 由下次任务复用或 TTL 自然过期。
+            if self.selected_pdf_path == target_pdf:
+                self.current_context_cache_name = ""
+                self.current_context_cache_meta = {}
             return
         self._clear_context_cache_for_pdf(target_pdf, try_remote_delete=True)
 
@@ -1872,11 +2208,36 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
         if self._uses_stateless_analysis_generation():
             turn_prompt = self.get_turn_prompt(page_index, source_text or "")
+            gen_mime = type(self)._effective_generation_response_mime_type()
+            gen_temp = type(self)._effective_generation_temperature()
+            max_rebuilds = max(0, int(type(self)._MAX_CACHE_REBUILDS_PER_TASK))
+
+            # 任务级 plain-prompt 降级：若本任务前面页已触发过 cache rebuild 上限，
+            # 后续页直接走「带 system_instruction、不带 cached_content」路径，
+            # 不再尝试重建 cache，避免每页都付一次 cache write 费。
+            if self._task_cache_disabled:
+                system_prompt_fallback = self.get_system_prompt()
+                result_text, usage_summary = self.llm_service.generate_text_once(
+                    screen_name=type(self).__name__,
+                    task_name=type(self).task_short_name,
+                    selected_pdf_path=self.selected_pdf_path,
+                    file_name=file_name,
+                    model_name=model_name,
+                    prompt_text=turn_prompt,
+                    behavior_name=type(self).task_short_name,
+                    page_index=page_index,
+                    enrich_json_data=enrich_hook,
+                    response_mime_type=gen_mime,
+                    temperature=gen_temp,
+                    cached_content=None,
+                    system_instruction=system_prompt_fallback,
+                )
+                self.after(0, lambda s=usage_summary: self._accumulate_usage_summary(s))
+                return result_text
+
             cached_content = self.current_context_cache_name or None
             if not cached_content:
                 cached_content = self._prepare_analysis_context_cache(api_key, model_name)
-            gen_mime = type(self)._effective_generation_response_mime_type()
-            gen_temp = type(self)._effective_generation_temperature()
             try:
                 result_text, usage_summary = self.llm_service.generate_text_once(
                     screen_name=type(self).__name__,
@@ -1894,22 +2255,44 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 )
             except RuntimeError as e:
                 if cached_content and "CACHED_CONTENT_INVALID" in str(e):
-                    self._clear_context_cache_for_pdf(self.selected_pdf_path, try_remote_delete=False)
-                    rebuilt_cache = self._prepare_analysis_context_cache(api_key, model_name)
-                    result_text, usage_summary = self.llm_service.generate_text_once(
-                        screen_name=type(self).__name__,
-                        task_name=type(self).task_short_name,
-                        selected_pdf_path=self.selected_pdf_path,
-                        file_name=file_name,
-                        model_name=model_name,
-                        prompt_text=turn_prompt,
-                        behavior_name=type(self).task_short_name,
-                        page_index=page_index,
-                        enrich_json_data=enrich_hook,
-                        response_mime_type=gen_mime,
-                        temperature=gen_temp,
-                        cached_content=rebuilt_cache,
-                    )
+                    # 同步尝试删除远端无效 cache（15s 短超时保护），减少远端孤儿计费概率。
+                    self._clear_context_cache_for_pdf(self.selected_pdf_path, try_remote_delete=True)
+                    self._task_cache_rebuild_count += 1
+                    if self._task_cache_rebuild_count > max_rebuilds:
+                        # 触发雪崩防护：本任务从这一页开始改走 plain prompt（不再重建 cache）。
+                        self._task_cache_disabled = True
+                        system_prompt_fallback = self.get_system_prompt()
+                        result_text, usage_summary = self.llm_service.generate_text_once(
+                            screen_name=type(self).__name__,
+                            task_name=type(self).task_short_name,
+                            selected_pdf_path=self.selected_pdf_path,
+                            file_name=file_name,
+                            model_name=model_name,
+                            prompt_text=turn_prompt,
+                            behavior_name=type(self).task_short_name,
+                            page_index=page_index,
+                            enrich_json_data=enrich_hook,
+                            response_mime_type=gen_mime,
+                            temperature=gen_temp,
+                            cached_content=None,
+                            system_instruction=system_prompt_fallback,
+                        )
+                    else:
+                        rebuilt_cache = self._prepare_analysis_context_cache(api_key, model_name)
+                        result_text, usage_summary = self.llm_service.generate_text_once(
+                            screen_name=type(self).__name__,
+                            task_name=type(self).task_short_name,
+                            selected_pdf_path=self.selected_pdf_path,
+                            file_name=file_name,
+                            model_name=model_name,
+                            prompt_text=turn_prompt,
+                            behavior_name=type(self).task_short_name,
+                            page_index=page_index,
+                            enrich_json_data=enrich_hook,
+                            response_mime_type=gen_mime,
+                            temperature=gen_temp,
+                            cached_content=rebuilt_cache,
+                        )
                 else:
                     raise
             self.after(0, lambda s=usage_summary: self._accumulate_usage_summary(s))

@@ -83,6 +83,8 @@ class AnalysisScreen(BaseDocumentScreen):
         self._build_controlled_form()
         # 父类初始化阶段可能已加载了当前页文本；表单建好后主动同步一次
         self._show_current_ocr_page()
+        # 启动后台巡检：清理上次运行遗留的孤儿 context cache（防止进程崩溃后远端继续计费）。
+        self.schedule_orphan_context_cache_patrol()
 
     def _build_controlled_form(self) -> None:
         self.form_entries: dict[str, ctk.CTkEntry] = {}
