@@ -27,6 +27,27 @@ class DocumentTaskState(Enum):
 
 
 DOC_TASK_CANCELLED = "DOC_TASK_CANCELLED"
+DEBUG_LOG_PATH = "/Users/merin/本地文稿/Historical Records Scraper/main_dev/.cursor/debug-b75604.log"
+DEBUG_SESSION_ID = "b75604"
+
+
+def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # region agent log
+    try:
+        payload = {
+            "sessionId": DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # endregion
 
 
 class BaseDocumentScreen(ctk.CTkFrame, ABC):
@@ -69,6 +90,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     api_retry_backoff_jitter_sec: float = 0.8
     #: 连续 API 请求最小间隔秒数（软限流，0 表示不限制）
     api_min_request_interval_sec: float = 0.0
+    #: Chat Session 历史轮次达到阈值后自动滚动重建（<=0 关闭）
+    chat_history_rotate_threshold: int = 12
     #: v2.6.6 起：是否以有状态 Chat Session 调用 LLM。OCR 走单次调用，Analysis/Translation 启用。
     use_chat_session: bool = False
     #: Chat Session 的响应 MIME 类型；Analysis 子类应覆盖为 "application/json"。
@@ -1293,6 +1316,22 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         timeout_attempts = 0
         retryable_attempts = 0
         last_err = None
+        _debug_log(
+            "run1",
+            "H1",
+            "screens/base_screen.py:_call_page_with_retry:entry",
+            "retry loop entered",
+            {
+                "task": type(self).task_short_name,
+                "pageIndex": page_index,
+                "totalPages": total_pages,
+                "timeoutMaxAttempts": timeout_max_attempts,
+                "retryableMaxAttempts": retryable_max_attempts,
+                "retryBase": retry_base,
+                "retryCap": retry_cap,
+                "retryJitter": retry_jitter,
+            },
+        )
         while True:
             self._ensure_active_task(task_id)
             try:
@@ -1300,13 +1339,51 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             except Exception as e:
                 last_err = e
                 is_timeout = self._is_timeout_error(e)
+                _debug_log(
+                    "run1",
+                    "H2",
+                    "screens/base_screen.py:_call_page_with_retry:exception",
+                    "invoke exception captured",
+                    {
+                        "task": type(self).task_short_name,
+                        "pageIndex": page_index,
+                        "isTimeout": is_timeout,
+                        "isRetryable": type(self)._is_retryable_error(e),
+                        "errorType": type(e).__name__,
+                        "error": str(e)[:260],
+                    },
+                )
                 if is_timeout:
                     timeout_attempts += 1
                     if timeout_attempts >= timeout_max_attempts:
+                        _debug_log(
+                            "run1",
+                            "H3",
+                            "screens/base_screen.py:_call_page_with_retry:timeout-exhausted",
+                            "timeout retries exhausted",
+                            {
+                                "task": type(self).task_short_name,
+                                "pageIndex": page_index,
+                                "timeoutAttempts": timeout_attempts,
+                                "timeoutMaxAttempts": timeout_max_attempts,
+                            },
+                        )
                         raise
                     wait_s = min(retry_cap, retry_base * (2 ** max(0, timeout_attempts - 1)))
                     if retry_jitter > 0:
                         wait_s += random.uniform(0.0, retry_jitter)
+                    _debug_log(
+                        "run1",
+                        "H4",
+                        "screens/base_screen.py:_call_page_with_retry:timeout-wait",
+                        "timeout retry scheduled",
+                        {
+                            "task": type(self).task_short_name,
+                            "pageIndex": page_index,
+                            "attempt": timeout_attempts + 1,
+                            "waitSeconds": round(wait_s, 3),
+                        },
+                    )
                     self.after(
                         0,
                         lambda a=timeout_attempts, w=wait_s: self.ocr_progress_label.configure(
@@ -1319,14 +1396,51 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     continue
 
                 if not type(self)._is_retryable_error(e):
+                    _debug_log(
+                        "run1",
+                        "H5",
+                        "screens/base_screen.py:_call_page_with_retry:non-retryable",
+                        "error treated as non-retryable",
+                        {
+                            "task": type(self).task_short_name,
+                            "pageIndex": page_index,
+                            "errorType": type(e).__name__,
+                            "error": str(e)[:260],
+                        },
+                    )
                     raise
 
                 retryable_attempts += 1
                 if retryable_attempts >= retryable_max_attempts:
+                    _debug_log(
+                        "run1",
+                        "H6",
+                        "screens/base_screen.py:_call_page_with_retry:retryable-exhausted",
+                        "retryable retries exhausted",
+                        {
+                            "task": type(self).task_short_name,
+                            "pageIndex": page_index,
+                            "retryableAttempts": retryable_attempts,
+                            "retryableMaxAttempts": retryable_max_attempts,
+                        },
+                    )
                     raise
                 wait_s = min(retry_cap, retry_base * (2 ** max(0, retryable_attempts - 1)))
                 if retry_jitter > 0:
                     wait_s += random.uniform(0.0, retry_jitter)
+                _debug_log(
+                    "run1",
+                    "H7",
+                    "screens/base_screen.py:_call_page_with_retry:retryable-wait",
+                    "retryable error retry scheduled",
+                    {
+                        "task": type(self).task_short_name,
+                        "pageIndex": page_index,
+                        "attempt": retryable_attempts + 1,
+                        "waitSeconds": round(wait_s, 3),
+                        "error": str(e)[:180],
+                    },
+                )
                 self.after(
                     0,
                     lambda a=retryable_attempts, w=wait_s: self.ocr_progress_label.configure(
@@ -1431,6 +1545,37 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         enrich_hook = self.enrich_json_data if hasattr(self, "enrich_json_data") else None
 
         if type(self).use_chat_session and self.current_chat is not None:
+            rotate_threshold = max(0, int(type(self).chat_history_rotate_threshold))
+            if rotate_threshold > 0:
+                history_count = self.llm_service.get_chat_history_count(self.current_chat)
+                _debug_log(
+                    "run4",
+                    "H13",
+                    "screens/base_screen.py:_request_page_text:rotate-check",
+                    "chat rotation check snapshot",
+                    {
+                        "task": type(self).task_short_name,
+                        "pageIndex": page_index,
+                        "historyCount": history_count,
+                        "rotateThreshold": rotate_threshold,
+                        "timeoutSec": int(type(self).api_request_timeout_sec),
+                        "timeoutMaxAttempts": int(type(self).api_timeout_max_attempts),
+                    },
+                )
+                if history_count >= rotate_threshold:
+                    _debug_log(
+                        "run3",
+                        "H12",
+                        "screens/base_screen.py:_request_page_text:rotate",
+                        "chat session rotated by history threshold",
+                        {
+                            "task": type(self).task_short_name,
+                            "pageIndex": page_index,
+                            "historyCount": history_count,
+                            "threshold": rotate_threshold,
+                        },
+                    )
+                    self._start_new_chat_session(api_key, model_name)
             # Analysis / Translation：走有状态 Chat Session 通道
             turn_prompt = self.get_turn_prompt(page_index, source_text or "")
             result_text, usage_summary = self.llm_service.send_chat_message(

@@ -5,7 +5,18 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 #全局版本号配置
-APP_VERSION = "V2.6.7"
+APP_VERSION = "V3.1.1"
+
+# OCR 预处理总开关与分档模式（off / mild / strong）
+OCR_PREPROCESS_ENABLED = True
+OCR_PREPROCESS_MODE = "mild"
+
+# 各档图像增强参数：对比度 + 锐度
+OCR_PREPROCESS_PROFILES = {
+    "off": {"contrast": 1.0, "sharpness": 1.0},
+    "mild": {"contrast": 1.3, "sharpness": 1.1},
+    "strong": {"contrast": 1.5, "sharpness": 1.2},
+}
 
 # 保留给未来可能需要的图片组件结构
 imagesTupple = namedtuple("images", ["light", "dark"])

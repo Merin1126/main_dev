@@ -15,6 +15,28 @@ from config.api_key_store import load_trace_config
 from utils.gemini_trace_logger import append_trace_event, build_cache_event
 from utils.token_logger import log_gemini_usage
 
+DEBUG_LOG_PATH = "/Users/merin/本地文稿/Historical Records Scraper/main_dev/.cursor/debug-b75604.log"
+DEBUG_SESSION_ID = "b75604"
+
+
+def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # region agent log
+    try:
+        payload = {
+            "sessionId": DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # endregion
+
 
 class LlmService:
     """封装 google-genai SDK 调用（含 OCR 单次调用 + Analysis/Translation 有状态 Chat Session）。
@@ -171,7 +193,15 @@ class LlmService:
         now = time.monotonic()
         elapsed = now - self._last_request_started_at
         if elapsed < min_gap:
-            time.sleep(min_gap - elapsed)
+            wait = min_gap - elapsed
+            _debug_log(
+                "run1",
+                "H8",
+                "services/llm_service.py:_apply_request_rate_gate",
+                "request delayed by rate gate",
+                {"minGap": round(min_gap, 3), "elapsed": round(elapsed, 3), "wait": round(wait, 3)},
+            )
+            time.sleep(wait)
         self._last_request_started_at = time.monotonic()
 
     @staticmethod
@@ -205,6 +235,12 @@ class LlmService:
         except Exception:
             return []
         return hist if isinstance(hist, list) else []
+
+    def get_chat_history_count(self, chat) -> int:
+        try:
+            return len(self._safe_chat_history(chat))
+        except Exception:
+            return 0
 
     @staticmethod
     def _extract_model_text_from_history(history: list[Any]) -> str:
@@ -332,11 +368,31 @@ class LlmService:
                 "turn_prompt": self._trace_text(turn_prompt, include_full_text),
             },
         )
+        _debug_log(
+            "run2",
+            "H11",
+            "services/llm_service.py:send_chat_message:prepared",
+            "chat turn prepared metrics",
+            {
+                "model": model_name,
+                "pageIndex": page_index,
+                "historyCountBefore": len(history_before),
+                "turnPromptLen": len(turn_prompt or ""),
+                "minIntervalSec": round(float(self.min_interval_sec or 0.0), 3),
+            },
+        )
 
         try:
             self._apply_request_rate_gate()
             response = self._run_with_timeout(lambda: chat.send_message(turn_prompt))
         except Exception as e:
+            _debug_log(
+                "run1",
+                "H9",
+                "services/llm_service.py:send_chat_message:exception",
+                "chat request failed before retry layer",
+                {"model": model_name, "pageIndex": page_index, "errorCategory": self._classify_error(e), "error": str(e)[:260]},
+            )
             self._trace_event(
                 screen_name=screen_name,
                 task_name=task_name,

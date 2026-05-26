@@ -1,6 +1,11 @@
 import json
 import os
 
+from config.settings import OCR_PREPROCESS_ENABLED, OCR_PREPROCESS_MODE
+
+
+OCR_PREPROCESS_MODES = {"off", "mild", "strong"}
+
 
 def _project_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -93,6 +98,27 @@ def save_trace_config(*, enabled=None, include_full_text=None):
         payload["trace_gemini_io_enabled"] = bool(enabled)
     if include_full_text is not None:
         payload["trace_gemini_io_full_text"] = bool(include_full_text)
+    _write_config(payload)
+
+
+def load_ocr_preprocess_config():
+    data = _read_config()
+    enabled = bool(data.get("ocr_preprocess_enabled", OCR_PREPROCESS_ENABLED))
+    mode = str(data.get("ocr_preprocess_mode", OCR_PREPROCESS_MODE)).strip().lower()
+    if mode not in OCR_PREPROCESS_MODES:
+        mode = OCR_PREPROCESS_MODE
+    return {"enabled": enabled, "mode": mode}
+
+
+def save_ocr_preprocess_config(*, enabled=None, mode=None):
+    payload = _read_config()
+    if enabled is not None:
+        payload["ocr_preprocess_enabled"] = bool(enabled)
+    if mode is not None:
+        normalized_mode = str(mode).strip().lower()
+        if normalized_mode not in OCR_PREPROCESS_MODES:
+            raise ValueError(f"Unsupported OCR preprocess mode: {mode}")
+        payload["ocr_preprocess_mode"] = normalized_mode
     _write_config(payload)
 
 

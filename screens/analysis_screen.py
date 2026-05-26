@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
 import customtkinter as ctk
 
@@ -10,18 +11,43 @@ from config.academic_prompts import render_analysis_system, render_analysis_turn
 from config.translation_prompts import TRANSLATION_PLUGINS
 from screens.base_screen import BaseDocumentScreen
 
+DEBUG_LOG_PATH = "/Users/merin/本地文稿/Historical Records Scraper/main_dev/.cursor/debug-b75604.log"
+DEBUG_SESSION_ID = "b75604"
+
+
+def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # region agent log
+    try:
+        payload = {
+            "sessionId": DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # endregion
+
 
 class AnalysisScreen(BaseDocumentScreen):
     requires_image_input = False
     show_single_page_actions = False
-    # 分析任务优先保障“可快速回馈错误弹窗”：单页超时不做额外重试，避免长时间卡住。
-    api_timeout_max_attempts = 1
-    # 503/429/断连仅做一次短退避重试，失败后让用户手动继续断点任务。
-    api_retryable_max_attempts = 2
+    # 分析任务：将单次超时缩短，并允许一次超时重试（总时长仍控制在约 2 分钟内）。
+    api_request_timeout_sec = 55
+    api_timeout_max_attempts = 2
+    # 503/429/断连允许更充分但仍短时的退避重试，提升高峰期连续成功概率。
+    api_retryable_max_attempts = 4
     api_retry_backoff_base_sec = 2
-    api_retry_backoff_cap_sec = 6
+    api_retry_backoff_cap_sec = 8
     api_retry_backoff_jitter_sec = 0.8
-    api_min_request_interval_sec = 0.3
+    api_min_request_interval_sec = 0.6
+    # 会话历史达到阈值后主动滚动重建，降低长会话在高峰期的卡顿概率。
+    chat_history_rotate_threshold = 8
     #: v2.6.6：Analysis 切换为有状态 Chat Session，并通过 SDK 原生 JSON 约束格式
     use_chat_session = True
     chat_response_mime_type = "application/json"
@@ -411,11 +437,24 @@ class AnalysisScreen(BaseDocumentScreen):
         """渲染单页 turn_prompt（包含断点恢复上下文 capsule + 当前页 <SOURCE_TEXT>）。"""
         page_number = (page_index or 0) + 1
         context_capsule = self._build_recovery_context_capsule(page_index or 0)
-        return render_analysis_turn(
+        prompt = render_analysis_turn(
             page_number=page_number,
             page_text=page_text or "",
             context_capsule=context_capsule,
         )
+        _debug_log(
+            "run2",
+            "H10",
+            "screens/analysis_screen.py:get_turn_prompt",
+            "analysis turn prompt sized",
+            {
+                "pageIndex": page_index,
+                "sourceLen": len(page_text or ""),
+                "capsuleLen": len(context_capsule or ""),
+                "promptLen": len(prompt or ""),
+            },
+        )
+        return prompt
 
     def _build_recovery_context_capsule(self, page_index: int, window_size: int = 3) -> str:
         """从本地 Analysis 缓存回收最近若干页的关键字段，缓解会话重建后的继承漂移。"""

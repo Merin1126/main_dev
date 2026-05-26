@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+from io import BytesIO
 from typing import Optional
 
 import fitz
-from PIL import Image, ImageTk
+from PIL import Image, ImageEnhance, ImageTk
+
+from config.api_key_store import load_ocr_preprocess_config
+from config.settings import (
+    OCR_PREPROCESS_ENABLED,
+    OCR_PREPROCESS_MODE,
+    OCR_PREPROCESS_PROFILES,
+)
 
 
 class PdfService:
@@ -43,4 +51,24 @@ class PdfService:
             raise RuntimeError("PDF 尚未打开。")
         page = self._doc[page_index]
         pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
-        return pix.tobytes("png")
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        preprocess_cfg = load_ocr_preprocess_config()
+        enabled = bool(preprocess_cfg.get("enabled", OCR_PREPROCESS_ENABLED))
+        mode = str(preprocess_cfg.get("mode", OCR_PREPROCESS_MODE)).strip().lower()
+        if (not enabled) or mode == "off":
+            return self._to_png_bytes(img)
+
+        profile = OCR_PREPROCESS_PROFILES.get(mode, OCR_PREPROCESS_PROFILES[OCR_PREPROCESS_MODE])
+        contrast = float(profile.get("contrast", 1.0))
+        sharpness = float(profile.get("sharpness", 1.0))
+
+        enhanced = ImageEnhance.Contrast(img).enhance(contrast)
+        enhanced = ImageEnhance.Sharpness(enhanced).enhance(sharpness)
+        return self._to_png_bytes(enhanced)
+
+    @staticmethod
+    def _to_png_bytes(image: Image.Image) -> bytes:
+        with BytesIO() as buffer:
+            image.save(buffer, format="PNG")
+            return buffer.getvalue()

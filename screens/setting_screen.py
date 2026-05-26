@@ -10,10 +10,13 @@ from config.api_key_store import (
     load_google_api_key as load_gemini_api_key,
     save_google_api_key as save_gemini_api_key,
     clear_google_api_key as clear_gemini_api_key,
+    load_ocr_preprocess_config,
+    save_ocr_preprocess_config,
     load_trace_config,
     save_trace_config,
     mask_api_key,
 )
+from config.settings import OCR_PREPROCESS_ENABLED, OCR_PREPROCESS_MODE
 
 
 class SettingScreen(ctk.CTkFrame):
@@ -90,6 +93,8 @@ class SettingScreen(ctk.CTkFrame):
 
         self.trace_enabled_var = ctk.BooleanVar(value=False)
         self.trace_full_text_var = ctk.BooleanVar(value=True)
+        self.ocr_preprocess_enabled_var = ctk.BooleanVar(value=OCR_PREPROCESS_ENABLED)
+        self.ocr_preprocess_mode_var = ctk.StringVar(value=OCR_PREPROCESS_MODE)
 
         ctk.CTkCheckBox(
             container,
@@ -117,6 +122,48 @@ class SettingScreen(ctk.CTkFrame):
             font=("Arial", 12),
         )
         self.trace_hint_label.pack(anchor="w", padx=16, pady=(0, 14))
+
+        ctk.CTkLabel(
+            container,
+            text="OCR 图像预处理（识别前增强）",
+            font=("Arial", 14),
+        ).pack(anchor="w", padx=16, pady=(8, 6))
+
+        ctk.CTkCheckBox(
+            container,
+            text="启用 OCR 图像预处理",
+            variable=self.ocr_preprocess_enabled_var,
+        ).pack(anchor="w", padx=16, pady=(0, 6))
+
+        ctk.CTkLabel(
+            container,
+            text="增强档位",
+            font=("Arial", 12),
+            text_color=Color.TEXT_HINT_TUPLE,
+        ).pack(anchor="w", padx=16, pady=(0, 4))
+
+        self.ocr_preprocess_mode_menu = ctk.CTkOptionMenu(
+            container,
+            width=180,
+            values=["off", "mild", "strong"],
+            variable=self.ocr_preprocess_mode_var,
+        )
+        self.ocr_preprocess_mode_menu.pack(anchor="w", padx=16, pady=(0, 8))
+
+        Button(
+            container,
+            text="保存 OCR 预处理设置",
+            width=220,
+            height=40,
+            command=self.save_ocr_preprocess_settings,
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        self.ocr_preprocess_hint_label = ctk.CTkLabel(
+            container,
+            text="OCR 预处理：未配置",
+            font=("Arial", 12),
+        )
+        self.ocr_preprocess_hint_label.pack(anchor="w", padx=16, pady=(0, 14))
 
         Button(
             container,
@@ -159,7 +206,11 @@ class SettingScreen(ctk.CTkFrame):
         trace_cfg = load_trace_config()
         self.trace_enabled_var.set(bool(trace_cfg.get("enabled", False)))
         self.trace_full_text_var.set(bool(trace_cfg.get("include_full_text", True)))
+        preprocess_cfg = load_ocr_preprocess_config()
+        self.ocr_preprocess_enabled_var.set(bool(preprocess_cfg.get("enabled", OCR_PREPROCESS_ENABLED)))
+        self.ocr_preprocess_mode_var.set(str(preprocess_cfg.get("mode", OCR_PREPROCESS_MODE)))
         self._refresh_trace_hint()
+        self._refresh_ocr_preprocess_hint()
 
     def _refresh_trace_hint(self):
         enabled = bool(self.trace_enabled_var.get())
@@ -171,6 +222,23 @@ class SettingScreen(ctk.CTkFrame):
             )
         else:
             self.trace_hint_label.configure(text="追踪状态：未启用")
+
+    def _refresh_ocr_preprocess_hint(self):
+        enabled = bool(self.ocr_preprocess_enabled_var.get())
+        mode = str(self.ocr_preprocess_mode_var.get()).strip().lower()
+        if mode not in {"off", "mild", "strong"}:
+            mode = OCR_PREPROCESS_MODE
+            self.ocr_preprocess_mode_var.set(mode)
+        if not enabled:
+            self.ocr_preprocess_hint_label.configure(text="OCR 预处理：已关闭（等同 off）")
+            return
+        if mode == "off":
+            mode_desc = "off（不增强）"
+        elif mode == "strong":
+            mode_desc = "strong（对比 1.5 / 锐度 1.2）"
+        else:
+            mode_desc = "mild（推荐；对比 1.3 / 锐度 1.1）"
+        self.ocr_preprocess_hint_label.configure(text=f"OCR 预处理：已启用，当前 {mode_desc}")
 
     def save_api_key(self):
         raw_key = self.api_entry.get().strip()
@@ -199,6 +267,20 @@ class SettingScreen(ctk.CTkFrame):
         save_trace_config(enabled=enabled, include_full_text=include_full_text)
         self._refresh_trace_hint()
         messagebox.showinfo("成功", "Gemini 追踪设置已保存。")
+
+    def save_ocr_preprocess_settings(self):
+        enabled = bool(self.ocr_preprocess_enabled_var.get())
+        mode = str(self.ocr_preprocess_mode_var.get()).strip().lower()
+        if mode not in {"off", "mild", "strong"}:
+            messagebox.showwarning("提示", "OCR 预处理模式仅支持 off / mild / strong。")
+            return
+        try:
+            save_ocr_preprocess_config(enabled=enabled, mode=mode)
+        except ValueError as e:
+            messagebox.showwarning("提示", str(e))
+            return
+        self._refresh_ocr_preprocess_hint()
+        messagebox.showinfo("成功", "OCR 预处理设置已保存。")
 
     def convert_current_trace_log(self):
         try:
