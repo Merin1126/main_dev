@@ -19,11 +19,14 @@ OCR_PREPROCESS_PROFILES = {
 }
 
 # Analysis explicit context cache 开关（Gemini cachedContents）
-ANALYSIS_EXPLICIT_CACHE_ENABLED = False
+ANALYSIS_EXPLICIT_CACHE_ENABLED = True
 # 显式缓存默认 TTL（秒）
 ANALYSIS_CACHE_TTL_SECONDS = 7200
-# 命中已有缓存时是否自动续期
-ANALYSIS_CACHE_AUTO_REFRESH_TTL = True
+# 命中已有缓存时是否自动续期 TTL。
+# 默认 False：Analysis 任务结束（成功/取消/异常）会在 finally 中主动删除远端 cache，
+# 自动续期意义不大；若未来希望保留 cache 让其自然过期再做二次分析，可改为 True
+# 并将清理时机改成"按页清理或不清理"。
+ANALYSIS_CACHE_AUTO_REFRESH_TTL = False
 
 # 保留给未来可能需要的图片组件结构
 imagesTupple = namedtuple("images", ["light", "dark"])

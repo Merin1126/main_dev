@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+from typing import Any
 
 import customtkinter as ctk
 
@@ -46,12 +47,10 @@ class AnalysisScreen(BaseDocumentScreen):
     api_retry_backoff_cap_sec = 8
     api_retry_backoff_jitter_sec = 0.8
     api_min_request_interval_sec = 0.6
-    # 会话历史达到阈值后主动滚动重建，降低长会话在高峰期的卡顿概率。
-    chat_history_rotate_threshold = 8
-    #: v2.6.6：Analysis 切换为有状态 Chat Session，并通过 SDK 原生 JSON 约束格式
-    use_chat_session = True
-    chat_response_mime_type = "application/json"
-    chat_temperature = 0.3
+    # Analysis 走无状态单次生成（explicit cache + context capsule），不再依赖 Chat Session 历史。
+    # 使用 generation_* alias 字段，专门用于 stateless 路径；保留旧 chat_* 仅作为 alias 回退。
+    generation_response_mime_type = "application/json"
+    generation_temperature = 0.3
 
     screen_title = "史料分析"
     cache_dir_name = "Analysis_Cache"
@@ -421,20 +420,16 @@ class AnalysisScreen(BaseDocumentScreen):
         self.ocr_pages[self.current_ocr_page_index] = json.dumps(payload, ensure_ascii=False, indent=2)
 
     # ------------------------------------------------------------------ #
-    # v2.6.6 Chat Session 接入：system_prompt 与逐轮 turn_prompt
+    # v2.7.x 无状态生成：static cache（system_prompt） + dynamic turn（turn_prompt）
     # ------------------------------------------------------------------ #
 
     def get_system_prompt(self) -> str:
-        """渲染 Analysis 会话的系统前缀（人物定义 + JSON Schema + 跨页继承法则）。
-
-        过去版本里 `get_academic_prompt` 中"上一页元数据回灌"逻辑现在由 Chat Session 原生
-        历史接管：模型在每一轮都能看到自己上一轮的 JSON 输出，从而自然继承档案元数据。
-        """
+        """渲染 Analysis 静态系统前缀（用于 explicit cache 的 system_instruction）。"""
         plugin_keys = "』、『".join(TRANSLATION_PLUGINS.keys())
         return render_analysis_system(translation_plugin_enum=f"『{plugin_keys}』")
 
     def get_turn_prompt(self, page_index: int, page_text: str) -> str:
-        """渲染单页 turn_prompt（包含断点恢复上下文 capsule + 当前页 <SOURCE_TEXT>）。"""
+        """渲染单页 turn_prompt（动态任务层：context capsule + 当前页文本）。"""
         page_number = (page_index or 0) + 1
         context_capsule = self._build_recovery_context_capsule(page_index or 0)
         prompt = render_analysis_turn(
@@ -456,8 +451,35 @@ class AnalysisScreen(BaseDocumentScreen):
         )
         return prompt
 
+    # ------------------------------------------------------------------ #
+    # 回忆胶囊（recovery context capsule）的体积约束
+    # ------------------------------------------------------------------ #
+    # 单字段长度上限（如 Core_Judgment），过长会被尾截断 + 省略号。
+    _CAPSULE_FIELD_CHAR_LIMIT = 200
+    # 单行内非 Judgment 类摘要字段上限（Date/Sender/Recipient/Type 通常短，留个安全阀）。
+    _CAPSULE_SHORT_FIELD_CHAR_LIMIT = 80
+    # 整体硬上限：所有页行拼接后超出此长度则尾截断 + 省略号，避免 turn token 失控。
+    _CAPSULE_TOTAL_CHAR_LIMIT = 1500
+
+    @classmethod
+    def _truncate_capsule_field(cls, value: Any, *, limit: int) -> str:
+        """单字段安全截断：去首尾空白，超长尾截断并补省略号；空值返回空串。"""
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        if limit > 0 and len(text) > limit:
+            ellipsis = "…"
+            keep = max(1, limit - len(ellipsis))
+            text = text[:keep] + ellipsis
+        return text
+
     def _build_recovery_context_capsule(self, page_index: int, window_size: int = 3) -> str:
-        """从本地 Analysis 缓存回收最近若干页的关键字段，缓解会话重建后的继承漂移。"""
+        """从本地 Analysis 缓存回收最近若干页关键字段，作为无状态生成的跨页回忆胶囊。
+
+        约束：单字段截断 + 整体硬上限，避免随页数累积无界膨胀 turn token 体积。
+        """
         if not self.selected_pdf_path or page_index <= 0:
             return ""
         cache_path = self._build_cache_path(self.selected_pdf_path)
@@ -471,6 +493,8 @@ class AnalysisScreen(BaseDocumentScreen):
             return ""
 
         start = max(0, page_index - max(1, int(window_size)))
+        short_limit = self._CAPSULE_SHORT_FIELD_CHAR_LIMIT
+        judgment_limit = self._CAPSULE_FIELD_CHAR_LIMIT
         lines: list[str] = []
         for idx in range(start, min(page_index, len(pages))):
             raw = str(pages[idx] or "").strip()
@@ -484,18 +508,29 @@ class AnalysisScreen(BaseDocumentScreen):
                 continue
             ctx = payload.get("Historical_Context", {}) or {}
             disc = payload.get("Discourse_Analysis", {}) or {}
+            date_field = self._truncate_capsule_field(ctx.get("Date_Written"), limit=short_limit) or "未知"
+            sender_field = self._truncate_capsule_field(ctx.get("Author_Sender"), limit=short_limit) or "未知"
+            recipient_field = self._truncate_capsule_field(ctx.get("Recipient"), limit=short_limit) or "未知"
+            type_field = self._truncate_capsule_field(ctx.get("Document_Type"), limit=short_limit) or "未知"
+            judgment_field = self._truncate_capsule_field(disc.get("Core_Judgment"), limit=judgment_limit) or "未提及"
             lines.append(
                 (
-                    f"第{idx + 1}页 | Date={ctx.get('Date_Written') or '未知'} | "
-                    f"Sender={ctx.get('Author_Sender') or '未知'} | "
-                    f"Recipient={ctx.get('Recipient') or '未知'} | "
-                    f"Type={ctx.get('Document_Type') or '未知'} | "
-                    f"Judgment={disc.get('Core_Judgment') or '未提及'}"
+                    f"第{idx + 1}页 | Date={date_field} | "
+                    f"Sender={sender_field} | "
+                    f"Recipient={recipient_field} | "
+                    f"Type={type_field} | "
+                    f"Judgment={judgment_field}"
                 )
             )
         if not lines:
             return ""
-        return "\n".join(lines)
+        capsule = "\n".join(lines)
+        total_limit = int(self._CAPSULE_TOTAL_CHAR_LIMIT or 0)
+        if total_limit > 0 and len(capsule) > total_limit:
+            ellipsis = "\n…(已截断)"
+            keep = max(1, total_limit - len(ellipsis))
+            capsule = capsule[:keep] + ellipsis
+        return capsule
 
     def export_document(self) -> None:
         self._export_text_pages_default()

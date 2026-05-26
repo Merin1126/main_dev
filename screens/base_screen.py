@@ -24,6 +24,7 @@ from config.api_key_store import load_google_api_key as load_gemini_api_key
 from services import CacheService, LlmService, PdfService
 from utils.app_state import AppState
 from utils.docx_export import write_pages_to_docx
+from utils.token_logger import log_context_cache_event
 
 class DocumentTaskState(Enum):
     IDLE = auto()
@@ -99,19 +100,44 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     api_min_request_interval_sec: float = 0.0
     #: Chat Session 历史轮次达到阈值后自动滚动重建（<=0 关闭）
     chat_history_rotate_threshold: int = 12
-    #: v2.6.6 起：是否以有状态 Chat Session 调用 LLM。OCR 走单次调用，Analysis/Translation 启用。
+    #: 是否以有状态 Chat Session 调用 LLM；OCR/Analysis 已切换为无状态生成，Translation 保留 True。
     use_chat_session: bool = False
-    #: Chat Session 的响应 MIME 类型；Analysis 子类应覆盖为 "application/json"。
+    #: Chat Session 的响应 MIME 类型；旧字段，保留兼容 Translation。
     chat_response_mime_type: str = "text/plain"
-    #: Chat Session 的温度参数（仅在 use_chat_session=True 时生效）。
+    #: Chat Session 的温度参数（仅在 use_chat_session=True 时生效）；旧字段，保留兼容。
     chat_temperature: float = 0.3
+    #: 单次生成（stateless）/ Chat 共用的响应 MIME 类型 alias。Analysis 应覆盖为 "application/json"。
+    #: 若子类未设置，运行时回退到 `chat_response_mime_type` 以保证 Translation 等旧路径不被破坏。
+    generation_response_mime_type: str | None = None
+    #: 单次生成（stateless）/ Chat 共用的温度参数 alias。若子类未设置则回退到 `chat_temperature`。
+    generation_temperature: float | None = None
+
+    @classmethod
+    def _effective_generation_response_mime_type(cls) -> str:
+        value = getattr(cls, "generation_response_mime_type", None)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return cls.chat_response_mime_type
+        return str(value)
+
+    @classmethod
+    def _effective_generation_temperature(cls) -> float:
+        value = getattr(cls, "generation_temperature", None)
+        if value is None:
+            return cls.chat_temperature
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return cls.chat_temperature
 
     def get_academic_prompt(self, page_index: int = None) -> str:
         """返回发送给 Gemini 的学术/任务提示词（用于 OCR 单次调用路径）。
 
-        v2.6.6 起，Analysis / Translation 改走 Chat Session（`use_chat_session=True`），
-        系统指令与每轮消息由 `get_system_prompt()` 与 `get_turn_prompt()` 分别提供，
-        本方法对它们不再被调用，可保留默认实现。
+        路由约定：
+        - OCR：仍走单次调用并使用本方法返回的 prompt；
+        - Translation：走有状态 Chat Session，由 `get_system_prompt()` + `get_turn_prompt()` 分担；
+        - Analysis：走无状态 generate + explicit context cache + context capsule，
+          同样由 `get_system_prompt()`（静态进入缓存）+ `get_turn_prompt()`（动态每页）分担。
+        本方法对 Analysis/Translation 不再被调用，可保留默认实现。
         """
         raise NotImplementedError(
             f"{type(self).__name__} 未实现 get_academic_prompt；如已切换 Chat Session，请实现 get_system_prompt/get_turn_prompt。"
@@ -328,7 +354,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.current_ocr_state = DocumentTaskState.IDLE
         self.ocr_pages = []
         self.current_ocr_page_index = 0
-        #: v2.6.6 起：有状态 Chat 会话句柄，每次任务开始时通过 _start_new_chat_session() 重建
+        #: 有状态 Chat 会话句柄（仅 Translation 等启用 `use_chat_session` 的子类使用）；
+        #: 每次任务开始时通过 `_prepare_task_context()` 重建。Analysis 已切换为 stateless 路径，
+        #: 该字段在 Analysis 任务期间始终为 None。
         self.current_chat = None
         self.current_context_cache_name = ""
         self.current_context_cache_meta: dict = {}
@@ -887,6 +915,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         worker.start()
 
     def _run_single_page_worker(self, page_index, pages_text, total_pages, task_id):
+        pdf_path_for_task = self.selected_pdf_path
         try:
             if not self.current_pdf or not self.selected_pdf_path:
                 raise RuntimeError("当前未加载有效的 PDF 文件。")
@@ -905,8 +934,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             file_tag = f"{os.path.basename(self.selected_pdf_path)}_第{page_index + 1}页"
             model_name = self.selected_model_var.get()
 
-            # 单页任务同样初始化一次 Chat Session（即使只发一轮，也借助 system_instruction 走原生强约束）
-            self._start_new_chat_session(api_key, model_name)
+            # 单页任务同样初始化一次任务上下文（Analysis: explicit cache；Translation: chat）。
+            self._prepare_task_context(api_key, model_name)
 
             if type(self).requires_image_input:
                 image_bytes = self.pdf_service.get_page_bytes(page_index)
@@ -982,6 +1011,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 self._set_ocr_state(DocumentTaskState.ERROR)
 
             self.after(0, _apply_single_page_error)
+        finally:
+            self._cleanup_task_context_cache(pdf_path_for_task)
 
     def _start_ocr_worker(self, file_path, task_id):
         worker = threading.Thread(target=self._run_ocr_worker, args=(file_path, task_id), daemon=True)
@@ -1003,6 +1034,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         except Exception as e:
             err_msg = str(e)
             self.after(0, lambda msg=err_msg: self._handle_ocr_failed(task_id, msg))
+        finally:
+            self._cleanup_task_context_cache(file_path)
 
     def _show_ocr_text_result(self, ocr_pages, task_id, from_cache):
         if task_id != self.ocr_task_id:
@@ -1105,8 +1138,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     ),
                 )
 
-        # v2.6.6：进入逐页循环前，初始化（或覆盖）Chat Session，作为 Analysis/Translation 的多轮通道。
-        self._start_new_chat_session(api_key, self.selected_model_var.get())
+        # 进入逐页循环前初始化任务上下文：Analysis 走 explicit cache，Translation 仍走 Chat Session。
+        self._prepare_task_context(api_key, self.selected_model_var.get())
 
         for page_index in range(start_page, total_pages):
             self._ensure_active_task(task_id)
@@ -1302,8 +1335,14 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     def _is_analysis_context_cache_enabled(self) -> bool:
         return bool(
             ANALYSIS_EXPLICIT_CACHE_ENABLED
-            and type(self).use_chat_session
             and not type(self).requires_image_input
+            and type(self).cache_dir_name == "Analysis_Cache"
+        )
+
+    def _uses_stateless_analysis_generation(self) -> bool:
+        """Analysis 无状态通道：单次 generate + explicit context cache + context capsule。"""
+        return bool(
+            not type(self).requires_image_input
             and type(self).cache_dir_name == "Analysis_Cache"
         )
 
@@ -1316,6 +1355,12 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         return max(300, ttl)
 
     def _build_context_cache_payload_text(self, pdf_path: str) -> str:
+        """拼接 OCR 全文作为 explicit cache 的静态上下文。
+
+        【页号连续性】空 OCR 页改为写入占位行而非跳过，确保模型在缓存内看到
+        与实际 PDF 一致的页号序列，避免"丢页"假象。`has_content` 仍按是否
+        存在非空页判断，全空 PDF 直接返回空串，跳过 cache 上传。
+        """
         total_pages = self.pdf_service.count_pages(pdf_path)
         chunks = [
             "以下是该 PDF 的 OCR 全文（按页拼接）。后续问答请以此为文档上下文。",
@@ -1323,10 +1368,11 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         has_content = False
         for idx in range(total_pages):
             page_text = (self._get_ocr_text_for_page(pdf_path, idx) or "").strip()
-            if not page_text:
-                continue
-            has_content = True
-            chunks.append(f"\n[Page {idx + 1}]\n{page_text}")
+            if page_text:
+                has_content = True
+                chunks.append(f"\n[Page {idx + 1}]\n{page_text}")
+            else:
+                chunks.append(f"\n[Page {idx + 1}] (本页 OCR 缺失或空白)")
         return "\n".join(chunks).strip() if has_content else ""
 
     def _build_context_source_fingerprint(
@@ -1354,7 +1400,12 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         cache_name = str(meta.get("cache_name", "")).strip() if isinstance(meta, dict) else ""
         if try_remote_delete and cache_name:
             try:
-                self.llm_service.delete_context_cache(cache_name=cache_name)
+                self.llm_service.delete_context_cache(
+                    cache_name=cache_name,
+                    screen_name=type(self).__name__,
+                    task_name=type(self).task_short_name,
+                    selected_pdf_path=pdf_path,
+                )
             except Exception:
                 pass
         self.cache_service.delete_context_meta(cache_path)
@@ -1407,6 +1458,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                         cache_obj = self.llm_service.update_context_cache_ttl(
                             cache_name=old_cache_name,
                             ttl_seconds=ttl_seconds,
+                            screen_name=type(self).__name__,
+                            task_name=type(self).task_short_name,
+                            selected_pdf_path=self.selected_pdf_path,
                         )
                     refreshed_meta = {
                         "cache_name": old_cache_name,
@@ -1419,10 +1473,27 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     self.cache_service.write_context_meta(cache_path, refreshed_meta)
                     self.current_context_cache_name = old_cache_name
                     self.current_context_cache_meta = refreshed_meta
+                    try:
+                        log_context_cache_event(
+                            event="reuse",
+                            model_name=model_name,
+                            cache_name=old_cache_name,
+                            cache_tokens=0,
+                            ttl_seconds=ttl_seconds,
+                            file_name=os.path.basename(pdf_path),
+                            reused=True,
+                        )
+                    except Exception:
+                        pass
                     return old_cache_name
                 except Exception:
                     try:
-                        self.llm_service.delete_context_cache(cache_name=old_cache_name)
+                        self.llm_service.delete_context_cache(
+                            cache_name=old_cache_name,
+                            screen_name=type(self).__name__,
+                            task_name=type(self).task_short_name,
+                            selected_pdf_path=self.selected_pdf_path,
+                        )
                     except Exception:
                         pass
 
@@ -1692,14 +1763,38 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 pass
         self.start_ocr_recognition()
 
-    def _start_new_chat_session(self, api_key: str, model_name: str) -> None:
-        """在进入逐页循环前调用：渲染 system_prompt 并新建/覆盖 self.current_chat。
+    def _prepare_analysis_context_cache(self, api_key: str, model_name: str) -> str:
+        """Analysis 任务级缓存准备：创建/复用 explicit cache 并记录当前 cache 名称。"""
+        self.current_chat = None
+        self.current_context_cache_name = ""
+        if not self._uses_stateless_analysis_generation():
+            return ""
+        if not self._is_analysis_context_cache_enabled():
+            raise RuntimeError(
+                "Analysis 显式上下文缓存未启用。请在 config/settings.py 中打开 ANALYSIS_EXPLICIT_CACHE_ENABLED。"
+            )
+        self.llm_service.update_api_key(api_key)
+        system_prompt = self.get_system_prompt()
+        cached_content = self._resolve_context_cache_name(
+            api_key=api_key,
+            model_name=model_name,
+            system_prompt=system_prompt,
+        )
+        if not cached_content:
+            raise RuntimeError("Analysis context cache 准备失败：未获取到有效 cached_content。")
+        self.current_context_cache_name = cached_content
+        return cached_content
 
-        - 仅当 `use_chat_session=True` 时生效；否则将 `self.current_chat` 置空走 OCR 单次通道；
-        - 新文档加载或"重新开始"会自动调用一次，从而覆盖旧会话上下文。
+    def _prepare_task_context(self, api_key: str, model_name: str) -> None:
+        """任务级上下文准备：
+        - Analysis（无状态生成）走 explicit context cache 路径；
+        - 其余启用了 chat session 的子类（如 Translation）按需创建 Chat 实例。
         """
         self.current_chat = None
         self.current_context_cache_name = ""
+        if self._uses_stateless_analysis_generation():
+            self._prepare_analysis_context_cache(api_key, model_name)
+            return
         if not type(self).use_chat_session:
             return
         self.llm_service.update_api_key(api_key)
@@ -1744,6 +1839,24 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 return
             raise
 
+    def _start_new_chat_session(self, api_key: str, model_name: str) -> None:
+        """Deprecated（保留兼容）：原始命名暗示总是创建 chat session，已被 `_prepare_task_context` 取代。
+
+        请在新代码中使用 `_prepare_task_context(...)`；本函数仅作为薄包装存在，
+        避免破坏可能存在的外部子类调用点。
+        """
+        self._prepare_task_context(api_key, model_name)
+
+    def _cleanup_task_context_cache(self, pdf_path: str | None) -> None:
+        """任务收尾：无论结果如何，Analysis 任务都主动清理远端 context cache。"""
+        if not self._uses_stateless_analysis_generation():
+            return
+        target_pdf = pdf_path or self.selected_pdf_path
+        self.current_chat = None
+        if not target_pdf:
+            return
+        self._clear_context_cache_for_pdf(target_pdf, try_remote_delete=True)
+
     def _request_page_text(
         self,
         api_key: str,
@@ -1756,6 +1869,51 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     ):
         self.llm_service.update_api_key(api_key)
         enrich_hook = self.enrich_json_data if hasattr(self, "enrich_json_data") else None
+
+        if self._uses_stateless_analysis_generation():
+            turn_prompt = self.get_turn_prompt(page_index, source_text or "")
+            cached_content = self.current_context_cache_name or None
+            if not cached_content:
+                cached_content = self._prepare_analysis_context_cache(api_key, model_name)
+            gen_mime = type(self)._effective_generation_response_mime_type()
+            gen_temp = type(self)._effective_generation_temperature()
+            try:
+                result_text, usage_summary = self.llm_service.generate_text_once(
+                    screen_name=type(self).__name__,
+                    task_name=type(self).task_short_name,
+                    selected_pdf_path=self.selected_pdf_path,
+                    file_name=file_name,
+                    model_name=model_name,
+                    prompt_text=turn_prompt,
+                    behavior_name=type(self).task_short_name,
+                    page_index=page_index,
+                    enrich_json_data=enrich_hook,
+                    response_mime_type=gen_mime,
+                    temperature=gen_temp,
+                    cached_content=cached_content,
+                )
+            except RuntimeError as e:
+                if cached_content and "CACHED_CONTENT_INVALID" in str(e):
+                    self._clear_context_cache_for_pdf(self.selected_pdf_path, try_remote_delete=False)
+                    rebuilt_cache = self._prepare_analysis_context_cache(api_key, model_name)
+                    result_text, usage_summary = self.llm_service.generate_text_once(
+                        screen_name=type(self).__name__,
+                        task_name=type(self).task_short_name,
+                        selected_pdf_path=self.selected_pdf_path,
+                        file_name=file_name,
+                        model_name=model_name,
+                        prompt_text=turn_prompt,
+                        behavior_name=type(self).task_short_name,
+                        page_index=page_index,
+                        enrich_json_data=enrich_hook,
+                        response_mime_type=gen_mime,
+                        temperature=gen_temp,
+                        cached_content=rebuilt_cache,
+                    )
+                else:
+                    raise
+            self.after(0, lambda s=usage_summary: self._accumulate_usage_summary(s))
+            return result_text
 
         if type(self).use_chat_session and self.current_chat is not None:
             rotate_threshold = max(0, int(type(self).chat_history_rotate_threshold))
@@ -1804,7 +1962,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 enrich_json_data=enrich_hook,
             )
         else:
-            # OCR 或未启用 Chat Session 的子类：单次 generate_content
+            # OCR 路径：单次 generate_content（无 chat history，无 explicit cache）。
+            # 注：Analysis 的无状态分支在函数前部已 `return`，本分支不会被 Analysis 命中。
             result_text, usage_summary = self.llm_service.detect_text(
                 screen_name=type(self).__name__,
                 task_name=type(self).task_short_name,

@@ -3,9 +3,9 @@
 {{ context_capsule }}
 </RECOVERY_CONTEXT>
 
-{% endif %}<INSTRUCTION>
-如果文本中出现 Markdown 版式符号（如 #、-、|、**），请忽略版式标记，仅依据语义内容完成抽取。
-</INSTRUCTION>
+{% endif %}<TASK>
+请仅分析当前页内容，并结合上方 RECOVERY_CONTEXT（若存在）维持跨页一致性。不要虚构历史信息；若信息缺失请按 schema 要求填 null、空数组或“未提及”。
+</TASK>
 
 <SOURCE_TEXT page="{{ page_number }}">
 {{ page_text }}

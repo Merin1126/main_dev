@@ -13,7 +13,7 @@ from google.genai import types
 
 from config.api_key_store import load_trace_config
 from utils.gemini_trace_logger import append_trace_event, build_cache_event
-from utils.token_logger import log_gemini_usage
+from utils.token_logger import log_context_cache_event, log_gemini_usage
 
 DEBUG_LOG_PATH = "/Users/merin/本地文稿/Historical Records Scraper/main_dev/.cursor/debug-b75604.log"
 DEBUG_SESSION_ID = "b75604"
@@ -171,9 +171,13 @@ class LlmService:
         )
         append_trace_event(self.project_root, event)
 
-    def _run_with_timeout(self, fn: Callable[[], Any]) -> Any:
-        """阻塞执行 `fn`，超时立即放弃后台线程（避免线程清理拖延主流程）。"""
-        timeout_s = max(1, int(self.timeout_sec))
+    def _run_with_timeout(self, fn: Callable[[], Any], *, timeout_override: int | None = None) -> Any:
+        """阻塞执行 `fn`，超时立即放弃后台线程（避免线程清理拖延主流程）。
+
+        `timeout_override` 用于 cache 生命周期类操作（delete/get/update），
+        这些操作不应被默认 120s 长超时拖累 worker 线程的 finally 清理路径。
+        """
+        timeout_s = max(1, int(timeout_override if timeout_override is not None else self.timeout_sec))
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(fn)
         try:
@@ -183,6 +187,10 @@ class LlmService:
             raise RuntimeError(f"Gemini 请求超时（>{timeout_s}s）")
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+
+    # explicit cache 生命周期类操作的短超时（秒）。
+    # 这些 API 在网络异常时容易挂起，单独短超时避免 finally 清理路径卡死 worker 线程。
+    _CACHE_LIFECYCLE_TIMEOUT_SEC = 15
 
     def _apply_request_rate_gate(self) -> None:
         """软限流：控制相邻请求最小间隔，降低突发频率导致的 429/503。"""
@@ -289,29 +297,101 @@ class LlmService:
             ttl=self._format_ttl_seconds(ttl_seconds),
         )
         try:
-            return self.client.caches.create(model=model_name, config=config)
+            created = self.client.caches.create(model=model_name, config=config)
+            cache_token_count = 0
+            try:
+                # Counting_Tokens 文档建议：count_tokens 参数与 generate_content 基本对齐。
+                count_resp = self.client.models.count_tokens(
+                    model=model_name,
+                    contents=[cache_text or ""],
+                    config=types.GenerateContentConfig(system_instruction=system_instruction),
+                )
+                cache_token_count = int(getattr(count_resp, "total_tokens", 0) or 0)
+            except Exception:
+                cache_token_count = 0
+            try:
+                log_context_cache_event(
+                    event="create",
+                    model_name=model_name,
+                    cache_name=str(getattr(created, "name", "") or ""),
+                    cache_tokens=cache_token_count,
+                    ttl_seconds=ttl_seconds,
+                    file_name=(display_name or "").strip(),
+                    reused=False,
+                )
+            except Exception:
+                pass
+            return created
         except Exception as e:
             raise RuntimeError(f"Gemini context cache 创建失败: {e}")
 
     def get_context_cache(self, *, cache_name: str):
-        """获取 Gemini explicit cache 元数据。"""
+        """获取 Gemini explicit cache 元数据（带短超时保护）。"""
         try:
-            return self.client.caches.get(name=cache_name)
+            return self._run_with_timeout(
+                lambda: self.client.caches.get(name=cache_name),
+                timeout_override=self._CACHE_LIFECYCLE_TIMEOUT_SEC,
+            )
         except Exception as e:
             raise RuntimeError(f"Gemini context cache 获取失败: {e}")
 
-    def update_context_cache_ttl(self, *, cache_name: str, ttl_seconds: int):
-        """更新 Gemini explicit cache TTL。"""
+    def update_context_cache_ttl(
+        self,
+        *,
+        cache_name: str,
+        ttl_seconds: int,
+        screen_name: str | None = None,
+        task_name: str | None = None,
+        selected_pdf_path: str | None = None,
+    ):
+        """更新 Gemini explicit cache TTL（带短超时保护 + 续期 trace）。"""
         config = types.UpdateCachedContentConfig(ttl=self._format_ttl_seconds(ttl_seconds))
         try:
-            return self.client.caches.update(name=cache_name, config=config)
+            result = self._run_with_timeout(
+                lambda: self.client.caches.update(name=cache_name, config=config),
+                timeout_override=self._CACHE_LIFECYCLE_TIMEOUT_SEC,
+            )
+            if screen_name and task_name:
+                self._trace_event(
+                    screen_name=screen_name,
+                    task_name=task_name,
+                    selected_pdf_path=selected_pdf_path,
+                    event="context_cache_refreshed",
+                    payload={
+                        "cache_name": cache_name,
+                        "ttl_seconds": int(ttl_seconds or 0),
+                    },
+                )
+            return result
         except Exception as e:
             raise RuntimeError(f"Gemini context cache 更新失败: {e}")
 
-    def delete_context_cache(self, *, cache_name: str) -> None:
-        """删除 Gemini explicit cache。"""
+    def delete_context_cache(
+        self,
+        *,
+        cache_name: str,
+        screen_name: str | None = None,
+        task_name: str | None = None,
+        selected_pdf_path: str | None = None,
+    ) -> None:
+        """删除 Gemini explicit cache（带短超时保护 + 删除 trace）。
+
+        【⚠️ Keyword-Only 约束】底层 SDK 要求 `name=` 必须显式具名传参，
+        位置参数会触发 TypeError。
+        """
         try:
-            self.client.caches.delete(name=cache_name)
+            self._run_with_timeout(
+                lambda: self.client.caches.delete(name=cache_name),
+                timeout_override=self._CACHE_LIFECYCLE_TIMEOUT_SEC,
+            )
+            if screen_name and task_name:
+                self._trace_event(
+                    screen_name=screen_name,
+                    task_name=task_name,
+                    selected_pdf_path=selected_pdf_path,
+                    event="context_cache_deleted",
+                    payload={"cache_name": cache_name},
+                )
         except Exception as e:
             raise RuntimeError(f"Gemini context cache 删除失败: {e}")
 
@@ -510,6 +590,116 @@ class LlmService:
             page_index=page_index,
             enrich_json_data=enrich_json_data,
         ), usage_summary
+
+    def generate_text_once(
+        self,
+        *,
+        screen_name: str,
+        task_name: str,
+        selected_pdf_path: str | None,
+        file_name: str,
+        model_name: str,
+        prompt_text: str,
+        behavior_name: str,
+        page_index: int | None = None,
+        enrich_json_data: Callable[[dict, str], dict] | None = None,
+        response_mime_type: str = "text/plain",
+        temperature: float = 0.3,
+        cached_content: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """单次文本生成通道：支持 cached_content（无状态 Analysis 主通道）。"""
+        if not self.api_key:
+            raise RuntimeError("未检测到 GOOGLE_GEMINI_API_KEY。请先配置后再调用 Gemini。")
+
+        cfg = self._load_trace_cfg()
+        include_full_text = cfg["include_full_text"]
+        request_started_at = time.perf_counter()
+        clean_prompt = (prompt_text or "").strip()
+
+        self._trace_event(
+            screen_name=screen_name,
+            task_name=task_name,
+            selected_pdf_path=selected_pdf_path,
+            event="request_prepared",
+            payload={
+                "file_name": file_name,
+                "page_index": page_index,
+                "model_name": model_name,
+                "input_kind": "stateless_text",
+                "cached_content": cached_content or "",
+                "response_mime_type": response_mime_type,
+                "temperature": temperature,
+                "prompt_text": self._trace_text(clean_prompt, include_full_text),
+            },
+        )
+
+        config = types.GenerateContentConfig(
+            safety_settings=self.DEFAULT_SAFETY_SETTINGS,
+            response_mime_type=response_mime_type,
+            temperature=temperature,
+            cached_content=(cached_content or None),
+        )
+        try:
+            self._apply_request_rate_gate()
+            response = self._run_with_timeout(
+                lambda: self.client.models.generate_content(
+                    model=model_name,
+                    contents=[clean_prompt],
+                    config=config,
+                )
+            )
+            usage_summary = log_gemini_usage(
+                getattr(response, "usage_metadata", None),
+                file_name,
+                behavior_name,
+                model_name,
+            )
+            raw_text = (response.text or "").strip()
+            elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
+            self._trace_event(
+                screen_name=screen_name,
+                task_name=task_name,
+                selected_pdf_path=selected_pdf_path,
+                event="response_received",
+                payload={
+                    "file_name": file_name,
+                    "page_index": page_index,
+                    "model_name": model_name,
+                    "elapsed_ms": elapsed_ms,
+                    "usage_summary": usage_summary,
+                    "response_text": self._trace_text(raw_text, include_full_text),
+                    "response_len": len(raw_text),
+                },
+            )
+            return self._postprocess_text_result(
+                raw_text=raw_text,
+                screen_name=screen_name,
+                task_name=task_name,
+                selected_pdf_path=selected_pdf_path,
+                file_name=file_name,
+                page_index=page_index,
+                enrich_json_data=enrich_json_data,
+            ), usage_summary
+        except Exception as e:
+            category = self._classify_error(e)
+            self._trace_event(
+                screen_name=screen_name,
+                task_name=task_name,
+                selected_pdf_path=selected_pdf_path,
+                event="request_error",
+                payload={
+                    "file_name": file_name,
+                    "page_index": page_index,
+                    "model_name": model_name,
+                    "cached_content": cached_content or "",
+                    "error": str(e),
+                    "error_category": category,
+                    "elapsed_ms": int((time.perf_counter() - request_started_at) * 1000),
+                },
+            )
+            if cached_content and category == "cached_content_error":
+                raise RuntimeError(f"CACHED_CONTENT_INVALID: {e}")
+            raise RuntimeError(f"Gemini API 调用失败: {e}")
 
     # ------------------------------------------------------------------ #
     # 单次调用：OCR
