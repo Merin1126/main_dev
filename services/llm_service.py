@@ -217,7 +217,16 @@ class LlmService:
             return "server_disconnected"
         if "connection reset" in msg or "connection aborted" in msg:
             return "connection_reset"
+        if "cachedcontent" in msg or "cached content" in msg:
+            return "cached_content_error"
         return "unknown"
+
+    @staticmethod
+    def _format_ttl_seconds(ttl_seconds: int | None) -> str | None:
+        if ttl_seconds is None:
+            return None
+        ttl = max(1, int(ttl_seconds))
+        return f"{ttl}s"
 
     @staticmethod
     def _safe_chat_history(chat) -> list[Any]:
@@ -263,12 +272,56 @@ class LlmService:
     # Chat Session：Analysis / Translation 的有状态多轮通道
     # ------------------------------------------------------------------ #
 
+    def create_context_cache(
+        self,
+        *,
+        model_name: str,
+        system_instruction: str,
+        cache_text: str,
+        ttl_seconds: int | None = None,
+        display_name: str | None = None,
+    ):
+        """创建 Gemini explicit context cache。"""
+        config = types.CreateCachedContentConfig(
+            system_instruction=system_instruction,
+            contents=[cache_text or ""],
+            display_name=(display_name or "").strip() or None,
+            ttl=self._format_ttl_seconds(ttl_seconds),
+        )
+        try:
+            return self.client.caches.create(model=model_name, config=config)
+        except Exception as e:
+            raise RuntimeError(f"Gemini context cache 创建失败: {e}")
+
+    def get_context_cache(self, *, cache_name: str):
+        """获取 Gemini explicit cache 元数据。"""
+        try:
+            return self.client.caches.get(name=cache_name)
+        except Exception as e:
+            raise RuntimeError(f"Gemini context cache 获取失败: {e}")
+
+    def update_context_cache_ttl(self, *, cache_name: str, ttl_seconds: int):
+        """更新 Gemini explicit cache TTL。"""
+        config = types.UpdateCachedContentConfig(ttl=self._format_ttl_seconds(ttl_seconds))
+        try:
+            return self.client.caches.update(name=cache_name, config=config)
+        except Exception as e:
+            raise RuntimeError(f"Gemini context cache 更新失败: {e}")
+
+    def delete_context_cache(self, *, cache_name: str) -> None:
+        """删除 Gemini explicit cache。"""
+        try:
+            self.client.caches.delete(name=cache_name)
+        except Exception as e:
+            raise RuntimeError(f"Gemini context cache 删除失败: {e}")
+
     def start_chat_session(
         self,
         model_name: str,
         system_instruction: str,
         response_mime_type: str = "text/plain",
         temperature: float = 0.3,
+        cached_content: str | None = None,
         *,
         screen_name: str | None = None,
         task_name: str | None = None,
@@ -278,13 +331,21 @@ class LlmService:
 
         【⚠️ Keyword-Only 约束】底层 SDK 要求 `model=`、`config=` 必须显式具名传参。
         """
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type=response_mime_type,
-            temperature=temperature,
-            safety_settings=self.DEFAULT_SAFETY_SETTINGS,
-        )
-        chat = self.client.chats.create(model=model_name, config=config)
+        config_kwargs = {
+            "response_mime_type": response_mime_type,
+            "temperature": temperature,
+            "safety_settings": self.DEFAULT_SAFETY_SETTINGS,
+            "cached_content": (cached_content or None),
+        }
+        if not cached_content:
+            config_kwargs["system_instruction"] = system_instruction
+        config = types.GenerateContentConfig(**config_kwargs)
+        try:
+            chat = self.client.chats.create(model=model_name, config=config)
+        except Exception as e:
+            if cached_content:
+                raise RuntimeError(f"CACHED_CONTENT_INVALID: {e}")
+            raise RuntimeError(f"Gemini Chat 会话创建失败: {e}")
         session_id = uuid.uuid4().hex[:12]
         try:
             setattr(chat, "_hrs_session_id", session_id)
@@ -305,6 +366,7 @@ class LlmService:
                     "model_name": model_name,
                     "response_mime_type": response_mime_type,
                     "temperature": temperature,
+                    "cached_content": cached_content or "",
                     "history_turn_count": 0,
                     "system_instruction": self._trace_text(system_instruction, include_full_text),
                 },

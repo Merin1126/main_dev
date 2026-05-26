@@ -3,16 +3,23 @@ from __future__ import annotations
 import os
 import json
 import re
+import hashlib
 import threading
 import time
 import random
+from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from components.ui.button import Button
-from config.settings import Color
+from config.settings import (
+    Color,
+    ANALYSIS_EXPLICIT_CACHE_ENABLED,
+    ANALYSIS_CACHE_TTL_SECONDS,
+    ANALYSIS_CACHE_AUTO_REFRESH_TTL,
+)
 from config.api_key_store import load_google_api_key as load_gemini_api_key
 from services import CacheService, LlmService, PdfService
 from utils.app_state import AppState
@@ -323,6 +330,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.current_ocr_page_index = 0
         #: v2.6.6 起：有状态 Chat 会话句柄，每次任务开始时通过 _start_new_chat_session() 重建
         self.current_chat = None
+        self.current_context_cache_name = ""
+        self.current_context_cache_meta: dict = {}
         self.session_prompt_non_cached = 0
         self.session_cached_tokens = 0
         self.session_output_tokens = 0
@@ -716,6 +725,8 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.cancel_ocr_task(silent=True)
         # 切换 PDF 即视为新文档：清空旧 Chat Session 上下文。
         self.current_chat = None
+        self.current_context_cache_name = ""
+        self.current_context_cache_meta = {}
 
         if self.current_pdf:
             self.pdf_service.close()
@@ -1270,6 +1281,175 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     def _build_cache_path(self, pdf_path):
         return self.cache_service.build_cache_path(pdf_path, self.document_cache_dir)
 
+    @staticmethod
+    def _iso_utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _to_iso_datetime(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        iso = getattr(value, "isoformat", None)
+        if callable(iso):
+            try:
+                return iso()
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def _is_analysis_context_cache_enabled(self) -> bool:
+        return bool(
+            ANALYSIS_EXPLICIT_CACHE_ENABLED
+            and type(self).use_chat_session
+            and not type(self).requires_image_input
+            and type(self).cache_dir_name == "Analysis_Cache"
+        )
+
+    @staticmethod
+    def _effective_context_cache_ttl_seconds() -> int:
+        try:
+            ttl = int(ANALYSIS_CACHE_TTL_SECONDS)
+        except (TypeError, ValueError):
+            ttl = 7200
+        return max(300, ttl)
+
+    def _build_context_cache_payload_text(self, pdf_path: str) -> str:
+        total_pages = self.pdf_service.count_pages(pdf_path)
+        chunks = [
+            "以下是该 PDF 的 OCR 全文（按页拼接）。后续问答请以此为文档上下文。",
+        ]
+        has_content = False
+        for idx in range(total_pages):
+            page_text = (self._get_ocr_text_for_page(pdf_path, idx) or "").strip()
+            if not page_text:
+                continue
+            has_content = True
+            chunks.append(f"\n[Page {idx + 1}]\n{page_text}")
+        return "\n".join(chunks).strip() if has_content else ""
+
+    def _build_context_source_fingerprint(
+        self,
+        *,
+        pdf_path: str,
+        model_name: str,
+        system_prompt: str,
+        source_text: str,
+    ) -> str:
+        stat = os.stat(pdf_path)
+        system_hash = hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()
+        source_hash = hashlib.sha256((source_text or "").encode("utf-8")).hexdigest()
+        seed = (
+            f"{pdf_path}|{stat.st_mtime_ns}|{stat.st_size}|"
+            f"{model_name}|{system_hash}|{source_hash}"
+        )
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+    def _clear_context_cache_for_pdf(self, pdf_path: str, *, try_remote_delete: bool) -> None:
+        if not pdf_path:
+            return
+        cache_path = self._build_cache_path(pdf_path)
+        meta = self.cache_service.read_context_meta(cache_path)
+        cache_name = str(meta.get("cache_name", "")).strip() if isinstance(meta, dict) else ""
+        if try_remote_delete and cache_name:
+            try:
+                self.llm_service.delete_context_cache(cache_name=cache_name)
+            except Exception:
+                pass
+        self.cache_service.delete_context_meta(cache_path)
+        if self.selected_pdf_path == pdf_path:
+            self.current_context_cache_name = ""
+            self.current_context_cache_meta = {}
+
+    def _resolve_context_cache_name(
+        self,
+        *,
+        api_key: str,
+        model_name: str,
+        system_prompt: str,
+    ) -> str | None:
+        if not self._is_analysis_context_cache_enabled():
+            return None
+        pdf_path = self.selected_pdf_path
+        if not pdf_path:
+            return None
+
+        source_text = self._build_context_cache_payload_text(pdf_path)
+        if not source_text:
+            return None
+
+        ttl_seconds = self._effective_context_cache_ttl_seconds()
+        cache_path = self._build_cache_path(pdf_path)
+        system_prompt_version = hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()
+        source_fingerprint = self._build_context_source_fingerprint(
+            pdf_path=pdf_path,
+            model_name=model_name,
+            system_prompt=system_prompt,
+            source_text=source_text,
+        )
+        old_meta = self.cache_service.read_context_meta(cache_path)
+        if isinstance(old_meta, dict):
+            old_cache_name = str(old_meta.get("cache_name", "")).strip()
+            old_model = str(old_meta.get("model", "")).strip()
+            old_fingerprint = str(old_meta.get("source_fingerprint", "")).strip()
+            old_prompt_ver = str(old_meta.get("system_prompt_version", "")).strip()
+            if (
+                old_cache_name
+                and old_model == model_name
+                and old_fingerprint == source_fingerprint
+                and old_prompt_ver == system_prompt_version
+            ):
+                try:
+                    self.llm_service.update_api_key(api_key)
+                    cache_obj = self.llm_service.get_context_cache(cache_name=old_cache_name)
+                    if ANALYSIS_CACHE_AUTO_REFRESH_TTL:
+                        cache_obj = self.llm_service.update_context_cache_ttl(
+                            cache_name=old_cache_name,
+                            ttl_seconds=ttl_seconds,
+                        )
+                    refreshed_meta = {
+                        "cache_name": old_cache_name,
+                        "model": model_name,
+                        "created_at": old_meta.get("created_at") or self._iso_utc_now(),
+                        "expire_time": self._to_iso_datetime(getattr(cache_obj, "expire_time", "")),
+                        "source_fingerprint": source_fingerprint,
+                        "system_prompt_version": system_prompt_version,
+                    }
+                    self.cache_service.write_context_meta(cache_path, refreshed_meta)
+                    self.current_context_cache_name = old_cache_name
+                    self.current_context_cache_meta = refreshed_meta
+                    return old_cache_name
+                except Exception:
+                    try:
+                        self.llm_service.delete_context_cache(cache_name=old_cache_name)
+                    except Exception:
+                        pass
+
+        self.llm_service.update_api_key(api_key)
+        created = self.llm_service.create_context_cache(
+            model_name=model_name,
+            system_instruction=system_prompt,
+            cache_text=source_text,
+            ttl_seconds=ttl_seconds,
+            display_name=f"analysis:{os.path.basename(pdf_path)}",
+        )
+        new_cache_name = str(getattr(created, "name", "")).strip()
+        if not new_cache_name:
+            return None
+        new_meta = {
+            "cache_name": new_cache_name,
+            "model": model_name,
+            "created_at": self._iso_utc_now(),
+            "expire_time": self._to_iso_datetime(getattr(created, "expire_time", "")),
+            "source_fingerprint": source_fingerprint,
+            "system_prompt_version": system_prompt_version,
+        }
+        self.cache_service.write_context_meta(cache_path, new_meta)
+        self.current_context_cache_name = new_cache_name
+        self.current_context_cache_meta = new_meta
+        return new_cache_name
+
     def _ensure_active_task(self, task_id):
         if task_id != self.ocr_task_id or self.ocr_cancel_event.is_set():
             raise RuntimeError("DOC_TASK_CANCELLED")
@@ -1483,6 +1663,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
         current_pdf_name = os.path.basename(self.selected_pdf_path)
         cache_path = self._build_cache_path(self.selected_pdf_path)
+        self._clear_context_cache_for_pdf(self.selected_pdf_path, try_remote_delete=True)
         if not os.path.exists(cache_path):
             messagebox.showinfo("提示", "当前文件无缓存。")
             return
@@ -1503,6 +1684,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             return
 
         cache_path = self._build_cache_path(self.selected_pdf_path)
+        self._clear_context_cache_for_pdf(self.selected_pdf_path, try_remote_delete=True)
         if os.path.exists(cache_path):
             try:
                 os.remove(cache_path)
@@ -1517,19 +1699,50 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         - 新文档加载或"重新开始"会自动调用一次，从而覆盖旧会话上下文。
         """
         self.current_chat = None
+        self.current_context_cache_name = ""
         if not type(self).use_chat_session:
             return
         self.llm_service.update_api_key(api_key)
         system_prompt = self.get_system_prompt()
-        self.current_chat = self.llm_service.start_chat_session(
+        cached_content = self._resolve_context_cache_name(
+            api_key=api_key,
             model_name=model_name,
-            system_instruction=system_prompt,
-            response_mime_type=type(self).chat_response_mime_type,
-            temperature=type(self).chat_temperature,
-            screen_name=type(self).__name__,
-            task_name=type(self).task_short_name,
-            selected_pdf_path=self.selected_pdf_path,
+            system_prompt=system_prompt,
         )
+        try:
+            self.current_chat = self.llm_service.start_chat_session(
+                model_name=model_name,
+                system_instruction=system_prompt,
+                response_mime_type=type(self).chat_response_mime_type,
+                temperature=type(self).chat_temperature,
+                cached_content=cached_content,
+                screen_name=type(self).__name__,
+                task_name=type(self).task_short_name,
+                selected_pdf_path=self.selected_pdf_path,
+            )
+            self.current_context_cache_name = cached_content or ""
+        except RuntimeError as e:
+            if cached_content and "CACHED_CONTENT_INVALID" in str(e):
+                # 显式缓存过期/失效后仅重建一次，避免无限重试。
+                self._clear_context_cache_for_pdf(self.selected_pdf_path, try_remote_delete=False)
+                rebuilt_cache = self._resolve_context_cache_name(
+                    api_key=api_key,
+                    model_name=model_name,
+                    system_prompt=system_prompt,
+                )
+                self.current_chat = self.llm_service.start_chat_session(
+                    model_name=model_name,
+                    system_instruction=system_prompt,
+                    response_mime_type=type(self).chat_response_mime_type,
+                    temperature=type(self).chat_temperature,
+                    cached_content=rebuilt_cache,
+                    screen_name=type(self).__name__,
+                    task_name=type(self).task_short_name,
+                    selected_pdf_path=self.selected_pdf_path,
+                )
+                self.current_context_cache_name = rebuilt_cache or ""
+                return
+            raise
 
     def _request_page_text(
         self,

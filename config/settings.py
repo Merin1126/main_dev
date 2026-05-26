@@ -18,6 +18,13 @@ OCR_PREPROCESS_PROFILES = {
     "strong": {"contrast": 1.5, "sharpness": 1.2},
 }
 
+# Analysis explicit context cache 开关（Gemini cachedContents）
+ANALYSIS_EXPLICIT_CACHE_ENABLED = False
+# 显式缓存默认 TTL（秒）
+ANALYSIS_CACHE_TTL_SECONDS = 7200
+# 命中已有缓存时是否自动续期
+ANALYSIS_CACHE_AUTO_REFRESH_TTL = True
+
 # 保留给未来可能需要的图片组件结构
 imagesTupple = namedtuple("images", ["light", "dark"])
 

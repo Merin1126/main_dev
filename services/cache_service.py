@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import re
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 
 class CacheService:
@@ -49,6 +49,40 @@ class CacheService:
             except OSError:
                 failed_count += 1
         return removed_count, failed_count
+
+    @staticmethod
+    def build_context_sidecar_path(cache_path: str) -> str:
+        base, _ext = os.path.splitext(cache_path)
+        return f"{base}.context.json"
+
+    def read_context_meta(self, cache_path: str) -> dict[str, Any]:
+        sidecar_path = self.build_context_sidecar_path(cache_path)
+        if not os.path.isfile(sidecar_path):
+            return {}
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def write_context_meta(self, cache_path: str, payload: dict[str, Any]) -> str:
+        sidecar_path = self.build_context_sidecar_path(cache_path)
+        safe_payload = payload if isinstance(payload, dict) else {}
+        encoded = json.dumps(safe_payload, ensure_ascii=False, indent=2)
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            f.write(encoded)
+        return encoded
+
+    def delete_context_meta(self, cache_path: str) -> bool:
+        sidecar_path = self.build_context_sidecar_path(cache_path)
+        if not os.path.exists(sidecar_path):
+            return False
+        try:
+            os.remove(sidecar_path)
+            return True
+        except OSError:
+            return False
 
     def parse_paged_text(self, cached_text: str) -> List[str]:
         try:
