@@ -26,7 +26,7 @@ v2.6.6 起对齐新版 SDK 的 `response.usage_metadata` 字段语义：
 """
 
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -52,6 +52,24 @@ def _safe_int(usage_metadata, key: str) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def storage_hours_between(iso_anchor: str, *, end: datetime | None = None) -> float:
+    """根据 ISO 时间锚点计算 storage 计费小时数（用于 explicit cache 存活时长估算）。"""
+    text = (iso_anchor or "").strip()
+    if not text:
+        return 0.0
+    try:
+        normalized = text.replace("Z", "+00:00") if text.endswith("Z") else text
+        start = datetime.fromisoformat(normalized)
+    except Exception:
+        return 0.0
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    end_dt = end or datetime.now(timezone.utc)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (end_dt - start).total_seconds() / 3600.0)
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -228,13 +246,15 @@ def log_context_cache_event(
     behavior_name: str = "analysis_context_cache",
     storage_hours: float | None = None,
     reused: bool = False,
+    bill_write: bool | None = None,
 ) -> dict:
     """记录 explicit context cache 的创建/复用/删除/续期成本估算。
 
     - event: create / reuse / delete / refresh
-    - cache_tokens: 缓存文本对应 token 数（建议来自 count_tokens）
-    - reused: 是否命中已有 cache（True 表示节省了 cache write 费用）。
-      reuse 路径下 `write_cost_usd` 强制写 0，仅记录存储费估算便于审计。
+    - cache_tokens: 缓存文本 token 数（优先 CachedContent.usage_metadata.total_token_count）
+    - storage_hours: 本次结算的存储时长；create 应为 0，reuse/delete 传实际存活增量
+    - reused: 是否命中已有 cache（True 表示未发生新的 cache write）
+    - bill_write: 是否计入 write 费；默认仅 create 为 True，delete/reuse 为 False
     """
     cached_tokens = max(0, int(cache_tokens or 0))
     pricing = _resolve_model_pricing(model_name, cached_tokens)
@@ -246,7 +266,9 @@ def log_context_cache_event(
     else:
         storage_hours = max(0.0, _safe_float(storage_hours))
 
-    if reused:
+    if bill_write is None:
+        bill_write = event == "create" and not reused
+    if reused or not bill_write:
         write_cost_usd = 0.0
     else:
         write_cost_usd = (cached_tokens / 1_000_000) * write_price_per_m

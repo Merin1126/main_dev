@@ -1,10 +1,13 @@
 import customtkinter as ctk
 import os
+import threading
+from datetime import datetime, timezone
 from tkinter import messagebox
 
 from components.ui.button import Button
 from config.settings import Color
 from screens.report_summary_window import ReportSummaryWindow
+from services import LlmService
 from utils.trace_report import convert_current_trace_to_md, delete_current_converted_trace_md
 from config.api_key_store import (
     load_google_api_key as load_gemini_api_key,
@@ -84,6 +87,38 @@ class SettingScreen(ctk.CTkFrame):
             font=("Arial", 12),
             text_color=Color.TEXT_HINT_TUPLE
         ).pack(anchor="w", padx=16, pady=(2, 16))
+
+        ctk.CTkLabel(
+            container,
+            text="Analysis 云端 Context Cache（explicit cache）",
+            font=("Arial", 14),
+        ).pack(anchor="w", padx=16, pady=(8, 6))
+
+        ctk.CTkLabel(
+            container,
+            text="查询当前 Google 账号下仍生效的上下文缓存。未删除的 cache 可能继续产生存储费用。",
+            font=("Arial", 12),
+            text_color=Color.TEXT_HINT_TUPLE,
+            wraplength=560,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        Button(
+            container,
+            text="检测活动中的云端 Cache",
+            width=240,
+            height=40,
+            command=self.check_active_context_caches,
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        self.cache_check_hint_label = ctk.CTkLabel(
+            container,
+            text="尚未检测。",
+            font=("Arial", 12),
+            wraplength=560,
+            justify="left",
+        )
+        self.cache_check_hint_label.pack(anchor="w", padx=16, pady=(0, 14))
 
         ctk.CTkLabel(
             container,
@@ -249,6 +284,138 @@ class SettingScreen(ctk.CTkFrame):
         self.api_entry.delete(0, "end")
         self.api_hint_label.configure(text=f"当前状态：已配置（{mask_api_key(raw_key)}）")
         messagebox.showinfo("成功", "Gemini API Key 已保存到本地安全配置。")
+
+    @staticmethod
+    def _format_cache_expire_time(expire_time) -> str:
+        if expire_time is None:
+            return "未知"
+        if isinstance(expire_time, str):
+            text = expire_time.strip()
+            return text if text else "未知"
+        iso = getattr(expire_time, "isoformat", None)
+        if callable(iso):
+            try:
+                return iso()
+            except Exception:
+                return str(expire_time)
+        return str(expire_time)
+
+    @staticmethod
+    def _cache_remaining_seconds(expire_time) -> int | None:
+        text = SettingScreen._format_cache_expire_time(expire_time)
+        if not text or text == "未知":
+            return None
+        try:
+            normalized = text.replace("Z", "+00:00") if text.endswith("Z") else text
+            expire_dt = datetime.fromisoformat(normalized)
+        except Exception:
+            return None
+        if expire_dt.tzinfo is None:
+            expire_dt = expire_dt.replace(tzinfo=timezone.utc)
+        return int((expire_dt - datetime.now(timezone.utc)).total_seconds())
+
+    def check_active_context_caches(self):
+        """后台拉取 `client.caches.list()`，汇总仍生效的 explicit context cache。"""
+        api_key = (
+            os.getenv("GOOGLE_GEMINI_API_KEY", "").strip()
+            or os.getenv("GOOGLE_VISION_API_KEY", "").strip()
+            or load_gemini_api_key()
+        )
+        if not api_key:
+            messagebox.showwarning("提示", "请先配置 Gemini API Key 后再检测云端 Cache。")
+            return
+        self.cache_check_hint_label.configure(text="正在检测云端 Cache，请稍候…")
+        threading.Thread(
+            target=self._run_active_context_cache_check,
+            args=(api_key,),
+            daemon=True,
+        ).start()
+
+    def _run_active_context_cache_check(self, api_key: str) -> None:
+        try:
+            llm = LlmService(api_key=api_key, project_root=self.project_root, timeout_sec=30)
+            all_caches = llm.list_context_caches()
+            active_rows: list[dict[str, str]] = []
+            for cache in all_caches or []:
+                remaining = self._cache_remaining_seconds(getattr(cache, "expire_time", None))
+                if remaining is not None and remaining <= 0:
+                    continue
+                display = str(getattr(cache, "display_name", "") or "").strip()
+                active_rows.append(
+                    {
+                        "name": str(getattr(cache, "name", "") or "").strip() or "（无 ID）",
+                        "model": str(getattr(cache, "model", "") or "").strip() or "未知",
+                        "display_name": display or "（未设置）",
+                        "expire_time": self._format_cache_expire_time(getattr(cache, "expire_time", None)),
+                        "remaining": (
+                            f"{remaining // 60} 分钟" if remaining is not None and remaining >= 0 else "未知"
+                        ),
+                        "is_analysis": "是" if display.startswith("analysis:") else "否",
+                    }
+                )
+
+            lines: list[str] = []
+            lines.append(f"检测时间（UTC）：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"活动中的 Cache 数量：{len(active_rows)}")
+            analysis_count = sum(1 for row in active_rows if row["is_analysis"] == "是")
+            lines.append(f"其中本程序 Analysis 创建（display_name 以 analysis: 开头）：{analysis_count}")
+            lines.append("")
+            if not active_rows:
+                lines.append("当前账号下没有检测到仍生效的 explicit context cache。")
+                lines.append("（已过期项不会列入；若刚删除，列表可能稍后才会更新。）")
+            else:
+                for idx, row in enumerate(active_rows, start=1):
+                    lines.append(f"【{idx}】")
+                    lines.append(f"  缓存名称 (ID)：{row['name']}")
+                    lines.append(f"  绑定的模型：{row['model']}")
+                    lines.append(f"  display_name：{row['display_name']}")
+                    lines.append(f"  到期时间：{row['expire_time']}")
+                    lines.append(f"  剩余约：{row['remaining']}")
+                    lines.append(f"  是否 Analysis 任务：{row['is_analysis']}")
+                    lines.append("-" * 40)
+
+            report = "\n".join(lines)
+            summary = (
+                f"上次检测：{len(active_rows)} 个活动 cache"
+                f"（Analysis：{analysis_count}）"
+            )
+            self.after(0, lambda: self._apply_cache_check_result(summary, report))
+        except Exception as e:
+            err = str(e)
+            self.after(
+                0,
+                lambda: self._apply_cache_check_error(err),
+            )
+
+    def _apply_cache_check_result(self, summary: str, report: str) -> None:
+        self.cache_check_hint_label.configure(text=summary)
+        self._show_cache_check_dialog("云端 Context Cache 检测结果", report)
+
+    def _apply_cache_check_error(self, err: str) -> None:
+        self.cache_check_hint_label.configure(text="检测失败，请查看错误详情。")
+        messagebox.showerror("检测失败", f"无法列出云端 Context Cache：\n{err}")
+
+    def _show_cache_check_dialog(self, title: str, body: str) -> None:
+        win = ctk.CTkToplevel(self)
+        win.title(title)
+        win.geometry("760x520")
+        win.transient(self.winfo_toplevel())
+        ctk.CTkLabel(
+            win,
+            text=title,
+            font=("Arial", 15, "bold"),
+        ).pack(anchor="w", padx=14, pady=(12, 6))
+        textbox = ctk.CTkTextbox(win, wrap="word", font=("Menlo", 12))
+        textbox.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        textbox.insert("0.0", body)
+        textbox.configure(state="disabled")
+        Button(
+            win,
+            text="关闭",
+            width=120,
+            height=36,
+            command=win.destroy,
+        ).pack(pady=(0, 12))
 
     def clear_api_key(self):
         removed = clear_gemini_api_key()

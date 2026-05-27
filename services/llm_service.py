@@ -226,6 +226,31 @@ class LlmService:
     # 这些 API 在网络异常时容易挂起，单独短超时避免 finally 清理路径卡死 worker 线程。
     _CACHE_LIFECYCLE_TIMEOUT_SEC = 15
 
+    # Gemini CreateCachedContentConfig.display_name 上限（API 校验 len($) <= 128，按 UTF-8 字节计）。
+    _CACHE_DISPLAY_NAME_MAX_BYTES = 128
+
+    @classmethod
+    def clamp_context_cache_display_name(cls, display_name: str | None) -> str | None:
+        """将 display_name 截断到 Gemini API 允许的 128 UTF-8 字节以内。
+
+        API 的 `len($) <= 128` 按 UTF-8 字节计，不能仅用 Python len(text)（日文文件名常字符少、字节多）。
+        完整文件名应写入成本日志的 file_name 字段，而非依赖 display_name。
+        """
+        text = (display_name or "").strip()
+        if not text:
+            return None
+        max_bytes = int(cls._CACHE_DISPLAY_NAME_MAX_BYTES)
+        encoded = text.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return text
+        cut = encoded[:max_bytes]
+        while cut:
+            try:
+                return cut.decode("utf-8")
+            except UnicodeDecodeError:
+                cut = cut[:-1]
+        return "analysis:cache"
+
     def _apply_request_rate_gate(self) -> None:
         """软限流：控制相邻请求最小间隔，降低突发频率导致的 429/503。"""
         min_gap = max(0.0, float(self.min_interval_sec or 0.0))
@@ -310,6 +335,64 @@ class LlmService:
                 return "\n".join(chunks).strip()
         return ""
 
+    @staticmethod
+    def extract_context_cache_token_count(cache_obj: Any) -> int:
+        """从 CachedContent.usage_metadata 读取 token 数（官方 caches.create 响应自带）。"""
+        if cache_obj is None:
+            return 0
+        usage = getattr(cache_obj, "usage_metadata", None)
+        if usage is None:
+            return 0
+        for key in ("total_token_count", "total_tokens"):
+            try:
+                value = (
+                    usage.get(key, 0)
+                    if isinstance(usage, dict)
+                    else getattr(usage, key, 0)
+                )
+                count = int(value or 0)
+                if count > 0:
+                    return count
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    @staticmethod
+    def extract_context_cache_create_time_iso(cache_obj: Any) -> str:
+        """从 CachedContent.create_time 提取 ISO 时间（用于 storage 存活时长锚点）。"""
+        if cache_obj is None:
+            return ""
+        create_time = getattr(cache_obj, "create_time", None)
+        if create_time is None:
+            return ""
+        if isinstance(create_time, str):
+            return create_time.strip()
+        iso = getattr(create_time, "isoformat", None)
+        if callable(iso):
+            try:
+                return iso()
+            except Exception:
+                return str(create_time)
+        return str(create_time)
+
+    def _count_context_cache_tokens_fallback(
+        self,
+        *,
+        model_name: str,
+        system_instruction: str,
+        cache_text: str,
+    ) -> int:
+        """count_tokens 兜底：官方文档注明 caching 暂不支持统一 count_tokens，失败时返回 0。"""
+        try:
+            count_resp = self.client.models.count_tokens(
+                model=model_name,
+                contents=[cache_text or ""],
+                config=types.GenerateContentConfig(system_instruction=system_instruction),
+            )
+            return int(getattr(count_resp, "total_tokens", 0) or 0)
+        except Exception:
+            return 0
+
     # ------------------------------------------------------------------ #
     # Chat Session：Analysis / Translation 的有状态多轮通道
     # ------------------------------------------------------------------ #
@@ -324,34 +407,34 @@ class LlmService:
         display_name: str | None = None,
     ):
         """创建 Gemini explicit context cache。"""
+        raw_display_name = (display_name or "").strip()
+        safe_display_name = self.clamp_context_cache_display_name(raw_display_name)
         config = types.CreateCachedContentConfig(
             system_instruction=system_instruction,
             contents=[cache_text or ""],
-            display_name=(display_name or "").strip() or None,
+            display_name=safe_display_name,
             ttl=self._format_ttl_seconds(ttl_seconds),
         )
         try:
             created = self.client.caches.create(model=model_name, config=config)
-            cache_token_count = 0
-            try:
-                # Counting_Tokens 文档建议：count_tokens 参数与 generate_content 基本对齐。
-                count_resp = self.client.models.count_tokens(
-                    model=model_name,
-                    contents=[cache_text or ""],
-                    config=types.GenerateContentConfig(system_instruction=system_instruction),
+            cache_token_count = self.extract_context_cache_token_count(created)
+            if cache_token_count <= 0:
+                cache_token_count = self._count_context_cache_tokens_fallback(
+                    model_name=model_name,
+                    system_instruction=system_instruction,
+                    cache_text=cache_text,
                 )
-                cache_token_count = int(getattr(count_resp, "total_tokens", 0) or 0)
-            except Exception:
-                cache_token_count = 0
             try:
                 log_context_cache_event(
                     event="create",
                     model_name=model_name,
                     cache_name=str(getattr(created, "name", "") or ""),
                     cache_tokens=cache_token_count,
+                    storage_hours=0.0,
                     ttl_seconds=ttl_seconds,
-                    file_name=(display_name or "").strip(),
+                    file_name=raw_display_name or (safe_display_name or ""),
                     reused=False,
+                    bill_write=True,
                 )
             except Exception:
                 pass
@@ -431,17 +514,35 @@ class LlmService:
         screen_name: str | None = None,
         task_name: str | None = None,
         selected_pdf_path: str | None = None,
+        cost_log: dict[str, Any] | None = None,
     ) -> None:
         """删除 Gemini explicit cache（带短超时保护 + 删除 trace）。
 
         【⚠️ Keyword-Only 约束】底层 SDK 要求 `name=` 必须显式具名传参，
         位置参数会触发 TypeError。
+
+        `cost_log`（可选）由调用方传入已算好的 storage 结算字段，用于写入
+        `api_cache_cost_log.csv` 的 delete 行。
         """
         try:
             self._run_with_timeout(
                 lambda: self.client.caches.delete(name=cache_name),
                 timeout_override=self._CACHE_LIFECYCLE_TIMEOUT_SEC,
             )
+            if isinstance(cost_log, dict) and cost_log:
+                try:
+                    log_context_cache_event(
+                        event="delete",
+                        model_name=str(cost_log.get("model_name", "") or ""),
+                        cache_name=cache_name,
+                        cache_tokens=int(cost_log.get("cache_tokens", 0) or 0),
+                        storage_hours=float(cost_log.get("storage_hours", 0) or 0),
+                        file_name=str(cost_log.get("file_name", "") or ""),
+                        reused=False,
+                        bill_write=False,
+                    )
+                except Exception:
+                    pass
             if screen_name and task_name:
                 self._trace_event(
                     screen_name=screen_name,

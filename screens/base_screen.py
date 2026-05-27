@@ -25,7 +25,7 @@ from config.api_key_store import load_google_api_key as load_gemini_api_key
 from services import CacheService, LlmService, PdfService
 from utils.app_state import AppState
 from utils.docx_export import write_pages_to_docx
-from utils.token_logger import log_context_cache_event
+from utils.token_logger import log_context_cache_event, storage_hours_between
 
 class DocumentTaskState(Enum):
     IDLE = auto()
@@ -1416,6 +1416,101 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 chunks.append(f"\n[Page {idx + 1}] (本页 OCR 缺失或空白)")
         return "\n".join(chunks).strip() if has_content else ""
 
+    def _resolve_context_cache_tokens(self, cache_obj, meta: dict | None) -> int:
+        """优先 CachedContent.usage_metadata，其次 sidecar 中的 cache_token_count。"""
+        count = self.llm_service.extract_context_cache_token_count(cache_obj)
+        if count > 0:
+            return count
+        if isinstance(meta, dict):
+            try:
+                return max(0, int(meta.get("cache_token_count", 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    @staticmethod
+    def _context_cache_storage_anchor(meta: dict | None) -> str:
+        if not isinstance(meta, dict):
+            return ""
+        return str(
+            meta.get("storage_cost_anchor_at") or meta.get("created_at") or ""
+        ).strip()
+
+    def _build_context_cache_cost_log_payload(
+        self,
+        *,
+        pdf_path: str | None,
+        meta: dict | None,
+        cache_obj=None,
+        model_name: str | None = None,
+    ) -> dict:
+        """组装 reuse/delete 写入 api_cache_cost_log 的字段。"""
+        meta = meta if isinstance(meta, dict) else {}
+        resolved_model = (
+            (model_name or "").strip()
+            or str(meta.get("model", "")).strip()
+            or (self.selected_model_var.get() if hasattr(self, "selected_model_var") else "")
+        )
+        if resolved_model.startswith("models/"):
+            resolved_model = resolved_model[len("models/") :]
+        anchor = self._context_cache_storage_anchor(meta)
+        if not anchor and cache_obj is not None:
+            anchor = self.llm_service.extract_context_cache_create_time_iso(cache_obj)
+        return {
+            "model_name": resolved_model,
+            "cache_tokens": self._resolve_context_cache_tokens(cache_obj, meta),
+            "storage_hours": storage_hours_between(anchor) if anchor else 0.0,
+            "file_name": os.path.basename(pdf_path) if pdf_path else "",
+        }
+
+    def _emit_context_cache_storage_cost(
+        self,
+        *,
+        event: str,
+        pdf_path: str | None,
+        cache_name: str,
+        meta: dict | None,
+        cache_obj=None,
+        model_name: str | None = None,
+        cache_path: str | None = None,
+        advance_anchor: bool = False,
+    ) -> None:
+        """记录 reuse/delete 的 storage 切片（create 的 write 在 llm_service 内结算）。"""
+        if not self._is_analysis_context_cache_enabled():
+            return
+        payload = self._build_context_cache_cost_log_payload(
+            pdf_path=pdf_path,
+            meta=meta,
+            cache_obj=cache_obj,
+            model_name=model_name,
+        )
+        storage_hours = float(payload.get("storage_hours", 0) or 0)
+        if storage_hours <= 0 and event == "reuse":
+            return
+        try:
+            log_context_cache_event(
+                event=event,
+                model_name=str(payload.get("model_name", "") or ""),
+                cache_name=cache_name,
+                cache_tokens=int(payload.get("cache_tokens", 0) or 0),
+                storage_hours=storage_hours,
+                file_name=str(payload.get("file_name", "") or ""),
+                reused=(event == "reuse"),
+                bill_write=False,
+            )
+        except Exception:
+            return
+        if advance_anchor and cache_path and isinstance(meta, dict):
+            try:
+                updated = dict(meta)
+                updated["storage_cost_anchor_at"] = self._iso_utc_now()
+                tokens = int(payload.get("cache_tokens", 0) or 0)
+                if tokens > 0:
+                    updated["cache_token_count"] = tokens
+                self.cache_service.write_context_meta(cache_path, updated)
+            except Exception:
+                pass
+
     def _build_context_source_fingerprint(
         self,
         *,
@@ -1457,12 +1552,24 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         cache_name = str(meta.get("cache_name", "")).strip() if isinstance(meta, dict) else ""
         remote_delete_failed = False
         if try_remote_delete and cache_name:
+            cache_obj = None
+            cost_log = None
+            try:
+                cache_obj = self.llm_service.get_context_cache(cache_name=cache_name)
+            except Exception:
+                cache_obj = None
+            cost_log = self._build_context_cache_cost_log_payload(
+                pdf_path=pdf_path,
+                meta=meta if isinstance(meta, dict) else None,
+                cache_obj=cache_obj,
+            )
             try:
                 self.llm_service.delete_context_cache(
                     cache_name=cache_name,
                     screen_name=type(self).__name__,
                     task_name=type(self).task_short_name,
                     selected_pdf_path=pdf_path,
+                    cost_log=cost_log,
                 )
             except Exception:
                 remote_delete_failed = True
@@ -1549,14 +1656,34 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                         except Exception:
                             # 续期失败：保留旧 cache_obj 继续复用，避免整体重建带来的 cache write 费。
                             pass
+                    create_iso = (
+                        str(old_meta.get("created_at", "")).strip()
+                        or self.llm_service.extract_context_cache_create_time_iso(cache_obj)
+                        or self._iso_utc_now()
+                    )
+                    cache_tokens = self._resolve_context_cache_tokens(cache_obj, old_meta)
+                    storage_anchor = (
+                        self._context_cache_storage_anchor(old_meta) or create_iso
+                    )
                     refreshed_meta = {
                         "cache_name": old_cache_name,
                         "model": model_name,
-                        "created_at": old_meta.get("created_at") or self._iso_utc_now(),
+                        "created_at": create_iso,
+                        "storage_cost_anchor_at": storage_anchor,
+                        "cache_token_count": cache_tokens,
                         "expire_time": self._to_iso_datetime(getattr(cache_obj, "expire_time", "")),
                         "source_fingerprint": source_fingerprint,
                         "system_prompt_version": system_prompt_version,
                     }
+                    self._emit_context_cache_storage_cost(
+                        event="reuse",
+                        pdf_path=pdf_path,
+                        cache_name=old_cache_name,
+                        meta=refreshed_meta,
+                        cache_obj=cache_obj,
+                        model_name=model_name,
+                    )
+                    refreshed_meta["storage_cost_anchor_at"] = self._iso_utc_now()
                     self.cache_service.write_context_meta(cache_path, refreshed_meta)
                     self.current_context_cache_name = old_cache_name
                     self.current_context_cache_meta = refreshed_meta
@@ -1571,18 +1698,6 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                             ttl_seconds=ttl_seconds,
                             source_fingerprint=source_fingerprint,
                             reason="meta_fingerprint_hit",
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        log_context_cache_event(
-                            event="reuse",
-                            model_name=model_name,
-                            cache_name=old_cache_name,
-                            cache_tokens=0,
-                            ttl_seconds=ttl_seconds,
-                            file_name=os.path.basename(pdf_path),
-                            reused=True,
                         )
                     except Exception:
                         pass
@@ -1602,11 +1717,18 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     except Exception:
                         pass
                     try:
+                        cost_log = self._build_context_cache_cost_log_payload(
+                            pdf_path=pdf_path,
+                            meta=old_meta if isinstance(old_meta, dict) else None,
+                            cache_obj=cache_obj,
+                            model_name=model_name,
+                        )
                         self.llm_service.delete_context_cache(
                             cache_name=old_cache_name,
                             screen_name=type(self).__name__,
                             task_name=type(self).task_short_name,
                             selected_pdf_path=self.selected_pdf_path,
+                            cost_log=cost_log,
                         )
                     except Exception:
                         pass
@@ -1622,10 +1744,17 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         new_cache_name = str(getattr(created, "name", "")).strip()
         if not new_cache_name:
             return None
+        create_iso = (
+            self.llm_service.extract_context_cache_create_time_iso(created)
+            or self._iso_utc_now()
+        )
+        cache_tokens = self._resolve_context_cache_tokens(created, None)
         new_meta = {
             "cache_name": new_cache_name,
             "model": model_name,
-            "created_at": self._iso_utc_now(),
+            "created_at": create_iso,
+            "storage_cost_anchor_at": create_iso,
+            "cache_token_count": cache_tokens,
             "expire_time": self._to_iso_datetime(getattr(created, "expire_time", "")),
             "source_fingerprint": source_fingerprint,
             "system_prompt_version": system_prompt_version,
@@ -2107,11 +2236,18 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 if pending:
                     # 上一次 delete 失败留下的 pending：再试一次。
                     try:
+                        cost_log = self._build_context_cache_cost_log_payload(
+                            pdf_path=None,
+                            meta=meta,
+                            cache_obj=None,
+                            model_name=str(meta.get("model", "")).strip() or None,
+                        )
                         self.llm_service.delete_context_cache(
                             cache_name=cache_name,
                             screen_name=type(self).__name__,
                             task_name=type(self).task_short_name,
                             selected_pdf_path=None,
+                            cost_log=cost_log,
                         )
                         try:
                             os.remove(sidecar_path)
@@ -2150,11 +2286,27 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 if not display.startswith("analysis:"):
                     continue
                 try:
+                    create_iso = self.llm_service.extract_context_cache_create_time_iso(
+                        remote_cache
+                    )
+                    cost_log = {
+                        "model_name": str(getattr(remote_cache, "model", "") or "").replace(
+                            "models/", ""
+                        ),
+                        "cache_tokens": self.llm_service.extract_context_cache_token_count(
+                            remote_cache
+                        ),
+                        "storage_hours": storage_hours_between(create_iso)
+                        if create_iso
+                        else 0.0,
+                        "file_name": display,
+                    }
                     self.llm_service.delete_context_cache(
                         cache_name=name,
                         screen_name=type(self).__name__,
                         task_name=type(self).task_short_name,
                         selected_pdf_path=None,
+                        cost_log=cost_log,
                     )
                     stats["removed_remote_orphan"] += 1
                 except Exception:
