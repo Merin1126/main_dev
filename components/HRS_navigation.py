@@ -244,14 +244,24 @@ class Navigation(ctk.CTkFrame):
                 btn.configure(text_color=inactive)
 
     def _render_title_branding(self, expanded: bool) -> None:
-        """展开侧栏时显示机构两行标识；折叠时仅保留 HRS 主标以适配窄宽。"""
+        """折叠：仅「四川大学」+ HRS；展开：两行机构名 + 分割线 + HRS。"""
         for widget in (self.org_line1_label, self.org_line2_label, self.org_divider):
             widget.pack_forget()
-        if not expanded:
+        if expanded:
+            self.org_line1_label.configure(
+                text="四川大学",
+                font=("PingFang SC", 12, "bold"),
+            )
+            self.org_line1_label.pack(before=self.title_label)
+            self.org_line2_label.pack(after=self.org_line1_label, pady=(2, 0))
+            self.org_divider.pack(after=self.org_line2_label, pady=(6, 4))
             return
-        self.org_line1_label.pack(before=self.title_label)
-        self.org_line2_label.pack(after=self.org_line1_label, pady=(2, 0))
-        self.org_divider.pack(after=self.org_line2_label, pady=(6, 4))
+        # 折叠态（84px）：单行「四川大学」可放入内容区，副标题与分割线隐藏。
+        self.org_line1_label.configure(
+            text="四川大学",
+            font=("PingFang SC", 10, "bold"),
+        )
+        self.org_line1_label.pack(before=self.title_label, pady=(0, 4))
 
     def _render_nav_buttons(self):
         expanded = self.is_expanded
