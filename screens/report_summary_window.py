@@ -11,7 +11,12 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from components.ui.button import Button
-from config.settings import Color
+from config.settings import (
+    Color,
+    GEMINI_SUMMARY_MODEL_DEFAULT,
+    GEMINI_SUMMARY_MODEL_LABELS,
+    GEMINI_SUMMARY_MODEL_OPTIONS,
+)
 from services import ReportService
 
 
@@ -31,6 +36,7 @@ class ReportSummaryWindow(ctk.CTkToplevel):
         self.compare_dir_var = ctk.StringVar(value=self.report_service.default_comparison_dir())
         self.summary_dir_var = ctk.StringVar(value=self.report_service.default_summary_dir())
         self.include_incomplete_var = ctk.BooleanVar(value=False)
+        self.summary_model_var = ctk.StringVar(value=GEMINI_SUMMARY_MODEL_DEFAULT)
 
         self.title("总结页面")
         self.geometry("1080x760")
@@ -117,6 +123,30 @@ class ReportSummaryWindow(ctk.CTkToplevel):
             open_cmd=lambda: self.open_folder(self.summary_dir_var.get()),
         )
 
+        model_section = ctk.CTkFrame(root, fg_color=Color.TRANSPARENT)
+        model_section.pack(fill="x", padx=14, pady=(0, 6))
+        model_row = ctk.CTkFrame(model_section, fg_color=Color.TRANSPARENT)
+        model_row.pack(fill="x")
+        ctk.CTkLabel(model_row, text="内容2 Gemini 模型：", width=120, anchor="w").pack(side="left")
+        self.summary_model_menu = ctk.CTkOptionMenu(
+            model_row,
+            values=list(GEMINI_SUMMARY_MODEL_OPTIONS),
+            variable=self.summary_model_var,
+            fg_color=Color.BG_HOVER,
+            button_color=Color.PRIMARY,
+            command=self._on_summary_model_changed,
+        )
+        self.summary_model_menu.pack(side="left", fill="x", expand=True)
+        self.summary_model_hint = ctk.CTkLabel(
+            model_section,
+            text="",
+            font=("Arial", 11),
+            text_color=Color.TEXT_MUTED,
+            anchor="w",
+        )
+        self.summary_model_hint.pack(anchor="w", padx=(124, 0), pady=(2, 0))
+        self._on_summary_model_changed(self.summary_model_var.get())
+
         action = ctk.CTkFrame(root, fg_color=Color.TRANSPARENT)
         action.pack(fill="x", padx=14, pady=(6, 6))
         self.btn_export_1 = Button(action, text="导出内容1", width=140, command=self.export_content_1)
@@ -148,6 +178,16 @@ class ReportSummaryWindow(ctk.CTkToplevel):
         Button(row, text="选择", width=78, command=choose_cmd).pack(side="left", padx=(0, 6))
         Button(row, text="打开", width=78, command=open_cmd).pack(side="left")
 
+    def _on_summary_model_changed(self, model_name: str) -> None:
+        label = GEMINI_SUMMARY_MODEL_LABELS.get(str(model_name or "").strip(), str(model_name or ""))
+        self.summary_model_hint.configure(text=label)
+
+    def _selected_summary_model(self) -> str:
+        model = str(self.summary_model_var.get() or "").strip()
+        if model in GEMINI_SUMMARY_MODEL_OPTIONS:
+            return model
+        return GEMINI_SUMMARY_MODEL_DEFAULT
+
     def _set_running(self, running: bool) -> None:
         self.running = running
         state = "disabled" if running else "normal"
@@ -160,6 +200,8 @@ class ReportSummaryWindow(ctk.CTkToplevel):
             self.btn_export_both,
         ):
             btn.configure(state=state)
+        if hasattr(self, "summary_model_menu"):
+            self.summary_model_menu.configure(state=state)
 
     def _post_progress(self, current: int, total: int, message: str) -> None:
         def _ui():
@@ -200,7 +242,10 @@ class ReportSummaryWindow(ctk.CTkToplevel):
     def build_index(self) -> None:
         def _work():
             self._post_progress(0, 1, "正在构建索引...")
-            payload = self.report_service.build_index()
+            payload = self.report_service.build_index(
+                comparison_dir=self.compare_dir_var.get().strip(),
+                summary_dir=self.summary_dir_var.get().strip(),
+            )
             self.index_data = payload
             self.after(0, self.reload_index)
 
@@ -224,8 +269,15 @@ class ReportSummaryWindow(ctk.CTkToplevel):
 
         total = int(self.index_data.get("total_documents", 0))
         ready = int(self.index_data.get("ready_documents", 0))
+        docx_n = int(self.index_data.get("comparison_docx_found", 0))
+        md_n = int(self.index_data.get("summary_md_found", 0))
         ts = self.index_data.get("generated_at", "-")
-        self.index_hint.configure(text=f"索引状态：已加载 | 文档 {total} | 可导出 {ready} | 生成于 {ts}")
+        self.index_hint.configure(
+            text=(
+                f"索引状态：已加载 | 文档 {total} | 可导出 {ready} | "
+                f"已有 DOCX {docx_n} | 已有总结 MD {md_n} | 生成于 {ts}"
+            )
+        )
         entries = self.index_data.get("entries", []) or []
         old_state = dict(self.selection_state)
         self.selection_state = {}
@@ -360,6 +412,29 @@ class ReportSummaryWindow(ctk.CTkToplevel):
 
             meta = f"页数: {entry.get('page_count', 0)} | OCR: {entry.get('ocr_pages', 0)} | Analysis: {entry.get('analysis_pages', 0)}"
             ctk.CTkLabel(row, text=meta, font=("Arial", 12), text_color=Color.TEXT_MUTED).pack(anchor="w", padx=14, pady=(0, 2))
+
+            has_docx = bool(entry.get("comparison_docx_exists"))
+            has_md = bool(entry.get("summary_md_exists"))
+            docx_tag = "内容1 DOCX ✓" if has_docx else "内容1 DOCX —"
+            md_tag = "内容2 总结 MD ✓" if has_md else "内容2 总结 MD —"
+            export_color = Color.TEXT_SUCCESS if (has_docx and has_md) else (
+                Color.TEXT_WARNING if (has_docx or has_md) else Color.TEXT_MUTED
+            )
+            ctk.CTkLabel(
+                row,
+                text=f"汇报导出：{docx_tag}  |  {md_tag}",
+                font=("Arial", 12),
+                text_color=export_color,
+            ).pack(anchor="w", padx=14, pady=(0, 2))
+            export_notes = entry.get("export_notes") or []
+            if export_notes:
+                ctk.CTkLabel(
+                    row,
+                    text="；".join(str(x) for x in export_notes[:2]),
+                    font=("Arial", 11),
+                    text_color=Color.TEXT_MUTED,
+                ).pack(anchor="w", padx=14, pady=(0, 2))
+
             if issues:
                 ctk.CTkLabel(
                     row,
@@ -456,6 +531,7 @@ class ReportSummaryWindow(ctk.CTkToplevel):
                 index_data=self.index_data or {},
                 selected_pdf_paths=selected,
                 output_dir=self.summary_dir_var.get().strip(),
+                model_name=self._selected_summary_model(),
                 include_incomplete=bool(self.include_incomplete_var.get()),
                 progress_cb=self._post_progress,
             )
@@ -488,6 +564,7 @@ class ReportSummaryWindow(ctk.CTkToplevel):
                 index_data=self.index_data or {},
                 selected_pdf_paths=selected,
                 output_dir=self.summary_dir_var.get().strip(),
+                model_name=self._selected_summary_model(),
                 include_incomplete=bool(self.include_incomplete_var.get()),
                 progress_cb=lambda c, t, m: self._post_progress(c, t, f"[内容2] {m}"),
             )

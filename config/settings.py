@@ -7,6 +7,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 #全局版本号配置
 APP_VERSION = "V3.1.1"
 
+# 进度汇报「导出内容2」总结所用 Gemini 模型（与 OCR/分析页、token_logger 定价一致）
+GEMINI_SUMMARY_MODEL_DEFAULT = "gemini-3-flash-preview"
+GEMINI_SUMMARY_MODEL_OPTIONS = (
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+)
+GEMINI_SUMMARY_MODEL_LABELS = {
+    "gemini-3-flash-preview": "Gemini 3 Flash（默认，较快较省）",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro（质量更高）",
+}
+
 # OCR 预处理总开关与分档模式（off / mild / strong）
 OCR_PREPROCESS_ENABLED = True
 OCR_PREPROCESS_MODE = "mild"

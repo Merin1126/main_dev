@@ -461,6 +461,26 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         
         Button(toolbar, text="◀ 上一页", width=80, height=30, command=self.prev_page).pack(side="left", padx=5)
         Button(toolbar, text="▶ 下一页", width=80, height=30, command=self.next_page).pack(side="left", padx=5)
+
+        self.document_title_bar = ctk.CTkFrame(
+            self.mid_frame,
+            fg_color=("#e8edf2", "#2a3038"),
+            corner_radius=8,
+            border_width=1,
+            border_color=("#cbd5e1", "#3c4452"),
+        )
+        self.document_title_bar.pack(fill="x", padx=5, pady=(0, 4))
+        self.document_title_label = ctk.CTkLabel(
+            self.document_title_bar,
+            text="请从左侧史料文件库选择 PDF",
+            font=("Arial", 12),
+            text_color=Color.TEXT,
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        )
+        self.document_title_label.pack(fill="x", anchor="w", padx=10, pady=8)
+        self.document_title_bar.bind("<Configure>", self._sync_document_title_wrap)
         
         self.canvas = tk.Canvas(self.mid_frame, bg=Color.BG_PANEL, highlightthickness=0, cursor="hand2")
         self.canvas.pack(fill="both", expand=True, padx=5, pady=5)
@@ -751,10 +771,31 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
     def on_global_file_changed(self, pdf_path: str):
         if not pdf_path:
+            self._update_selected_document_title(None)
             return
         if self.selected_pdf_path == pdf_path:
             return
         self.open_pdf(pdf_path)
+
+    def _sync_document_title_wrap(self, _event=None) -> None:
+        if not hasattr(self, "document_title_label"):
+            return
+        try:
+            width = max(200, int(self.document_title_bar.winfo_width()) - 24)
+        except tk.TclError:
+            return
+        self.document_title_label.configure(wraplength=width)
+
+    def _update_selected_document_title(self, file_path: str | None) -> None:
+        if not hasattr(self, "document_title_label"):
+            return
+        if not file_path:
+            self.document_title_label.configure(text="请从左侧史料文件库选择 PDF")
+            self._sync_document_title_wrap()
+            return
+        full_name = os.path.basename(file_path)
+        self.document_title_label.configure(text=full_name)
+        self._sync_document_title_wrap()
 
     def open_pdf(self, file_path):
         self.cancel_ocr_task(silent=True)
@@ -770,6 +811,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             self.current_page = 0
             self.zoom_factor = 1.0
             self.selected_pdf_path = file_path
+            self._update_selected_document_title(file_path)
             self.render_page()
 
             if not self._load_cached_ocr_for_pdf(file_path):
@@ -795,6 +837,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                     )
                 self.ocr_progress_bar.set(0)
         except Exception as e:
+            self._update_selected_document_title(None)
             messagebox.showerror("错误", f"无法打开 PDF 文件: {e}")
 
     def _load_cached_ocr_for_pdf(self, pdf_path):

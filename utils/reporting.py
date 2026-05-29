@@ -13,6 +13,9 @@ from services import CacheService, PdfService
 _FENCED_JSON_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", flags=re.DOTALL)
 
 
+_JACAR_REF_RE = re.compile(r"[ABCL][0-9]{11}", re.IGNORECASE)
+
+
 @dataclass
 class ReportDocumentEntry:
     pdf_path: str
@@ -28,8 +31,14 @@ class ReportDocumentEntry:
     analysis_json_pages: int
     ready: bool
     issues: list[str]
+    comparison_docx_exists: bool = False
+    comparison_docx_path: str = ""
+    summary_md_exists: bool = False
+    summary_md_path: str = ""
+    export_notes: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        notes = list(self.export_notes or [])
         return {
             "pdf_path": self.pdf_path,
             "pdf_rel_path": self.pdf_rel_path,
@@ -44,7 +53,19 @@ class ReportDocumentEntry:
             "analysis_json_pages": self.analysis_json_pages,
             "ready": self.ready,
             "issues": self.issues,
+            "comparison_docx_exists": self.comparison_docx_exists,
+            "comparison_docx_path": self.comparison_docx_path,
+            "summary_md_exists": self.summary_md_exists,
+            "summary_md_path": self.summary_md_path,
+            "export_notes": notes,
         }
+
+
+def extract_jacar_ref_from_path(path: str) -> str:
+    """从 PDF 文件名中提取 JACAR 编号（如 A03023710800）。"""
+    name = os.path.basename(path or "")
+    match = _JACAR_REF_RE.search(name)
+    return match.group(0).upper() if match else ""
 
 
 def now_iso() -> str:

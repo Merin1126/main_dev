@@ -9,6 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from config.settings import GEMINI_SUMMARY_MODEL_DEFAULT
 from services import ReportService
 
 
@@ -26,7 +27,11 @@ def main() -> int:
     parser.add_argument("--index-file", default=None, help="Index file path.")
     parser.add_argument("--output-dir", default=None, help="Summary output directory.")
     parser.add_argument("--manifest", default=None, help="Optional manifest output path.")
-    parser.add_argument("--model", default="gemini-3.1-pro-preview", help="Gemini model name.")
+    parser.add_argument(
+        "--model",
+        default=GEMINI_SUMMARY_MODEL_DEFAULT,
+        help="Gemini model name (default: gemini-3-flash-preview).",
+    )
     parser.add_argument("--api-key", default=None, help="Gemini API key. Defaults to env/.secrets.")
     parser.add_argument("--include-incomplete", action="store_true", help="Include incomplete docs.")
     parser.add_argument("--max-docs", type=int, default=0, help="Process up to N documents (0 = all).")

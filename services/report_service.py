@@ -14,6 +14,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 
 from config.api_key_store import load_google_api_key
+from config.settings import GEMINI_SUMMARY_MODEL_DEFAULT
 from services import CacheService, LlmService, PdfService, TemplateService
 from utils.docx_export import (
     COMPARISON_FONT_ANALYSIS,
@@ -30,6 +31,7 @@ from utils.docx_export import (
 from utils.reporting import (
     build_report_entry,
     discover_pdf_files,
+    extract_jacar_ref_from_path,
     extract_transcription_text,
     load_index,
     now_iso,
@@ -70,12 +72,118 @@ class ReportService:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"run_manifest_{prefix}_{ts}.json"
 
-    def build_index(self, *, pdf_root: str | None = None, output_path: str | None = None) -> dict[str, Any]:
+    @staticmethod
+    def expected_comparison_docx_path(pdf_path: str, comparison_dir: str) -> str:
+        """与 export_comparison_docx 输出命名规则一致。"""
+        doc_name = os.path.basename(pdf_path)
+        filename = safe_filename(os.path.splitext(doc_name)[0]) + "_按页对照报告.docx"
+        return os.path.join(comparison_dir, filename)
+
+    @staticmethod
+    def expected_summary_md_path(pdf_path: str, summary_dir: str) -> str:
+        """与 generate_summaries 输出命名规则一致。"""
+        doc_name = os.path.basename(pdf_path)
+        filename = safe_filename(os.path.splitext(doc_name)[0]) + ".summary.md"
+        return os.path.join(summary_dir, filename)
+
+    @staticmethod
+    def _find_existing_export_file(
+        output_dir: str,
+        pdf_path: str,
+        *,
+        exact_path: str,
+        ref: str,
+        suffix: str,
+    ) -> tuple[bool, str]:
+        """
+        在导出目录中定位已生成的汇报文件：先精确路径，再按 JACAR 编号模糊匹配。
+        返回 (是否存在, 实际命中路径或预期路径)。
+        """
+        if exact_path and os.path.isfile(exact_path):
+            return True, os.path.abspath(exact_path)
+
+        if not ref or not os.path.isdir(output_dir):
+            return False, exact_path
+
+        suffix_lower = suffix.lower()
+        ref_upper = ref.upper()
+        candidates: list[str] = []
+        for name in os.listdir(output_dir):
+            if not name.lower().endswith(suffix_lower):
+                continue
+            if ref_upper in name.upper():
+                candidates.append(os.path.join(output_dir, name))
+        if not candidates:
+            return False, exact_path
+        candidates.sort(key=lambda p: (len(os.path.basename(p)), p))
+        hit = os.path.abspath(candidates[0])
+        return True, hit
+
+    def probe_export_artifacts(
+        self,
+        pdf_path: str,
+        *,
+        comparison_dir: str | None = None,
+        summary_dir: str | None = None,
+    ) -> dict[str, Any]:
+        """检查内容1 DOCX / 内容2 总结 MD 是否已在默认输出目录生成。"""
+        comparison_dir = os.path.abspath(comparison_dir or self.default_comparison_dir())
+        summary_dir = os.path.abspath(summary_dir or self.default_summary_dir())
+        ref = extract_jacar_ref_from_path(pdf_path)
+
+        docx_expected = self.expected_comparison_docx_path(pdf_path, comparison_dir)
+        docx_exists, docx_hit = self._find_existing_export_file(
+            comparison_dir,
+            pdf_path,
+            exact_path=docx_expected,
+            ref=ref,
+            suffix=".docx",
+        )
+
+        md_expected = self.expected_summary_md_path(pdf_path, summary_dir)
+        md_exists, md_hit = self._find_existing_export_file(
+            summary_dir,
+            pdf_path,
+            exact_path=md_expected,
+            ref=ref,
+            suffix=".md",
+        )
+
+        notes: list[str] = []
+        if docx_exists:
+            notes.append(f"已生成内容1 DOCX：{os.path.basename(docx_hit)}")
+        else:
+            notes.append("未找到内容1 DOCX（Reports/comparison_docx）")
+        if md_exists:
+            notes.append(f"已生成内容2 总结 MD：{os.path.basename(md_hit)}")
+        else:
+            notes.append("未找到内容2 总结 MD（Reports/summary）")
+
+        return {
+            "comparison_docx_exists": docx_exists,
+            "comparison_docx_path": docx_hit,
+            "summary_md_exists": md_exists,
+            "summary_md_path": md_hit,
+            "export_notes": notes,
+        }
+
+    def build_index(
+        self,
+        *,
+        pdf_root: str | None = None,
+        output_path: str | None = None,
+        comparison_dir: str | None = None,
+        summary_dir: str | None = None,
+    ) -> dict[str, Any]:
         pdf_root = os.path.abspath(pdf_root or os.path.join(self.project_root, "JACAR_Downloads"))
         output_path = os.path.abspath(output_path or self.default_index_path())
+        comparison_dir = os.path.abspath(comparison_dir or self.default_comparison_dir())
+        summary_dir = os.path.abspath(summary_dir or self.default_summary_dir())
         pdf_paths = discover_pdf_files(pdf_root)
         entries: list[dict[str, Any]] = []
         ready_count = 0
+        docx_hit_count = 0
+        md_hit_count = 0
         for pdf_path in pdf_paths:
             entry = build_report_entry(
                 project_root=self.project_root,
@@ -86,13 +194,28 @@ class ReportService:
             )
             if entry.ready:
                 ready_count += 1
-            entries.append(entry.to_dict())
+            row = entry.to_dict()
+            export_info = self.probe_export_artifacts(
+                pdf_path,
+                comparison_dir=comparison_dir,
+                summary_dir=summary_dir,
+            )
+            row.update(export_info)
+            if export_info.get("comparison_docx_exists"):
+                docx_hit_count += 1
+            if export_info.get("summary_md_exists"):
+                md_hit_count += 1
+            entries.append(row)
         payload = {
             "generated_at": now_iso(),
             "project_root": self.project_root,
             "pdf_root": pdf_root,
+            "comparison_dir": comparison_dir,
+            "summary_dir": summary_dir,
             "total_documents": len(entries),
             "ready_documents": ready_count,
+            "comparison_docx_found": docx_hit_count,
+            "summary_md_found": md_hit_count,
             "entries": entries,
         }
         write_json(output_path, payload)
@@ -435,7 +558,7 @@ class ReportService:
         selected_pdf_paths: set[str] | None,
         output_dir: str | None = None,
         api_key: str | None = None,
-        model_name: str = "gemini-3.1-pro-preview",
+        model_name: str = GEMINI_SUMMARY_MODEL_DEFAULT,
         include_incomplete: bool = False,
         max_source_chars: int = 120000,
         chunk_pages: int = 20,
