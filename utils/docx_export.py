@@ -6,10 +6,11 @@ import re
 from typing import Literal
 
 from docx import Document
-from docx.enum.text import WD_BREAK, WD_LINE_SPACING
+from docx.enum.section import WD_ORIENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
 
 from utils.text_reflow import looks_like_structured_payload, reflow_page_text
 
@@ -230,3 +231,123 @@ def write_pages_to_docx(
             _append_page_break(last_paragraph)
 
     doc.save(file_path)
+
+
+# ------------------------------------------------------------------ #
+# 内容1：按页对照报告（横向分页：扫描图 / OCR 文本 / 分析）
+# ------------------------------------------------------------------ #
+
+COMPARISON_FONT_OCR = "MS Mincho"
+COMPARISON_FONT_ANALYSIS = "宋体"
+COMPARISON_HEADER_RGB = RGBColor(0x25, 0x63, 0xEB)
+COMPARISON_HEADER_SIZE_PT = 14
+COMPARISON_BODY_SIZE_PT = 11
+EMU_PER_INCH = 914400
+
+# 对照报告内嵌扫描图：版面按 fit_zoom 适配横向页，光栅化用更高 DPI 再缩放到版面（避免仅 ~72 DPI）
+COMPARISON_IMAGE_TARGET_DPI = 240
+COMPARISON_IMAGE_MIN_DPI = 96
+COMPARISON_IMAGE_MAX_DPI = 600
+COMPARISON_IMAGE_MAX_DIMENSION_PX = 10000
+PDF_POINTS_PER_INCH = 72.0
+
+
+def configure_document_landscape(doc: Document) -> None:
+    """将文档默认节设为横向 A4。"""
+    section = doc.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = section.page_height, section.page_width
+
+
+def landscape_content_size_inches(doc: Document) -> tuple[float, float]:
+    """返回当前节可用内容区宽高（英寸）。"""
+    section = doc.sections[-1]
+    width_emu = section.page_width - section.left_margin - section.right_margin
+    height_emu = section.page_height - section.top_margin - section.bottom_margin
+    return width_emu / EMU_PER_INCH, height_emu / EMU_PER_INCH
+
+
+def comparison_image_raster_plan(
+    *,
+    page_width_pt: float,
+    page_height_pt: float,
+    content_max_w_in: float,
+    content_max_h_in: float,
+    target_dpi: float = COMPARISON_IMAGE_TARGET_DPI,
+    max_dimension_px: int = COMPARISON_IMAGE_MAX_DIMENSION_PX,
+) -> tuple[float, float, float]:
+    """计算对照报告扫描图的版面缩放与光栅化缩放。
+
+    返回 (fit_zoom, render_zoom, display_width_inches)。
+    - fit_zoom：Word 中的显示尺寸（约 72 DPI 等效版面）
+    - render_zoom：PyMuPDF 渲染矩阵，通常 >> fit_zoom，使嵌入 PNG 有效 DPI 接近 target_dpi
+    """
+    dpi = max(COMPARISON_IMAGE_MIN_DPI, min(COMPARISON_IMAGE_MAX_DPI, float(target_dpi)))
+    fit_zoom = min(
+        content_max_w_in * PDF_POINTS_PER_INCH / max(page_width_pt, 1.0),
+        content_max_h_in * PDF_POINTS_PER_INCH / max(page_height_pt, 1.0),
+    )
+    fit_zoom = max(0.25, fit_zoom)
+    render_zoom = fit_zoom * (dpi / PDF_POINTS_PER_INCH)
+    longest_pt = max(page_width_pt, page_height_pt)
+    if longest_pt * render_zoom > max_dimension_px:
+        render_zoom = max_dimension_px / longest_pt
+    display_w_in = min(content_max_w_in, page_width_pt * fit_zoom / PDF_POINTS_PER_INCH)
+    return fit_zoom, render_zoom, display_w_in
+
+
+def add_comparison_page_banner(doc: Document, *, page_index: int, total_pages: int) -> None:
+    """页首蓝色「第 n / m 页」横幅。"""
+    paragraph = doc.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(10)
+    run = paragraph.add_run(f"第 {page_index + 1} / {total_pages} 页")
+    run.font.size = Pt(COMPARISON_HEADER_SIZE_PT)
+    run.font.bold = True
+    run.font.color.rgb = COMPARISON_HEADER_RGB
+
+
+def append_docx_page_break(doc: Document) -> None:
+    doc.add_page_break()
+
+
+def _set_run_east_asia_font(
+    run,
+    east_asia_font: str,
+    *,
+    size_pt: int = COMPARISON_BODY_SIZE_PT,
+    bold: bool = False,
+) -> None:
+    ascii_font = "Times New Roman"
+    run.font.name = ascii_font
+    run.font.size = Pt(size_pt)
+    run.font.bold = bold
+    r_pr = run._element.get_or_add_rPr()
+    r_fonts = r_pr.find(qn("w:rFonts"))
+    if r_fonts is None:
+        r_fonts = OxmlElement("w:rFonts")
+        r_pr.insert(0, r_fonts)
+    r_fonts.set(qn("w:ascii"), ascii_font)
+    r_fonts.set(qn("w:hAnsi"), ascii_font)
+    r_fonts.set(qn("w:eastAsia"), east_asia_font)
+    r_fonts.set(qn("w:cs"), east_asia_font)
+
+
+def add_comparison_paragraph(doc: Document, text: str, east_asia_font: str) -> None:
+    """单段正文，整段使用指定东亚字体（用于 OCR / 分析块）。"""
+    paragraph = doc.add_paragraph()
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(4)
+    paragraph.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+    paragraph.paragraph_format.line_spacing = Pt(18)
+    run = paragraph.add_run(text)
+    _set_run_east_asia_font(run, east_asia_font)
+
+
+def add_comparison_text_body(doc: Document, text: str, east_asia_font: str) -> None:
+    """多行正文块。"""
+    body = (text or "").strip() or "（空）"
+    lines = body.splitlines() or ["（空）"]
+    for line in lines:
+        add_comparison_paragraph(doc, line if line else " ", east_asia_font)

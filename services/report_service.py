@@ -10,10 +10,23 @@ from typing import Any, Callable
 
 import fitz
 from docx import Document
-from docx.shared import Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches, Pt
 
 from config.api_key_store import load_google_api_key
 from services import CacheService, LlmService, PdfService, TemplateService
+from utils.docx_export import (
+    COMPARISON_FONT_ANALYSIS,
+    COMPARISON_FONT_OCR,
+    COMPARISON_IMAGE_TARGET_DPI,
+    add_comparison_page_banner,
+    add_comparison_paragraph,
+    add_comparison_text_body,
+    append_docx_page_break,
+    comparison_image_raster_plan,
+    configure_document_landscape,
+    landscape_content_size_inches,
+)
 from utils.reporting import (
     build_report_entry,
     discover_pdf_files,
@@ -129,37 +142,49 @@ class ReportService:
         ocr_text: str,
         analysis_raw: str,
         include_analysis_raw: bool,
-        image_zoom: float,
+        image_dpi: float,
     ) -> None:
-        doc.add_heading(f"第 {page_index + 1} / {total_pages} 页", level=2)
-        table = doc.add_table(rows=1, cols=2)
-        table.style = "Table Grid"
-        table.autofit = False
-        table.columns[0].width = Inches(3.0)
-        table.columns[1].width = Inches(3.5)
+        """单页史料 → 三个横向 Word 页：扫描图满幅 / OCR 文本(MS Mincho) / 分析(宋体)。"""
+        content_w_in, content_h_in = landscape_content_size_inches(doc)
+        header_reserve_in = 0.55
+        image_max_h_in = max(1.0, content_h_in - header_reserve_in - 0.25)
+        image_max_w_in = max(1.0, content_w_in)
+        rect = pdf_page.rect
+        _fit_zoom, render_zoom, display_w_in = comparison_image_raster_plan(
+            page_width_pt=rect.width,
+            page_height_pt=rect.height,
+            content_max_w_in=image_max_w_in,
+            content_max_h_in=image_max_h_in,
+            target_dpi=image_dpi,
+        )
 
-        left = table.cell(0, 0)
-        right = table.cell(0, 1)
-
-        pix = pdf_page.get_pixmap(matrix=fitz.Matrix(image_zoom, image_zoom), alpha=False)
+        # 1) OCR 原件（高 DPI 光栅化，Word 中按版面宽度显示）
+        add_comparison_page_banner(doc, page_index=page_index, total_pages=total_pages)
+        pix = pdf_page.get_pixmap(matrix=fitz.Matrix(render_zoom, render_zoom), alpha=False)
         img_buf = io.BytesIO(pix.tobytes("png"))
-        p_img = left.paragraphs[0]
-        p_img.add_run().add_picture(img_buf, width=Inches(2.9))
+        image_paragraph = doc.add_paragraph()
+        image_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        image_paragraph.paragraph_format.space_after = Pt(0)
+        image_paragraph.add_run().add_picture(img_buf, width=Inches(display_w_in))
+        append_docx_page_break(doc)
 
-        right.paragraphs[0].add_run("OCR 提取：")
-        right.add_paragraph(ocr_text or "（空）")
+        # 2) OCR 提取文字
+        add_comparison_page_banner(doc, page_index=page_index, total_pages=total_pages)
+        add_comparison_text_body(doc, ocr_text, COMPARISON_FONT_OCR)
+        append_docx_page_break(doc)
 
-        doc.add_paragraph("Analysis：")
+        # 3) 分析内容
+        add_comparison_page_banner(doc, page_index=page_index, total_pages=total_pages)
         parsed, cleaned = parse_analysis_page_json(analysis_raw)
         if parsed is not None:
             for line in ReportService._analysis_lines(parsed):
-                doc.add_paragraph(line)
+                add_comparison_paragraph(doc, line, COMPARISON_FONT_ANALYSIS)
         else:
-            doc.add_paragraph(cleaned or "（空）")
+            add_comparison_text_body(doc, cleaned, COMPARISON_FONT_ANALYSIS)
 
         if include_analysis_raw and cleaned:
-            doc.add_paragraph("Analysis 原文：")
-            doc.add_paragraph(cleaned)
+            add_comparison_paragraph(doc, "Analysis 原文：", COMPARISON_FONT_ANALYSIS)
+            add_comparison_text_body(doc, cleaned, COMPARISON_FONT_ANALYSIS)
 
     def export_comparison_docx(
         self,
@@ -169,7 +194,7 @@ class ReportService:
         output_dir: str | None = None,
         include_incomplete: bool = False,
         include_analysis_raw: bool = False,
-        image_zoom: float = 1.5,
+        image_dpi: float = COMPARISON_IMAGE_TARGET_DPI,
         progress_cb: ProgressCallback | None = None,
     ) -> ExportResult:
         output_dir = os.path.abspath(output_dir or self.default_comparison_dir())
@@ -201,7 +226,7 @@ class ReportService:
                     entry=entry,
                     output_dir=output_dir,
                     include_analysis_raw=include_analysis_raw,
-                    image_zoom=max(0.8, float(image_zoom)),
+                    image_dpi=float(image_dpi),
                 )
                 row["status"] = "ok"
                 row["output_docx"] = out
@@ -231,7 +256,7 @@ class ReportService:
         entry: dict[str, Any],
         output_dir: str,
         include_analysis_raw: bool,
-        image_zoom: float,
+        image_dpi: float,
     ) -> str:
         pdf_path = entry["pdf_path"]
         page_count = int(entry.get("page_count", 0))
@@ -239,6 +264,7 @@ class ReportService:
         analysis_pages = self.cache_service.read_paged_cache(entry["analysis_cache_path"])
 
         doc = Document()
+        configure_document_landscape(doc)
         doc.add_heading(f"史料按页对照报告：{os.path.basename(pdf_path)}", level=1)
         doc.add_paragraph(f"来源文件：{entry.get('pdf_rel_path', pdf_path)}")
         doc.add_paragraph(f"总页数：{page_count}")
@@ -256,10 +282,10 @@ class ReportService:
                     ocr_text=ocr_text,
                     analysis_raw=analysis_raw,
                     include_analysis_raw=include_analysis_raw,
-                    image_zoom=image_zoom,
+                    image_dpi=image_dpi,
                 )
                 if i < total - 1:
-                    doc.add_page_break()
+                    append_docx_page_break(doc)
 
         name = safe_filename(os.path.splitext(os.path.basename(pdf_path))[0]) + "_按页对照报告.docx"
         out_path = os.path.join(output_dir, name)
