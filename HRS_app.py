@@ -11,7 +11,7 @@ class HRSApp(ctk.CTk):
         # 1. 基础窗口设置
         self.width = 1260
         self.height = 700
-        self.title(f"HRS 日本史料数据处理系统 {APP_VERSION}")
+        self.title(f"四川大学日本研究中心 HRS 日本史料数据处理系统 {APP_VERSION}")
         self.minsize(800, 600)
         self._center_window() # 调用原作者优雅的居中算法
 

@@ -9,6 +9,8 @@ api_config.json
 
 # 2. 本地产生的数据文件 (避免仓库变得非常大)
 JACAR_Downloads/
+OCR_Cache/
+Reports/
 Translation_Cache/
 Analysis_Cache/
 Database_JSON/

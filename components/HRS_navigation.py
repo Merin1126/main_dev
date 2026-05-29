@@ -28,7 +28,27 @@ class Navigation(ctk.CTkFrame):
 
         # ================= 顶部 Logo/标题区 =================
         self.title_container = ctk.CTkFrame(self, fg_color=Color.TRANSPARENT)
-        self.title_container.pack(pady=(34, 0), padx=10)
+        self.title_container.pack(pady=(20, 0), padx=10)
+
+        self.org_line1_label = ctk.CTkLabel(
+            self.title_container,
+            text="四川大学",
+            font=("PingFang SC", 12, "bold"),
+            text_color=Color.NAV_ORG_LINE1,
+        )
+        self.org_line2_label = ctk.CTkLabel(
+            self.title_container,
+            text="日本研究中心",
+            font=("PingFang SC", 10),
+            text_color=Color.NAV_ORG_LINE2,
+        )
+        self.org_divider = ctk.CTkFrame(
+            self.title_container,
+            height=1,
+            width=48,
+            fg_color=Color.NAV_ORG_DIVIDER,
+            corner_radius=0,
+        )
 
         self.title_label = ctk.CTkLabel(
             self.title_container, text="HRS",
@@ -83,6 +103,7 @@ class Navigation(ctk.CTkFrame):
         self.appearance_mode_menu.pack_forget()
 
         self._render_nav_buttons()
+        self._render_title_branding(self.is_expanded)
         self.navigate("scraper")
         self.after(0, self._ensure_initial_collapsed_width)
 
@@ -160,6 +181,7 @@ class Navigation(ctk.CTkFrame):
             self._last_applied_width = self.current_width
             self.is_expanded = (target_width == self.expanded_width)
             self._render_nav_buttons()
+            self._render_title_branding(self.is_expanded)
             if self.is_expanded:
                 self._set_button_text_colors(1.0)
             self._animating = False
@@ -220,6 +242,16 @@ class Navigation(ctk.CTkFrame):
                 btn.configure(text_color=active)
             else:
                 btn.configure(text_color=inactive)
+
+    def _render_title_branding(self, expanded: bool) -> None:
+        """展开侧栏时显示机构两行标识；折叠时仅保留 HRS 主标以适配窄宽。"""
+        for widget in (self.org_line1_label, self.org_line2_label, self.org_divider):
+            widget.pack_forget()
+        if not expanded:
+            return
+        self.org_line1_label.pack(before=self.title_label)
+        self.org_line2_label.pack(after=self.org_line1_label, pady=(2, 0))
+        self.org_divider.pack(after=self.org_line2_label, pady=(6, 4))
 
     def _render_nav_buttons(self):
         expanded = self.is_expanded

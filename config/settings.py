@@ -103,6 +103,11 @@ class Color:
     NAV_TEXT_ACTIVE_START = "#8db7d8"
     NAV_TEXT_ACTIVE_END = "#ffffff"
 
+    # 导航栏机构标识（四川大学 · 日本研究中心）
+    NAV_ORG_LINE1 = "#E6EBF2"
+    NAV_ORG_LINE2 = "#8FA3B8"
+    NAV_ORG_DIVIDER = "#3A4555"
+
 class ScreenName:
     """HRS V2.2 全局视图路由名称"""
     SCRAPER = "scraper"
