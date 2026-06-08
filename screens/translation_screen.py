@@ -11,6 +11,7 @@ from config.translation_prompts import (
     render_translation_system,
     render_translation_turn,
 )
+from components.editor_search import EditorSearchController
 from screens.base_screen import BaseDocumentScreen
 
 
@@ -46,6 +47,8 @@ class TranslationScreen(BaseDocumentScreen):
             text_color="gray",
         )
         self.plugin_status_label.pack(fill="x", padx=10, pady=(0, 4), before=self.text_editor)
+        self._editor_search = EditorSearchController(self.right_frame, self.text_editor)
+        self._editor_search.attach()
 
     # ------------------------------------------------------------------ #
     # 内部工具：加载本档案的 Analysis JSON 数据并做文档级聚合

@@ -95,14 +95,27 @@ class FileTreeSidebar(ctk.CTkFrame):
         self.search_entry.bind("<KeyRelease>", self._on_search_changed)
         self.search_entry.bind("<Return>", lambda _e: self._apply_search())
 
+        stats_row = ctk.CTkFrame(self, fg_color=Color.TRANSPARENT)
+        stats_row.pack(fill="x", padx=10, pady=(0, 4))
         self.search_stats_label = ctk.CTkLabel(
-            self,
+            stats_row,
             text="",
             font=("Arial", 11),
             text_color=self.ITEM_TEXT_MUTED,
             anchor="w",
         )
-        self.search_stats_label.pack(fill="x", padx=10, pady=(0, 4))
+        self.search_stats_label.pack(side="left", fill="x", expand=True)
+        self._folder_toggle_btn = Button(
+            stats_row,
+            text="一键折叠",
+            width=72,
+            height=26,
+            fontSize=12,
+            fg_color=Color.BG_BUTTON_MUTED,
+            hover_color=Color.BG_BUTTON_MUTED_HOVER,
+            command=self.toggle_all_folders,
+        )
+        self._folder_toggle_btn.pack(side="right", padx=(6, 0))
 
         list_container = ctk.CTkFrame(self, fg_color=Color.TRANSPARENT)
         list_container.pack(fill="both", expand=True, padx=5, pady=5)
@@ -156,6 +169,7 @@ class FileTreeSidebar(ctk.CTkFrame):
         self.visible_paths = self.index_service.filter_paths(self.pdf_index, needle)
         self._render_file_views()
         self._update_search_stats()
+        self._update_folder_toggle_label()
         if self.selected_file_index is not None:
             path = self.pdf_files[self.selected_file_index]
             if path not in self.visible_paths:
@@ -195,6 +209,55 @@ class FileTreeSidebar(ctk.CTkFrame):
             visit(root_dir)
         return ordered
 
+    def _collect_all_folder_paths(self) -> list[str]:
+        paths: list[str] = []
+
+        def visit(abs_dir: str) -> None:
+            try:
+                names = os.listdir(abs_dir)
+            except OSError:
+                return
+            for name in sorted(names):
+                if name.startswith("."):
+                    continue
+                sub = os.path.join(abs_dir, name)
+                if os.path.isdir(sub):
+                    paths.append(self._norm_path(sub))
+                    visit(sub)
+
+        if os.path.isdir(self.download_dir):
+            visit(self.download_dir)
+        return paths
+
+    def _any_folder_expanded(self) -> bool:
+        for folder_path in self._collect_all_folder_paths():
+            if self.expanded_folders.get(folder_path, True):
+                return True
+        return False
+
+    def _update_folder_toggle_label(self) -> None:
+        if (self.search_var.get() or "").strip():
+            self._folder_toggle_btn.configure(text="折叠/展开", state="disabled")
+            return
+        self._folder_toggle_btn.configure(state="normal")
+        if self._any_folder_expanded():
+            self._folder_toggle_btn.configure(text="一键折叠")
+        else:
+            self._folder_toggle_btn.configure(text="一键展开")
+
+    def toggle_all_folders(self) -> None:
+        if (self.search_var.get() or "").strip():
+            return
+        expand = not self._any_folder_expanded()
+        for folder_path in self._collect_all_folder_paths():
+            self.expanded_folders[folder_path] = expand
+        selected_idx = self.selected_file_index
+        self._render_file_views()
+        if selected_idx is not None:
+            self.selected_file_index = selected_idx
+            self._refresh_file_item_styles()
+        self._update_folder_toggle_label()
+
     def _toggle_folder_expanded(self, norm_path: str, child_host, folder_btn, display_name: str) -> None:
         cur = self.expanded_folders.get(norm_path, True)
         new_expanded = not cur
@@ -205,6 +268,7 @@ class FileTreeSidebar(ctk.CTkFrame):
             child_host.pack(fill="x", padx=0, pady=0)
         else:
             child_host.pack_forget()
+        self._update_folder_toggle_label()
 
     def _has_any_cache(self, pdf_path: str) -> bool:
         for d in self._cache_dirs:
@@ -461,6 +525,7 @@ class FileTreeSidebar(ctk.CTkFrame):
             self._render_dir_tree(self.file_list_frame, self.download_dir, depth=0)
 
         self._refresh_file_item_styles()
+        self._update_folder_toggle_label()
 
     def _load_file_list(self) -> None:
         self.pdf_files.clear()
@@ -472,6 +537,7 @@ class FileTreeSidebar(ctk.CTkFrame):
             os.makedirs(self.download_dir, exist_ok=True)
             self.visible_paths = set()
             self._update_search_stats()
+            self._update_folder_toggle_label()
             return
 
         self.pdf_files = [self._norm_path(p) for p in self._collect_pdfs_dfs(self.download_dir)]

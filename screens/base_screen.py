@@ -214,13 +214,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     @staticmethod
     def _extract_transcription_text(text: str) -> str:
         """兼容 OCR XML 输出：优先抽取 <transcription> 内容，无标签时回退原文。"""
-        raw = (text or "").strip()
-        if not raw:
-            return ""
-        match = re.search(r"<transcription>\s*(.*?)\s*</transcription>", raw, flags=re.IGNORECASE | re.DOTALL)
-        if not match:
-            return raw
-        return (match.group(1) or "").strip()
+        from utils.ocr_page_text import extract_transcription_text
+
+        return extract_transcription_text(text)
 
     def _get_ocr_text_for_page(self, pdf_path: str, page_index: int) -> str:
         """
@@ -683,21 +679,27 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.text_editor = ctk.CTkTextbox(self.right_frame, wrap="word", font=("Arial", 14), corner_radius=8)
         self.text_editor.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
-        text_action_frame = ctk.CTkFrame(self.right_frame, fg_color=Color.TRANSPARENT)
-        text_action_frame.pack(fill="x", padx=8, pady=(0, 10))
-        Button(
-            text_action_frame,
+        self.text_action_frame = ctk.CTkFrame(self.right_frame, fg_color=Color.TRANSPARENT)
+        self.text_action_frame.pack(fill="x", padx=8, pady=(0, 10))
+        self.btn_save_edits = Button(
+            self.text_action_frame,
             text="💾 保存修改",
             height=38,
             fg_color=Color.BTN_SUCCESS,
             hover_color=Color.BTN_SUCCESS_HOVER,
             command=self.save_edits_to_disk,
-        ).pack(fill="x")
+        )
+        self.btn_save_edits.pack(fill="x")
+        self._customize_text_action_frame()
 
         self._set_ocr_pages([type(self).idle_editor_hint])
 
         # 设置默认分栏宽度比例（阅读器:操作区:校对区 = 5:1.6:3）
         self.after(120, self._apply_default_pane_ratio)
+
+    def _customize_text_action_frame(self) -> None:
+        """子类可在保存按钮行追加控件（如 OCR 版面分析面板入口）。"""
+        return
 
     def _apply_default_pane_ratio(self):
         total_width = self.paned_window.winfo_width()
