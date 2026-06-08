@@ -17,7 +17,7 @@ class ScreenManager(ctk.CTkFrame):
         super().__init__(master, fg_color=Color.TRANSPARENT, corner_radius=0, **kwargs)
         self.master = master
 
-        self._sidebar_default_width = 220
+        self._sidebar_default_width = FileTreeSidebar.DEFAULT_WIDTH
         self._sidebar_attached = True
 
         self.main_paned = tk.PanedWindow(
@@ -33,7 +33,7 @@ class ScreenManager(ctk.CTkFrame):
 
         self.sidebar = FileTreeSidebar(self.main_paned, width=self._sidebar_default_width)
         self.content_frame = ctk.CTkFrame(self.main_paned, fg_color=Color.TRANSPARENT, corner_radius=0)
-        self.main_paned.add(self.sidebar, minsize=0, stretch="never")
+        self.main_paned.add(self.sidebar, minsize=200, stretch="never")
         self.main_paned.add(self.content_frame, minsize=680, stretch="always")
 
         self.initialize_screens()
@@ -76,7 +76,7 @@ class ScreenManager(ctk.CTkFrame):
     def _show_sidebar(self) -> None:
         if not self._sidebar_attached:
             self.main_paned.forget(self.content_frame)
-            self.main_paned.add(self.sidebar, minsize=0, stretch="never")
+            self.main_paned.add(self.sidebar, minsize=200, stretch="never")
             self.main_paned.add(self.content_frame, minsize=680, stretch="always")
             self._sidebar_attached = True
         self.sidebar.configure(width=self._sidebar_default_width)

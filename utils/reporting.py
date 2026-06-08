@@ -13,6 +13,8 @@ from services import CacheService, PdfService
 _FENCED_JSON_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", flags=re.DOTALL)
 
 
+from utils.jacar_filename import extract_jacar_ref_from_path  # noqa: F401 re-export
+
 _JACAR_REF_RE = re.compile(r"[ABCL][0-9]{11}", re.IGNORECASE)
 
 
@@ -59,13 +61,6 @@ class ReportDocumentEntry:
             "summary_md_path": self.summary_md_path,
             "export_notes": notes,
         }
-
-
-def extract_jacar_ref_from_path(path: str) -> str:
-    """从 PDF 文件名中提取 JACAR 编号（如 A03023710800）。"""
-    name = os.path.basename(path or "")
-    match = _JACAR_REF_RE.search(name)
-    return match.group(0).upper() if match else ""
 
 
 def now_iso() -> str:

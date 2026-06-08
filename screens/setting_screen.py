@@ -6,8 +6,11 @@ from tkinter import messagebox
 
 from components.ui.button import Button
 from config.settings import Color
+from screens.document_catalog_window import DocumentCatalogWindow
 from screens.report_summary_window import ReportSummaryWindow
 from services import LlmService
+from services.db_disk_sync_service import DbDiskSyncService
+from services.sidecar_filename_sync_service import SidecarFilenameSyncService
 from utils.trace_report import convert_current_trace_to_md, delete_current_converted_trace_md
 from config.api_key_store import (
     load_google_api_key as load_gemini_api_key,
@@ -28,6 +31,7 @@ class SettingScreen(ctk.CTkFrame):
         self.master = master
         self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.report_window = None
+        self.catalog_window = None
         self._setup_ui()
         self._load_config()
 
@@ -217,6 +221,87 @@ class SettingScreen(ctk.CTkFrame):
             hover_color=Color.BTN_WARNING_HOVER,
             command=self.delete_current_trace_report,
         ).pack(anchor="w", padx=16, pady=(0, 12))
+
+        ctk.CTkLabel(
+            container,
+            text="SQLite 数据库",
+            font=("Arial", 14),
+        ).pack(anchor="w", padx=16, pady=(10, 6))
+
+        ctk.CTkLabel(
+            container,
+            text=(
+                "对照 JACAR_Downloads 目录下的 PDF 重新同步 documents / files 表。"
+                "适用于重命名史料后手动刷新标题、路径与索引（不会删除既有 sidecar 记录）。"
+            ),
+            font=("Arial", 12),
+            text_color=Color.TEXT_HINT_TUPLE,
+            wraplength=560,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        Button(
+            container,
+            text="刷新 SQL 数据库（对照磁盘）",
+            width=280,
+            height=40,
+            command=self.refresh_sql_database_from_disk,
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        self.db_sync_hint_label = ctk.CTkLabel(
+            container,
+            text="尚未执行同步。",
+            font=("Arial", 12),
+            wraplength=560,
+            justify="left",
+        )
+        self.db_sync_hint_label.pack(anchor="w", padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(
+            container,
+            text=(
+                "若已在 Finder 中改过 PDF 文件名，可先将 JACAR_Downloads 下旧的 .json sidecar "
+                "重命名为与 PDF 同名（按 JACAR Ref 配对），再执行上方的 SQL 刷新。"
+            ),
+            font=("Arial", 12),
+            text_color=Color.TEXT_HINT_TUPLE,
+            wraplength=560,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        Button(
+            container,
+            text="同步 JSON 文件名（全盘）",
+            width=280,
+            height=40,
+            command=self.sync_sidecar_json_names,
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        self.sidecar_sync_hint_label = ctk.CTkLabel(
+            container,
+            text="尚未执行 JSON 同步。",
+            font=("Arial", 12),
+            wraplength=560,
+            justify="left",
+        )
+        self.sidecar_sync_hint_label.pack(anchor="w", padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(
+            container,
+            text="浏览、筛选与重命名 SQLite 中的 JACAR 条目，并导出 DOCX/PDF 史料目录。",
+            font=("Arial", 12),
+            text_color=Color.TEXT_HINT_TUPLE,
+            wraplength=560,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        Button(
+            container,
+            text="打开史料目录管理",
+            width=280,
+            height=40,
+            command=self.open_document_catalog_window,
+        ).pack(anchor="w", padx=16, pady=(0, 14))
 
         ctk.CTkLabel(
             container,
@@ -479,3 +564,88 @@ class SettingScreen(ctk.CTkFrame):
         self.report_window = ReportSummaryWindow(self, project_root=self.project_root)
         self.report_window.transient(self.winfo_toplevel())
         self.report_window.focus_set()
+
+    def open_document_catalog_window(self) -> None:
+        if self.catalog_window is not None and self.catalog_window.winfo_exists():
+            self.catalog_window.lift()
+            self.catalog_window.focus_set()
+            return
+        self.catalog_window = DocumentCatalogWindow(self, project_root=self.project_root)
+        self.catalog_window.transient(self.winfo_toplevel())
+        self.catalog_window.focus_set()
+
+    def refresh_sql_database_from_disk(self) -> None:
+        if not messagebox.askyesno(
+            "刷新 SQL 数据库",
+            "将扫描 JACAR_Downloads 下全部 PDF，并更新 SQLite 中的\n"
+            "标题、出处字段与 PDF 路径；对库中标记已下载但磁盘缺失的记录会重置为 discovered。\n\n"
+            "是否继续？",
+            parent=self.winfo_toplevel(),
+        ):
+            return
+        self.db_sync_hint_label.configure(text="正在对照磁盘刷新数据库，请稍候…")
+        threading.Thread(target=self._run_db_disk_sync, daemon=True).start()
+
+    def _run_db_disk_sync(self) -> None:
+        try:
+            stats = DbDiskSyncService(project_root=self.project_root).sync_from_disk()
+            report = "\n".join(stats.summary_lines())
+            summary = (
+                f"上次同步：扫描 {stats.pdfs_scanned} 个 PDF；"
+                f"更新 {stats.documents_updated} / 新建 {stats.documents_created} 条；"
+                f"路径 {stats.pdf_paths_updated} 条"
+            )
+            self.after(0, lambda: self._apply_db_sync_result(summary, report))
+        except Exception as exc:
+            err = str(exc)
+            self.after(0, lambda: self._apply_db_sync_error(err))
+
+    def _apply_db_sync_result(self, summary: str, report: str) -> None:
+        self.db_sync_hint_label.configure(text=summary)
+        self._show_cache_check_dialog("SQL 数据库同步结果", report)
+
+    def _apply_db_sync_error(self, err: str) -> None:
+        self.db_sync_hint_label.configure(text="数据库同步失败，请查看错误详情。")
+        messagebox.showerror("同步失败", f"无法刷新 SQL 数据库：\n{err}")
+
+    def sync_sidecar_json_names(self) -> None:
+        target = os.path.join(self.project_root, "JACAR_Downloads")
+        if not messagebox.askyesno(
+            "同步 JSON 文件名",
+            f"将递归扫描整个史料库：\n{target}\n\n"
+            "按 JACAR Ref 把 sidecar .json 重命名为与同条 PDF 相同的主文件名，"
+            "并更新 JSON 内的 Title 等字段。\n\n是否继续？",
+            parent=self.winfo_toplevel(),
+        ):
+            return
+        self.sidecar_sync_hint_label.configure(text="正在全盘同步 JSON 文件名，请稍候…")
+        threading.Thread(
+            target=self._run_sidecar_filename_sync,
+            args=(target,),
+            daemon=True,
+        ).start()
+
+    def _run_sidecar_filename_sync(self, target_dir: str) -> None:
+        try:
+            stats = SidecarFilenameSyncService(project_root=self.project_root).sync_directory(
+                target_dir
+            )
+            report = "\n".join(stats.summary_lines())
+            summary = (
+                f"JSON 同步：重命名 {stats.json_renamed} 个，"
+                f"已对齐 {stats.already_matched} 个，"
+                f"无 JSON 的 PDF {stats.pdfs_without_json} 个"
+            )
+            self.after(0, lambda: self._apply_sidecar_sync_result(summary, report))
+        except Exception as exc:
+            err = str(exc)
+            self.after(0, lambda: self._apply_sidecar_sync_error(err))
+
+    def _apply_sidecar_sync_result(self, summary: str, report: str) -> None:
+        self.sidecar_sync_hint_label.configure(text=summary)
+        self._show_cache_check_dialog("Sidecar JSON 文件名同步结果", report)
+
+    def _apply_sidecar_sync_error(self, err: str) -> None:
+        self.sidecar_sync_hint_label.configure(text="JSON 同步失败。")
+        messagebox.showerror("同步失败", f"无法同步 JSON 文件名：\n{err}")
+

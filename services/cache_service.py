@@ -12,7 +12,23 @@ class CacheService:
 
     def build_cache_path(self, pdf_path: str, cache_dir: str) -> str:
         stat = os.stat(pdf_path)
-        cache_key = f"{pdf_path}|{stat.st_mtime_ns}|{stat.st_size}"
+        return self.build_cache_path_from_stat(
+            pdf_path,
+            cache_dir,
+            mtime_ns=stat.st_mtime_ns,
+            size=stat.st_size,
+        )
+
+    @staticmethod
+    def build_cache_path_from_stat(
+        pdf_path: str,
+        cache_dir: str,
+        *,
+        mtime_ns: int,
+        size: int,
+    ) -> str:
+        """按路径 + mtime + size 生成缓存文件名（目标 PDF 尚未存在时也可计算新路径）。"""
+        cache_key = f"{pdf_path}|{mtime_ns}|{size}"
         name = hashlib.sha256(cache_key.encode("utf-8")).hexdigest() + ".txt"
         return os.path.join(cache_dir, name)
 

@@ -3,12 +3,16 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tkinter as tk
+
 import customtkinter as ctk
 from tkinter import messagebox
 
+from components.document_rename_dialog import DocumentRenameDialog
 from components.ui.button import Button
 from config.settings import Color
 from services.cache_service import CacheService
+from services.sidebar_pdf_index_service import PdfListItem, SidebarPdfIndexService
 from utils.app_state import AppState
 
 # Font Awesome glyphs (Private Use Area) — Symbols Nerd Font
@@ -26,20 +30,29 @@ class FileTreeSidebar(ctk.CTkFrame):
     ITEM_ACTIVE = ("#4a84db", "#3a5f96")
     ITEM_ACTIVE_HOVER = ("#3d73c9", "#476ea8")
     ITEM_TEXT = ("#2f3135", "#d7dbe1")
+    ITEM_TEXT_MUTED = ("#5c6570", "#9aa3ad")
     ITEM_TEXT_ACTIVE = ("#ffffff", "#ffffff")
     ITEM_BORDER = ("#aac0de", "#3c5678")
     ITEM_BORDER_ACTIVE = ("#6a94cf", "#7ca4d7")
     TITLE_TEXT = ("#1f2937", "#ffffff")
+    DEFAULT_WIDTH = 300
 
-    def __init__(self, master, width: int = 200, **kwargs):
-        super().__init__(master, width=width, fg_color=self.SIDEBAR_BG, **kwargs)
+    def __init__(self, master, width: int | None = None, **kwargs):
+        init_width = width if width is not None else self.DEFAULT_WIDTH
+        super().__init__(master, width=init_width, fg_color=self.SIDEBAR_BG, **kwargs)
         self.pack_propagate(False)
         self.cache_service = CacheService()
+        self.index_service = SidebarPdfIndexService()
         self.expanded_folders: dict[str, bool] = {}
         self.pdf_files: list[str] = []
-        self.file_item_buttons: list[ctk.CTkButton] = []
+        self.pdf_index: dict[str, PdfListItem] = {}
+        self.visible_paths: set[str] = set()
+        self.file_item_frames: list[ctk.CTkFrame] = []
         self._pdf_path_to_index: dict[str, int] = {}
         self.selected_file_index: int | None = None
+        self._tooltip_win: tk.Toplevel | None = None
+        self._tooltip_hide_after_id: str | None = None
+        self._search_debounce_id: str | None = None
 
         self._project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.download_dir = os.path.join(self._project_root, "JACAR_Downloads")
@@ -55,7 +68,7 @@ class FileTreeSidebar(ctk.CTkFrame):
 
     def _setup_ui(self) -> None:
         file_library_title = ctk.CTkFrame(self, fg_color=Color.TRANSPARENT)
-        file_library_title.pack(pady=10)
+        file_library_title.pack(pady=(10, 4))
         ctk.CTkLabel(
             file_library_title,
             text="\U0000EAEB",
@@ -68,6 +81,28 @@ class FileTreeSidebar(ctk.CTkFrame):
             font=("Arial", 16, "bold"),
             text_color=self.TITLE_TEXT,
         ).pack(side="left")
+
+        search_wrap = ctk.CTkFrame(self, fg_color=Color.TRANSPARENT)
+        search_wrap.pack(fill="x", padx=8, pady=(0, 4))
+        self.search_var = ctk.StringVar()
+        self.search_entry = ctk.CTkEntry(
+            search_wrap,
+            textvariable=self.search_var,
+            placeholder_text="搜索 Ref / 标题 / 卷名（联动 SQL）",
+            height=32,
+        )
+        self.search_entry.pack(fill="x")
+        self.search_entry.bind("<KeyRelease>", self._on_search_changed)
+        self.search_entry.bind("<Return>", lambda _e: self._apply_search())
+
+        self.search_stats_label = ctk.CTkLabel(
+            self,
+            text="",
+            font=("Arial", 11),
+            text_color=self.ITEM_TEXT_MUTED,
+            anchor="w",
+        )
+        self.search_stats_label.pack(fill="x", padx=10, pady=(0, 4))
 
         list_container = ctk.CTkFrame(self, fg_color=Color.TRANSPARENT)
         list_container.pack(fill="both", expand=True, padx=5, pady=5)
@@ -94,11 +129,47 @@ class FileTreeSidebar(ctk.CTkFrame):
             text="刷新列表",
             height=38,
             command=self.refresh_file_list,
+        ).pack(fill="x", pady=(0, 6))
+
+        Button(
+            list_action_frame,
+            text="重命名标题",
+            height=38,
+            command=self.rename_selected_title,
         ).pack(fill="x")
 
     @staticmethod
     def _norm_path(p: str) -> str:
         return os.path.normpath(os.path.abspath(p))
+
+    def _on_search_changed(self, _event=None) -> None:
+        if self._search_debounce_id is not None:
+            try:
+                self.after_cancel(self._search_debounce_id)
+            except (tk.TclError, ValueError):
+                pass
+        self._search_debounce_id = self.after(180, self._apply_search)
+
+    def _apply_search(self) -> None:
+        self._search_debounce_id = None
+        needle = (self.search_var.get() or "").strip()
+        self.visible_paths = self.index_service.filter_paths(self.pdf_index, needle)
+        self._render_file_views()
+        self._update_search_stats()
+        if self.selected_file_index is not None:
+            path = self.pdf_files[self.selected_file_index]
+            if path not in self.visible_paths:
+                self.selected_file_index = None
+                self._refresh_file_item_styles()
+
+    def _update_search_stats(self) -> None:
+        total = len(self.pdf_files)
+        shown = len(self.visible_paths)
+        needle = (self.search_var.get() or "").strip()
+        if needle:
+            self.search_stats_label.configure(text=f"显示 {shown} / 共 {total} 条（SQL + 本地）")
+        else:
+            self.search_stats_label.configure(text=f"共 {total} 条史料")
 
     def _collect_pdfs_dfs(self, root_dir: str) -> list[str]:
         """深度优先：先各子目录（按名排序），再当前目录下的 PDF（按名排序）。"""
@@ -145,7 +216,149 @@ class FileTreeSidebar(ctk.CTkFrame):
                 return True
         return False
 
+    def _folder_has_visible_pdfs(self, abs_dir: str) -> bool:
+        prefix = self._norm_path(abs_dir) + os.sep
+        for path in self.visible_paths:
+            if path == self._norm_path(abs_dir) or path.startswith(prefix):
+                return True
+        return False
+
+    def _cancel_tooltip_hide(self) -> None:
+        if self._tooltip_hide_after_id is not None:
+            try:
+                self.after_cancel(self._tooltip_hide_after_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._tooltip_hide_after_id = None
+
+    def _hide_tooltip(self) -> None:
+        self._cancel_tooltip_hide()
+        if self._tooltip_win is not None:
+            try:
+                if self._tooltip_win.winfo_exists():
+                    self._tooltip_win.destroy()
+            except tk.TclError:
+                pass
+            self._tooltip_win = None
+
+    def _position_tooltip(self, tw: tk.Toplevel, anchor: tk.Misc) -> None:
+        tw.update_idletasks()
+        tw_w = max(tw.winfo_width(), 1)
+        tw_h = max(tw.winfo_height(), 1)
+        ax = anchor.winfo_rootx()
+        ay = anchor.winfo_rooty()
+        aw = max(anchor.winfo_width(), 1)
+        ah = max(anchor.winfo_height(), 1)
+        # 紧贴当前悬停的标签：左对齐、紧贴其下沿
+        x = ax
+        y = ay + ah + 4
+        screen_w = anchor.winfo_screenwidth()
+        screen_h = anchor.winfo_screenheight()
+        if x + tw_w > screen_w - 12:
+            x = max(8, screen_w - tw_w - 12)
+        if y + tw_h > screen_h - 20:
+            y = max(8, ay - tw_h - 4)
+        tw.geometry(f"+{x}+{y}")
+
+    def _show_tooltip(self, anchor: tk.Misc, text: str) -> None:
+        self._hide_tooltip()
+        if not text:
+            return
+        tw = tk.Toplevel(anchor)
+        tw.wm_overrideredirect(True)
+        tw.attributes("-topmost", True)
+        tk.Label(
+            tw,
+            text=text,
+            justify="left",
+            bg="#1e293b",
+            fg="#f8fafc",
+            font=("Arial", 11),
+            padx=10,
+            pady=6,
+            wraplength=420,
+        ).pack()
+        self._position_tooltip(tw, anchor)
+        self._tooltip_win = tw
+
+    def _bind_tooltip(self, widget: tk.Misc, text: str) -> None:
+        def _on_enter(_event=None) -> None:
+            self._cancel_tooltip_hide()
+            self._show_tooltip(widget, text)
+
+        def _on_leave(_event=None) -> None:
+            self._cancel_tooltip_hide()
+            self._tooltip_hide_after_id = self.after(80, self._hide_tooltip)
+
+        widget.bind("<Enter>", _on_enter)
+        widget.bind("<Leave>", _on_leave)
+
+    def _render_pdf_item(
+        self,
+        parent,
+        *,
+        idx: int,
+        item: PdfListItem,
+        depth: int,
+    ) -> ctk.CTkFrame:
+        cache_tag = " 🟢" if self._has_any_cache(item.path) else ""
+        row = ctk.CTkFrame(
+            parent,
+            fg_color=Color.TRANSPARENT,
+            corner_radius=16,
+            border_width=1,
+            border_color=self.ITEM_BORDER,
+            height=52,
+        )
+        row.pack(fill="x", padx=(4 + depth * 14, 4), pady=2)
+        row.pack_propagate(False)
+        row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            row,
+            text=_TREE_ICON_PDF,
+            font=("Symbols Nerd Font", 13),
+            text_color=self.ITEM_TEXT,
+            width=20,
+        ).grid(row=0, column=0, rowspan=2, padx=(8, 4), pady=6, sticky="nw")
+
+        line1 = f"{item.line1}{cache_tag}"
+        ref_label = ctk.CTkLabel(
+            row,
+            text=line1,
+            font=("Arial", 12, "bold"),
+            text_color=self.ITEM_TEXT,
+            anchor="w",
+        )
+        ref_label.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(6, 0))
+
+        summary_label = ctk.CTkLabel(
+            row,
+            text=item.line2,
+            font=("Arial", 10),
+            text_color=self.ITEM_TEXT_MUTED,
+            anchor="w",
+        )
+        summary_label.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(0, 6))
+
+        tooltip_text = item.tooltip_text
+        for widget in row.winfo_children():
+            widget.bind("<Button-1>", lambda _e, i=idx: self.on_file_select(i))
+        row.bind("<Button-1>", lambda _e, i=idx: self.on_file_select(i))
+        row.configure(cursor="hand2")
+        ref_label.configure(cursor="hand2")
+        summary_label.configure(cursor="hand2")
+        row._pdf_idx = idx  # type: ignore[attr-defined]
+        # 仅在 Ref 行与摘要行悬停时显示全文，并锚定到对应标签位置
+        self._bind_tooltip(ref_label, tooltip_text)
+        self._bind_tooltip(summary_label, tooltip_text)
+        self.file_item_frames.append(row)
+        return row
+
     def _render_dir_tree(self, parent, abs_dir: str, depth: int) -> None:
+        if not self._folder_has_visible_pdfs(abs_dir):
+            return
+
         try:
             names = os.listdir(abs_dir)
         except OSError:
@@ -160,6 +373,8 @@ class FileTreeSidebar(ctk.CTkFrame):
 
         for name in subdirs:
             dpath = os.path.join(abs_dir, name)
+            if not self._folder_has_visible_pdfs(dpath):
+                continue
             norm = self._norm_path(dpath)
             if norm not in self.expanded_folders:
                 self.expanded_folders[norm] = True
@@ -183,7 +398,7 @@ class FileTreeSidebar(ctk.CTkFrame):
                 border_color=self.ITEM_BORDER,
                 state="normal",
             )
-            folder_btn.pack(fill="x", padx=(4 + depth * 18, 4), pady=2)
+            folder_btn.pack(fill="x", padx=(4 + depth * 14, 4), pady=2)
 
             child_host = ctk.CTkFrame(outer, fg_color=Color.TRANSPARENT)
             self._render_dir_tree(child_host, dpath, depth + 1)
@@ -201,48 +416,72 @@ class FileTreeSidebar(ctk.CTkFrame):
         for name in pdfs_here:
             fpath = os.path.join(abs_dir, name)
             norm_f = self._norm_path(fpath)
+            if norm_f not in self.visible_paths:
+                continue
             idx = self._pdf_path_to_index.get(norm_f)
             if idx is None:
                 continue
-            cache_tag = "   🟢 [已缓存]" if self._has_any_cache(fpath) else ""
-            text = f"{_TREE_ICON_PDF}  {name}{cache_tag}"
-            btn = ctk.CTkButton(
-                parent,
-                text=text,
-                font=("Symbols Nerd Font", 12),
-                fg_color=Color.TRANSPARENT,
-                hover_color=self.ITEM_HOVER,
-                text_color=self.ITEM_TEXT,
-                anchor="w",
-                height=34,
-                corner_radius=16,
-                border_width=1,
-                border_color=self.ITEM_BORDER,
-                command=lambda i=idx: self.on_file_select(i),
-            )
-            btn.pack(fill="x", padx=(4 + depth * 18, 4), pady=2)
-            self.file_item_buttons.append(btn)
+            item = self.pdf_index.get(norm_f)
+            if item is None:
+                continue
+            self._render_pdf_item(parent, idx=idx, item=item, depth=depth)
 
-    def _load_file_list(self) -> None:
-        self.pdf_files.clear()
-        self.file_item_buttons.clear()
-        self.selected_file_index = None
-        self._pdf_path_to_index.clear()
+    def _render_flat_results(self) -> None:
+        ordered = [
+            self.pdf_index[path]
+            for path in self.pdf_files
+            if path in self.visible_paths and path in self.pdf_index
+        ]
+        if not ordered:
+            ctk.CTkLabel(
+                self.file_list_frame,
+                text="无匹配史料，请调整搜索词。",
+                text_color=self.ITEM_TEXT_MUTED,
+            ).pack(anchor="w", padx=10, pady=10)
+            return
+        for item in ordered:
+            idx = self._pdf_path_to_index.get(item.path)
+            if idx is None:
+                continue
+            self._render_pdf_item(self.file_list_frame, idx=idx, item=item, depth=0)
 
+    def _render_file_views(self) -> None:
+        self._hide_tooltip()
+        self.file_item_frames.clear()
         for widget in self.file_list_frame.winfo_children():
             widget.destroy()
-
-        if not os.path.exists(self.download_dir):
-            os.makedirs(self.download_dir, exist_ok=True)
-            return
-
-        self.pdf_files = self._collect_pdfs_dfs(self.download_dir)
-        self._pdf_path_to_index = {self._norm_path(p): i for i, p in enumerate(self.pdf_files)}
 
         if not self.pdf_files:
             return
 
-        self._render_dir_tree(self.file_list_frame, self.download_dir, depth=0)
+        needle = (self.search_var.get() or "").strip()
+        if needle:
+            self._render_flat_results()
+        else:
+            self._render_dir_tree(self.file_list_frame, self.download_dir, depth=0)
+
+        self._refresh_file_item_styles()
+
+    def _load_file_list(self) -> None:
+        self.pdf_files.clear()
+        self.file_item_frames.clear()
+        self.pdf_index.clear()
+        self._pdf_path_to_index.clear()
+
+        if not os.path.exists(self.download_dir):
+            os.makedirs(self.download_dir, exist_ok=True)
+            self.visible_paths = set()
+            self._update_search_stats()
+            return
+
+        self.pdf_files = [self._norm_path(p) for p in self._collect_pdfs_dfs(self.download_dir)]
+        self.pdf_index = self.index_service.build_index(self.pdf_files)
+        self._pdf_path_to_index = {p: i for i, p in enumerate(self.pdf_files)}
+        needle = (self.search_var.get() or "").strip()
+        self.visible_paths = self.index_service.filter_paths(self.pdf_index, needle)
+
+        self._render_file_views()
+        self._update_search_stats()
         self._auto_select_pdf()
 
     def _auto_select_pdf(self) -> None:
@@ -250,18 +489,25 @@ class FileTreeSidebar(ctk.CTkFrame):
             return
         current = AppState().selected_pdf_path
         current_norm = self._norm_path(current) if current else None
-        match = next((p for p in self.pdf_files if self._norm_path(p) == current_norm), None)
-        target_path = match if match else self.pdf_files[0]
+        match = next((p for p in self.pdf_files if p == current_norm), None)
+        if match and match not in self.visible_paths:
+            match = None
+        target_path = match if match else next((p for p in self.pdf_files if p in self.visible_paths), None)
+        if not target_path:
+            return
         target_idx = self.pdf_files.index(target_path)
         self.on_file_select(target_idx)
 
     def on_file_select(self, index: int) -> None:
         if index < 0 or index >= len(self.pdf_files):
             return
+        path = self.pdf_files[index]
+        if path not in self.visible_paths:
+            return
         self._animate_file_press(index)
         self.selected_file_index = index
         self._refresh_file_item_styles()
-        AppState().set_selected_pdf(self.pdf_files[index])
+        AppState().set_selected_pdf(path)
 
     def _on_global_file_changed(self, pdf_path: str) -> None:
         if not pdf_path or not self.pdf_files:
@@ -273,33 +519,59 @@ class FileTreeSidebar(ctk.CTkFrame):
         self.selected_file_index = idx
         self._refresh_file_item_styles()
 
+    def _find_row_for_index(self, index: int) -> ctk.CTkFrame | None:
+        for row in self.file_item_frames:
+            if getattr(row, "_pdf_idx", None) == index:
+                return row
+        return None
+
     def _animate_file_press(self, index: int) -> None:
-        if index < 0 or index >= len(self.file_item_buttons):
+        row = self._find_row_for_index(index)
+        if row is None:
             return
-        btn = self.file_item_buttons[index]
-        btn.configure(height=31)
-        self.after(80, lambda b=btn: b.winfo_exists() and b.configure(height=34))
+        row.configure(height=48)
+        self.after(80, lambda r=row: r.winfo_exists() and r.configure(height=52))
 
     def _refresh_file_item_styles(self) -> None:
-        for idx, btn in enumerate(self.file_item_buttons):
-            if not btn.winfo_exists():
+        for row in self.file_item_frames:
+            if not row.winfo_exists():
                 continue
-            if idx == self.selected_file_index:
-                btn.configure(
+            item_idx = getattr(row, "_pdf_idx", None)
+            is_active = item_idx == self.selected_file_index
+            labels = [c for c in row.winfo_children() if isinstance(c, ctk.CTkLabel)]
+            if is_active:
+                row.configure(
                     fg_color=Color.BG_LIST_ITEM_ACTIVE,
-                    hover_color=self.ITEM_ACTIVE_HOVER,
-                    text_color=self.ITEM_TEXT_ACTIVE,
-                    border_width=1,
                     border_color=self.ITEM_BORDER_ACTIVE,
                 )
+                for child in labels:
+                    child.configure(text_color=self.ITEM_TEXT_ACTIVE)
             else:
-                btn.configure(
+                row.configure(
                     fg_color=Color.TRANSPARENT,
-                    hover_color=self.ITEM_HOVER,
-                    text_color=self.ITEM_TEXT,
-                    border_width=1,
                     border_color=self.ITEM_BORDER,
                 )
+                if labels:
+                    labels[0].configure(text_color=self.ITEM_TEXT)
+                if len(labels) > 1:
+                    labels[1].configure(text_color=self.ITEM_TEXT)
+                if len(labels) > 2:
+                    labels[2].configure(text_color=self.ITEM_TEXT_MUTED)
+
+    def rename_selected_title(self) -> None:
+        if self.selected_file_index is None or not self.pdf_files:
+            messagebox.showwarning("提示", "请先在列表中选择一条史料 PDF。")
+            return
+        pdf_path = self.pdf_files[self.selected_file_index]
+
+        def _after_rename(new_path: str) -> None:
+            self._load_file_list()
+            norm = self._norm_path(new_path)
+            idx = self._pdf_path_to_index.get(norm)
+            if idx is not None:
+                self.on_file_select(idx)
+
+        DocumentRenameDialog(self.winfo_toplevel(), pdf_path, on_success=_after_rename)
 
     def refresh_file_list(self) -> None:
         self._load_file_list()

@@ -23,8 +23,10 @@ from config.settings import (
 )
 from config.api_key_store import load_google_api_key as load_gemini_api_key
 from services import CacheService, LlmService, PdfService
+from services.report_service import ReportService
 from utils.app_state import AppState
 from utils.docx_export import write_pages_to_docx
+from utils.open_path import open_path_in_system
 from utils.token_logger import log_context_cache_event, storage_hours_between
 
 class DocumentTaskState(Enum):
@@ -337,6 +339,9 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self.download_dir = os.path.join(base_dir, "JACAR_Downloads")
         self.document_cache_dir = os.path.join(base_dir, cls.cache_dir_name)
         self._ocr_cache_dir = os.path.join(base_dir, "OCR_Cache")
+        self._analysis_cache_dir = os.path.join(base_dir, "Analysis_Cache")
+        self._translation_cache_dir = os.path.join(base_dir, "Translation_Cache")
+        self._report_service = ReportService(project_root=base_dir)
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
         if not os.path.exists(self.document_cache_dir):
@@ -481,6 +486,10 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         )
         self.document_title_label.pack(fill="x", anchor="w", padx=10, pady=8)
         self.document_title_bar.bind("<Configure>", self._sync_document_title_wrap)
+        self._copy_toast_win = None
+        self._copy_toast_after_id = None
+        for widget in (self.document_title_bar, self.document_title_label):
+            widget.bind("<Button-1>", self._on_document_title_click)
         
         self.canvas = tk.Canvas(self.mid_frame, bg=Color.BG_PANEL, highlightthickness=0, cursor="hand2")
         self.canvas.pack(fill="both", expand=True, padx=5, pady=5)
@@ -588,6 +597,34 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             self.clear_ocr_cache,
         )
         self.btn_clear_cache.pack(pady=(0, 8), padx=12, fill="x")
+
+        ctk.CTkLabel(
+            self.action_frame,
+            text="打开关联文件",
+            font=("Arial", 12, "bold"),
+        ).pack(anchor="w", padx=12, pady=(4, 4))
+
+        # 操作区较窄（paned minsize≈180）：并排两列时右侧按钮会被裁切，故改为纵向全宽。
+        artifact_cache_col = ctk.CTkFrame(self.action_frame, fg_color=Color.TRANSPARENT)
+        artifact_cache_col.pack(fill="x", padx=12, pady=(0, 4))
+        for label, cmd in (
+            ("OCR 缓存", self.open_ocr_cache_file),
+            ("分析缓存", self.open_analysis_cache_file),
+            ("翻译缓存", self.open_translation_cache_file),
+        ):
+            Button(
+                artifact_cache_col,
+                text=label,
+                height=30,
+                command=cmd,
+            ).pack(fill="x", pady=(0, 4))
+
+        Button(
+            self.action_frame,
+            text="汇报(导出2)",
+            height=30,
+            command=self.open_summary_report_file,
+        ).pack(fill="x", padx=12, pady=(0, 8))
 
         self.btn_export = self._build_icon_button(
             self.action_frame,
@@ -790,12 +827,71 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         if not hasattr(self, "document_title_label"):
             return
         if not file_path:
-            self.document_title_label.configure(text="请从左侧史料文件库选择 PDF")
+            self.document_title_label.configure(
+                text="请从左侧史料文件库选择 PDF",
+                cursor="",
+            )
+            self.document_title_bar.configure(cursor="")
             self._sync_document_title_wrap()
             return
         full_name = os.path.basename(file_path)
-        self.document_title_label.configure(text=full_name)
+        self.document_title_label.configure(text=full_name, cursor="hand2")
+        self.document_title_bar.configure(cursor="hand2")
         self._sync_document_title_wrap()
+
+    def _document_title_clipboard_text(self) -> str:
+        raw = (self.document_title_label.cget("text") or "").strip()
+        if not raw or raw == "请从左侧史料文件库选择 PDF":
+            return ""
+        return os.path.splitext(raw)[0]
+
+    def _on_document_title_click(self, _event=None) -> None:
+        text = self._document_title_clipboard_text()
+        if not text:
+            return
+        top = self.winfo_toplevel()
+        top.clipboard_clear()
+        top.clipboard_append(text)
+        top.update_idletasks()
+        self._show_copy_success_toast()
+
+    def _show_copy_success_toast(self, *, duration_ms: int = 500) -> None:
+        self._dismiss_copy_success_toast()
+        toast = ctk.CTkToplevel(self)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(fg_color=("#1e293b", "#334155"))
+        ctk.CTkLabel(
+            toast,
+            text="复制成功",
+            font=("Arial", 13),
+            text_color=("#f8fafc", "#f1f5f9"),
+        ).pack(padx=18, pady=10)
+        toast.update_idletasks()
+        bar = self.document_title_bar
+        x = bar.winfo_rootx() + max(bar.winfo_width(), 1) // 2
+        y = bar.winfo_rooty() + max(bar.winfo_height(), 1) // 2
+        w = max(toast.winfo_width(), 1)
+        h = max(toast.winfo_height(), 1)
+        toast.geometry(f"+{x - w // 2}+{y - h // 2}")
+        self._copy_toast_win = toast
+        self._copy_toast_after_id = self.after(duration_ms, self._dismiss_copy_success_toast)
+
+    def _dismiss_copy_success_toast(self) -> None:
+        if self._copy_toast_after_id is not None:
+            try:
+                self.after_cancel(self._copy_toast_after_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._copy_toast_after_id = None
+        win = self._copy_toast_win
+        self._copy_toast_win = None
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.destroy()
+            except tk.TclError:
+                pass
 
     def open_pdf(self, file_path):
         self.cancel_ocr_task(silent=True)
@@ -1370,6 +1466,69 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
 
     def _build_cache_path(self, pdf_path):
         return self.cache_service.build_cache_path(pdf_path, self.document_cache_dir)
+
+    def _selected_pdf_or_warn(self) -> str | None:
+        path = self.selected_pdf_path
+        if not path or not os.path.isfile(path):
+            messagebox.showwarning("提示", "请先在左侧史料文件库选择一条 PDF。")
+            return None
+        return path
+
+    def _open_existing_file(self, path: str, *, label: str) -> None:
+        if not path or not os.path.isfile(path):
+            messagebox.showinfo(
+                "文件不存在",
+                f"{label}不存在。\n\n预期路径：\n{path or '(无法解析路径)'}",
+            )
+            return
+        try:
+            open_path_in_system(path)
+        except FileNotFoundError:
+            messagebox.showinfo("文件不存在", f"{label}不存在。\n\n{path}")
+        except Exception as exc:
+            messagebox.showerror("打开失败", f"无法打开 {label}：\n{exc}")
+
+    def open_ocr_cache_file(self) -> None:
+        pdf_path = self._selected_pdf_or_warn()
+        if not pdf_path:
+            return
+        cache_path = self._build_ocr_cache_path(pdf_path)
+        self._open_existing_file(cache_path, label="OCR 缓存文件")
+
+    def open_analysis_cache_file(self) -> None:
+        pdf_path = self._selected_pdf_or_warn()
+        if not pdf_path:
+            return
+        cache_path = self.cache_service.build_cache_path(pdf_path, self._analysis_cache_dir)
+        self._open_existing_file(cache_path, label="分析缓存文件")
+
+    def open_translation_cache_file(self) -> None:
+        pdf_path = self._selected_pdf_or_warn()
+        if not pdf_path:
+            return
+        cache_path = self.cache_service.build_cache_path(pdf_path, self._translation_cache_dir)
+        self._open_existing_file(cache_path, label="Translation 缓存文件")
+
+    def open_summary_report_file(self) -> None:
+        """打开进度汇报「内容2」生成的 summary Markdown（导出2）。"""
+        pdf_path = self._selected_pdf_or_warn()
+        if not pdf_path:
+            return
+        probe = self._report_service.probe_export_artifacts(pdf_path)
+        md_path = str(probe.get("summary_md_path") or "")
+        if not probe.get("summary_md_exists"):
+            expected = self._report_service.expected_summary_md_path(
+                pdf_path,
+                self._report_service.default_summary_dir(),
+            )
+            messagebox.showinfo(
+                "文件不存在",
+                "汇报文件（内容2 总结 MD）不存在。\n\n"
+                f"预期路径：\n{expected}\n\n"
+                "请先在「进度汇报中心」生成内容2 总结。",
+            )
+            return
+        self._open_existing_file(md_path, label="汇报文件（导出2）")
 
     @staticmethod
     def _iso_utc_now() -> str:
