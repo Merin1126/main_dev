@@ -1,5 +1,8 @@
 import customtkinter as ctk
+import json
 import os
+import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
 from tkinter import messagebox
@@ -11,6 +14,7 @@ from screens.report_summary_window import ReportSummaryWindow
 from services import LlmService
 from services.db_disk_sync_service import DbDiskSyncService
 from services.sidecar_filename_sync_service import SidecarFilenameSyncService
+from services.scraper_health_check_service import ScraperHealthCheckService, ScraperHealthCheckResult
 from utils.trace_report import convert_current_trace_to_md, delete_current_converted_trace_md
 from config.api_key_store import (
     load_google_api_key as load_gemini_api_key,
@@ -285,6 +289,42 @@ class SettingScreen(ctk.CTkFrame):
             justify="left",
         )
         self.sidecar_sync_hint_label.pack(anchor="w", padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(
+            container,
+            text="Scraper 自检",
+            font=("Arial", 14),
+        ).pack(anchor="w", padx=16, pady=(10, 6))
+
+        ctk.CTkLabel(
+            container,
+            text=(
+                "执行一次不下载文件、不写抓取数据库的冒烟测试：检查 JACAR 是否可访问、"
+                "Selenium/Chrome 是否能启动，以及结果页关键选择器是否仍然可用。"
+            ),
+            font=("Arial", 12),
+            text_color=Color.TEXT_HINT_TUPLE,
+            wraplength=560,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        self.scraper_test_btn = Button(
+            container,
+            text="测试 Scraper 是否正常",
+            width=280,
+            height=40,
+            command=self.test_scraper_health,
+        )
+        self.scraper_test_btn.pack(anchor="w", padx=16, pady=(0, 8))
+
+        self.scraper_test_hint_label = ctk.CTkLabel(
+            container,
+            text="尚未执行自检。",
+            font=("Arial", 12),
+            wraplength=560,
+            justify="left",
+        )
+        self.scraper_test_hint_label.pack(anchor="w", padx=16, pady=(0, 8))
 
         ctk.CTkLabel(
             container,
@@ -648,4 +688,105 @@ class SettingScreen(ctk.CTkFrame):
     def _apply_sidecar_sync_error(self, err: str) -> None:
         self.sidecar_sync_hint_label.configure(text="JSON 同步失败。")
         messagebox.showerror("同步失败", f"无法同步 JSON 文件名：\n{err}")
+
+    def test_scraper_health(self) -> None:
+        self.scraper_test_btn.configure(state="disabled")
+        self.scraper_test_hint_label.configure(text="正在执行 Scraper 自检，请稍候…")
+        threading.Thread(target=self._run_scraper_health_check, daemon=True).start()
+
+    def _run_scraper_health_check(self) -> None:
+        service = ScraperHealthCheckService(project_root=self.project_root)
+        script_path = os.path.join(self.project_root, "scripts", "run_scraper_health_check.py")
+        try:
+            completed = subprocess.run(
+                [sys.executable, script_path],
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            stdout = (completed.stdout or "").strip()
+            stderr = (completed.stderr or "").strip()
+            if completed.returncode != 0:
+                log_path = service.write_manual_error_log(
+                    message=(
+                        f"Scraper 自检子进程异常退出，exit_code={completed.returncode}。"
+                        f"请检查网址：{service.search_url()}"
+                    ),
+                    lines=[
+                        "stdout:",
+                        stdout or "（空）",
+                        "",
+                        "stderr:",
+                        stderr or "（空）",
+                    ],
+                )
+                result = ScraperHealthCheckResult(
+                    ok=False,
+                    message=(
+                        "Scraper 自检失败：自检子进程异常退出。"
+                        f"请检查网址：{service.search_url()}"
+                    ),
+                    log_path=log_path,
+                    url=service.search_url(),
+                )
+            else:
+                payload = json.loads(stdout.splitlines()[-1])
+                result = ScraperHealthCheckResult(
+                    ok=bool(payload.get("ok")),
+                    message=str(payload.get("message") or ""),
+                    log_path=str(payload.get("log_path") or ""),
+                    url=str(payload.get("url") or service.search_url()),
+                    rows_found=int(payload.get("rows_found") or 0),
+                )
+        except subprocess.TimeoutExpired as exc:
+            log_path = service.write_manual_error_log(
+                message=(
+                    "Scraper 自检超过 120 秒未完成，已终止子进程。"
+                    f"请检查网址：{service.search_url()}"
+                ),
+                lines=[
+                    "stdout:",
+                    (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "（空）",
+                    "",
+                    "stderr:",
+                    (exc.stderr or "").strip() if isinstance(exc.stderr, str) else "（空）",
+                ],
+            )
+            result = ScraperHealthCheckResult(
+                ok=False,
+                message=f"Scraper 自检超时。请检查网址：{service.search_url()}",
+                log_path=log_path,
+                url=service.search_url(),
+            )
+        except Exception as exc:
+            log_path = service.write_manual_error_log(
+                message=f"Scraper 自检启动失败：{exc}。请检查网址：{service.search_url()}"
+            )
+            result = ScraperHealthCheckResult(
+                ok=False,
+                message=f"Scraper 自检启动失败：{exc}。请检查网址：{service.search_url()}",
+                log_path=log_path,
+                url=service.search_url(),
+            )
+        self.after(0, lambda: self._apply_scraper_health_result(result))
+
+    def _apply_scraper_health_result(self, result: ScraperHealthCheckResult) -> None:
+        self.scraper_test_btn.configure(state="normal")
+        if result.ok:
+            self.scraper_test_hint_label.configure(
+                text=f"上次自检：通过；命中 {result.rows_found} 行。"
+            )
+            messagebox.showinfo("Scraper 自检通过", result.message)
+            return
+
+        hint = "上次自检：失败。"
+        if result.log_path:
+            hint += f" 错误日志：{result.log_path}"
+        self.scraper_test_hint_label.configure(text=hint)
+        messagebox.showerror(
+            "Scraper 自检失败",
+            f"{result.message}\n\n请用户自行检查网址：\n{result.url}\n\n错误日志已保存：\n{result.log_path}",
+        )
 
