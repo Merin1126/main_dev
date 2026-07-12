@@ -223,6 +223,37 @@ class DbService:
             return None
         return str(row["status"]) if row["status"] is not None else None
 
+    def add_document_keyword(self, source: str, native_id: str, keyword: str | None) -> None:
+        """Record a keyword hit without changing document identity or download state."""
+        clean = (keyword or "").strip()
+        if not clean:
+            return
+        document_id = self.make_document_id(source, native_id)
+        now = self.utc_now_iso()
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM documents WHERE document_id = ? LIMIT 1",
+                (document_id,),
+            ).fetchone()
+            if row is None:
+                return
+            conn.execute(
+                """
+                INSERT INTO document_keywords(document_id, keyword, first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(document_id, keyword) DO UPDATE SET
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (document_id, clean, now, now),
+            )
+
+    def list_document_keywords(self, document_id: str) -> list[str]:
+        rows = self.fetchall(
+            "SELECT keyword FROM document_keywords WHERE document_id = ? ORDER BY keyword",
+            (document_id,),
+        )
+        return [str(row["keyword"]) for row in rows]
+
     def upsert_document(
         self,
         *,
@@ -276,6 +307,7 @@ class DbService:
                     now,
                 ),
             )
+        self.add_document_keyword(source, native_id, search_keyword)
         return document_id
 
     def mark_document_status(self, source: str, native_id: str, status: str) -> None:

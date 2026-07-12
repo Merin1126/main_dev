@@ -100,11 +100,9 @@ class DocumentStorageService:
         self.layout: LayoutMode = layout or self._configured_layout()
         self.cache_service = cache_service or CacheService()
         configured_root = os.path.abspath(str(DOCUMENT_BUNDLE_ROOT))
-        default_root = os.path.abspath(
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "JACAR_Downloads")
-        )
+        default_root = os.path.abspath(str(DOCUMENT_BUNDLE_ROOT))
         self.bundle_root = (
-            os.path.join(self.project_root, "JACAR_Downloads")
+            os.path.join(self.project_root, "Historical_Documents")
             if configured_root == default_root
             else configured_root
         )
@@ -161,14 +159,33 @@ class DocumentStorageService:
             citation_text=citation_text,
         )
 
-    def planned_bundle_dir(self, identity: DocumentIdentity) -> str:
+    @staticmethod
+    def _safe_path_part(value: str) -> str:
+        clean = str(value or "").strip().replace("/", "_").replace("\\", "_")
+        return clean or "unknown"
+
+    def planned_bundle_dir(
+        self,
+        identity: DocumentIdentity,
+        *,
+        hierarchy: tuple[str, ...] = (),
+    ) -> str:
         ref = identity.native_id or "unknown"
+        source = self._safe_path_part(identity.source or "unknown")
+        parts = [self.bundle_root, source]
+        parts.extend(self._safe_path_part(part) for part in hierarchy if str(part or "").strip())
+        parts.append(self._safe_path_part(ref))
         return os.path.abspath(
-            os.path.join(self.bundle_root, identity.search_keyword or "未分类", ref)
+            os.path.join(*parts)
         )
 
-    def ensure_bundle_dir(self, identity: DocumentIdentity) -> DocumentBundle:
-        root_dir = self.planned_bundle_dir(identity)
+    def ensure_bundle_dir(
+        self,
+        identity: DocumentIdentity,
+        *,
+        hierarchy: tuple[str, ...] = (),
+    ) -> DocumentBundle:
+        root_dir = self.planned_bundle_dir(identity, hierarchy=hierarchy)
         os.makedirs(root_dir, exist_ok=True)
         return DocumentBundle(
             root_dir=root_dir,

@@ -91,7 +91,13 @@ class SidebarPdfIndexService:
                 COALESCE(level2_name, '') AS level2_name,
                 COALESCE(parent_name, '') AS parent_name,
                 COALESCE(repo_name, '') AS repo_name,
-                COALESCE(NULLIF(TRIM(search_keyword), ''), '') AS search_keyword
+                COALESCE(
+                    (SELECT GROUP_CONCAT(dk.keyword, '、')
+                     FROM document_keywords dk
+                     WHERE dk.document_id = documents.document_id),
+                    NULLIF(TRIM(search_keyword), ''),
+                    ''
+                ) AS search_keyword
             FROM documents
             WHERE source = 'jacar' AND status != 'failed'
             """
@@ -156,10 +162,14 @@ class SidebarPdfIndexService:
                  OR d.parent_name LIKE ?
                  OR d.repo_name LIKE ?
                  OR d.search_keyword LIKE ?
+                 OR EXISTS (
+                        SELECT 1 FROM document_keywords dk
+                        WHERE dk.document_id = d.document_id AND dk.keyword LIKE ?
+                    )
                  OR fp.path LIKE ?
               )
             """,
-            (pattern, pattern, pattern, pattern, pattern, pattern, pattern),
+            (pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern),
         )
         hits: set[str] = set()
         for row in rows:

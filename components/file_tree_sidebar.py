@@ -15,6 +15,7 @@ from services.cache_service import CacheService
 from services.document_storage_service import DocumentStorageService
 from services.sidebar_pdf_index_service import PdfListItem, SidebarPdfIndexService
 from utils.app_state import AppState
+from utils.jacar_filename import extract_jacar_ref_from_path
 
 # Font Awesome glyphs (Private Use Area) — Symbols Nerd Font
 _TREE_ICON_FOLDER_CLOSED = "\uf07b"  # 折叠
@@ -56,7 +57,9 @@ class FileTreeSidebar(ctk.CTkFrame):
         self._search_debounce_id: str | None = None
 
         self._project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.download_dir = os.path.join(self._project_root, "JACAR_Downloads")
+        self.download_dir = os.path.join(self._project_root, "Historical_Documents", "jacar")
+        self.legacy_download_dir = os.path.join(self._project_root, "JACAR_Downloads")
+        self.download_roots = [self.download_dir, self.legacy_download_dir]
         self.storage_service = DocumentStorageService(
             project_root=self._project_root,
             cache_service=self.cache_service,
@@ -230,8 +233,9 @@ class FileTreeSidebar(ctk.CTkFrame):
                     paths.append(self._norm_path(sub))
                     visit(sub)
 
-        if os.path.isdir(self.download_dir):
-            visit(self.download_dir)
+        for root in self.download_roots:
+            if os.path.isdir(root):
+                visit(root)
         return paths
 
     def _any_folder_expanded(self) -> bool:
@@ -528,7 +532,9 @@ class FileTreeSidebar(ctk.CTkFrame):
         if needle:
             self._render_flat_results()
         else:
-            self._render_dir_tree(self.file_list_frame, self.download_dir, depth=0)
+            for root in self.download_roots:
+                if os.path.isdir(root):
+                    self._render_dir_tree(self.file_list_frame, root, depth=0)
 
         self._refresh_file_item_styles()
         self._update_folder_toggle_label()
@@ -539,14 +545,20 @@ class FileTreeSidebar(ctk.CTkFrame):
         self.pdf_index.clear()
         self._pdf_path_to_index.clear()
 
-        if not os.path.exists(self.download_dir):
-            os.makedirs(self.download_dir, exist_ok=True)
-            self.visible_paths = set()
-            self._update_search_stats()
-            self._update_folder_toggle_label()
-            return
-
-        self.pdf_files = [self._norm_path(p) for p in self._collect_pdfs_dfs(self.download_dir)]
+        os.makedirs(self.download_dir, exist_ok=True)
+        seen: set[str] = set()
+        seen_refs: set[str] = set()
+        self.pdf_files = []
+        for root in self.download_roots:
+            for path in self._collect_pdfs_dfs(root):
+                normalized = self._norm_path(path)
+                ref = (extract_jacar_ref_from_path(normalized) or "").upper()
+                if normalized in seen or (ref and ref in seen_refs):
+                    continue
+                seen.add(normalized)
+                if ref:
+                    seen_refs.add(ref)
+                self.pdf_files.append(normalized)
         self.pdf_index = self.index_service.build_index(self.pdf_files)
         self._pdf_path_to_index = {p: i for i, p in enumerate(self.pdf_files)}
         needle = (self.search_var.get() or "").strip()

@@ -4,9 +4,12 @@ from pathlib import Path
 # 定义项目根目录
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# 史料存储布局：legacy 保持当前 PDF + 哈希缓存目录；bundle_v1 预留给单篇史料文件夹布局。
+# 史料存储布局：新史料统一写入 Historical_Documents；JACAR_Downloads
+# 作为只读兼容根保留，待用户显式执行迁移。
 DOCUMENT_STORAGE_LAYOUT = "bundle_v1"
-DOCUMENT_BUNDLE_ROOT = BASE_DIR / "JACAR_Downloads"
+HISTORICAL_DOCUMENT_ROOT = BASE_DIR / "Historical_Documents"
+DOCUMENT_BUNDLE_ROOT = HISTORICAL_DOCUMENT_ROOT
+LEGACY_JACAR_DOWNLOAD_ROOT = BASE_DIR / "JACAR_Downloads"
 
 # Legacy 缓存目录（Phase 0/1 仍作为实际读写位置）。
 LEGACY_OCR_CACHE_DIR = BASE_DIR / "OCR_Cache"

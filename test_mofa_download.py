@@ -93,6 +93,14 @@ def main() -> int:
         )
         assert result.status == "downloaded"
         assert result.native_id.startswith("MOFA_T10_2_U")
+        assert os.path.dirname(result.pdf_path) == os.path.join(
+            root,
+            "Historical_Documents",
+            "mofa",
+            "1921",
+            "2",
+            result.native_id,
+        )
         assert os.path.isfile(result.pdf_path)
         assert os.path.isfile(result.sidecar_path)
         assert progress
@@ -118,6 +126,30 @@ def main() -> int:
         second = service.download_item(item, search_keyword="中国共産党")
         assert second.status == "already_downloaded"
         assert second.native_id == result.native_id
+        assert session.pdf_calls == 1
+
+        legacy_item = MofaCatalogItem(
+            volume=volume,
+            title="旧目录互換テスト",
+            pdf_url="https://www.mofa.go.jp/archives/pdfs/taisho10_2_legacy.pdf",
+        )
+        legacy_id = service.native_id_for_item(legacy_item)
+        legacy_dir = os.path.join(root, "JACAR_Downloads", "MOFA全量", legacy_id)
+        os.makedirs(legacy_dir)
+        legacy_pdf = os.path.join(legacy_dir, "document.pdf")
+        with open(legacy_pdf, "wb") as f:
+            f.write(b"%PDF-1.4\nlegacy\n")
+        db.upsert_document(
+            source="mofa",
+            native_id=legacy_id,
+            title=legacy_item.title,
+            search_keyword="MOFA全量",
+            status="downloaded",
+        )
+        db.mark_downloaded_with_files(source="mofa", native_id=legacy_id, pdf_path=legacy_pdf)
+        legacy_result = service.download_item(legacy_item, search_keyword="中国共産党")
+        assert legacy_result.status == "already_downloaded"
+        assert legacy_result.pdf_path == legacy_pdf
         assert session.pdf_calls == 1
 
         invalid_item = MofaCatalogItem(

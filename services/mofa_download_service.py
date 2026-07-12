@@ -121,7 +121,33 @@ class MofaDownloadService:
             search_keyword=search_keyword,
             collection="日本外交文書",
         )
-        return native_id, self.storage.ensure_bundle_dir(identity)
+        existing = self.db.fetchone(
+            """
+            SELECT f.path
+            FROM files f
+            JOIN documents d ON d.document_id = f.document_id
+            WHERE d.source = 'mofa' AND d.native_id = ? AND f.kind = 'pdf'
+            LIMIT 1
+            """,
+            (native_id,),
+        )
+        if existing:
+            existing_path = os.path.abspath(str(existing["path"] or ""))
+            if os.path.isfile(existing_path):
+                resolved = self.storage.resolve_bundle_from_pdf(existing_path)
+                if resolved.identity.document_id == identity.document_id:
+                    return native_id, resolved
+                return native_id, DocumentBundle(
+                    root_dir=os.path.dirname(existing_path),
+                    identity=identity,
+                    layout=self.storage.layout,
+                    pdf_path=existing_path,
+                )
+        hierarchy = (
+            str(item.volume.gregorian_year),
+            str(item.volume.volume_code),
+        )
+        return native_id, self.storage.ensure_bundle_dir(identity, hierarchy=hierarchy)
 
     @staticmethod
     def _source_metadata(item: MofaCatalogItem) -> dict:

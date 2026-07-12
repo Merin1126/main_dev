@@ -177,7 +177,11 @@ HRS_Project/
 │
 ├── PROMPT_FLOW.md              # （增量补记）OCR -> Analysis -> Translation 的 Prompt 调取链路文档
 │
-├── JACAR_Downloads/            # 📂 抓取到的原始 PDF（按关键词子目录组织，运行时生成）
+├── Historical_Documents/       # 📚 新版统一史料根目录（按来源与原生 ID 组织）
+│   ├── jacar/<JACAR_REF>/
+│   ├── mofa/<年份>/<卷代码>/<MOFA_ID>/
+│   └── research/               # 后续候选史料工作包
+├── JACAR_Downloads/            # 📂 旧版 JACAR 数据；迁移期间只读兼容保留
 ├── OCR_Cache/                  # 💾 OCR 结果缓存（paged_v1，哈希文件名，运行时生成）
 ├── Database_JSON/              #分析 JSON 单页归档（运行时生成；与 Analysis_Cache 的 paged_v1 形成「数据库轨 / UI 轨」分工）
 ├── Translation_Cache/          # 💾 翻译结果缓存（paged_v1，运行时生成）
@@ -250,6 +254,16 @@ HRS_Project/
 * **Phase 3**：新增 MOFA PDF 原子下载、文件头校验、SQLite 状态/文件登记、bundle sidecar/manifest 写入、重复下载跳过与物理自愈。
 * **Phase 4**：下载控制台增加 `JACAR / MOFA` 来源切换。MOFA 默认为“仅扫描目录”，必须显式选择才会下载“目录标题命中项”或“范围内全部正文 PDF”；扫描后独立展示卷册、PDF、正文和标题命中数量，下载任务复用 SQLite 监控弹窗。
 * **Phase 5A**：修复 MOFA CDN PDF 冷直连 403（同 Session 卷册页预热 + Referer + 一次强制重试）；新增逐页文本层/图像诊断、OCR 待处理页列表、实时目录规模估算 CLI。真实样本验证表明抽查的1921/1925/1927年正文均为纯影像 PDF。
+* **Phase 5B-0**：新增统一根目录 `Historical_Documents`。JACAR 新写入路径为 `jacar/<Ref>/`，MOFA 为 `mofa/<年份>/<卷代码>/<native_id>/`，物理目录不再由检索关键词决定。SQLite 继续以 `source:native_id` 防重，并新增 `document_keywords` 多对多表保存一份史料的全部关键词命中关系。
+
+#### Historical_Documents 迁移规则
+
+* 升级不会自动移动或删除 `JACAR_Downloads`，旧 PDF 与缓存关系继续可读。
+* 迁移工具默认只生成计划：`python3 scripts/migrate_to_historical_documents.py`。
+* 人工检查无冲突后，显式执行：`python3 scripts/migrate_to_historical_documents.py --execute`。
+* 执行模式只复制缺失文件并更新 SQLite `files.path`；旧目录仍保留作为回滚副本。目标文件校验不一致或同一 Ref 存在多个正式旧目录时，整份 bundle 会跳过并报告 `CONFLICT`。
+* 同一 Ref 的历史 PDF 若 SHA-256 完全一致，会合并到同一个目标 bundle；旧副本仍保留，不会自动删除。
+* `_scratch/duplicates` 是旧 bundle 迁移产生的冲突隔离区，不作为正式史料副本迁入。
 
 ### v2.6.7
 * **版本**：`config/settings.py` 中 `APP_VERSION = "V2.6.7"`，与窗口标题、导航栏版本显示保持同源常量。

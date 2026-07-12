@@ -85,6 +85,13 @@ def _check_sidecar_and_storage_resolution(citation: str) -> None:
             json.dump(payload, f, ensure_ascii=False)
 
         storage = DocumentStorageService(project_root=project_root, layout="bundle_v1")
+        planned = storage.planned_bundle_dir(identity)
+        assert planned == os.path.join(
+            project_root,
+            "Historical_Documents",
+            "mofa",
+            identity.native_id,
+        )
         bundle = storage.resolve_bundle_from_pdf(pdf_path)
         assert bundle.identity == identity
         assert bundle.root_dir == os.path.abspath(bundle_dir)

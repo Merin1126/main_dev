@@ -121,9 +121,10 @@ class DocumentCatalogService:
     def list_keywords(self) -> list[str]:
         rows = self.db_service.fetchall(
             """
-            SELECT DISTINCT COALESCE(NULLIF(TRIM(search_keyword), ''), '未分类') AS kw
-            FROM documents
-            WHERE source = 'jacar'
+            SELECT DISTINCT keyword AS kw
+            FROM document_keywords dk
+            JOIN documents d ON d.document_id = dk.document_id
+            WHERE d.source = 'jacar'
             ORDER BY kw
             """
         )
@@ -145,7 +146,13 @@ class DocumentCatalogService:
                 d.source,
                 d.native_id,
                 COALESCE(d.title, '') AS title,
-                COALESCE(NULLIF(TRIM(d.search_keyword), ''), '未分类') AS search_keyword,
+                COALESCE(
+                    (SELECT GROUP_CONCAT(dk.keyword, '、')
+                     FROM document_keywords dk
+                     WHERE dk.document_id = d.document_id),
+                    NULLIF(TRIM(d.search_keyword), ''),
+                    '未分类'
+                ) AS search_keyword,
                 COALESCE(d.level2_name, '') AS level2_name,
                 COALESCE(d.parent_name, '') AS parent_name,
                 COALESCE(d.repo_name, '') AS repo_name,
@@ -178,7 +185,8 @@ class DocumentCatalogService:
                 pdf_path=str(row["pdf_path"] or ""),
                 sidecar_path=str(row["sidecar_path"] or ""),
             )
-            if keyword_filter and keyword_filter != "全部" and entry.search_keyword != keyword_filter:
+            keywords = {part.strip() for part in entry.search_keyword.split("、") if part.strip()}
+            if keyword_filter and keyword_filter != "全部" and keyword_filter not in keywords:
                 continue
             if needle and not self._matches_search(entry, needle):
                 continue

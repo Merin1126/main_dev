@@ -1231,6 +1231,7 @@ def jacar_auto_search(
                         if source_for_task == "hoover":
                             skip_statuses.add("pending_hoover")
                         if (status_in_db or "").strip().lower() in skip_statuses:
+                            db_service.add_document_keyword(source_for_task, ref_code, target_keyword)
                             task_id = f"{source_for_task}:{ref_code}"
                             _safe_callback(
                                 on_task_enqueued,
