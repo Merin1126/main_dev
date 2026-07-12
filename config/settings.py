@@ -150,6 +150,7 @@ class Color:
 class ScreenName:
     """HRS V2.2 全局视图路由名称"""
     SCRAPER = "scraper"
+    MOFA_LIBRARY = "mofa_library"
     SCRAPER_TITLE = "史料下载"
     OCR = "ocr"
     OCR_TITLE = "史料校对"
@@ -163,6 +164,7 @@ class ScreenName:
 # 注册所有有效的屏幕路由
 LIST_SCREEN = [
     ScreenName.SCRAPER,
+    ScreenName.MOFA_LIBRARY,
     ScreenName.OCR,
     ScreenName.TRANSLATION,
     ScreenName.ANALYSIS,

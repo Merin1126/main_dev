@@ -13,6 +13,7 @@ from services.mofa_download_service import (
     MofaDownloadResult,
     MofaDownloadService,
 )
+from services.mofa_library_service import MofaLibraryService
 
 
 MOFA_MODE_SCAN = "scan"
@@ -74,10 +75,12 @@ class MofaWorkflowService:
         catalog_scraper: MofaCatalogScraper | None = None,
         download_service: MofaDownloadService | None = None,
         db_service: DbService | None = None,
+        library_service: MofaLibraryService | None = None,
     ) -> None:
         self.db = db_service or DbService()
         self.catalog = catalog_scraper or MofaCatalogScraper()
         self.downloader = download_service or MofaDownloadService(db_service=self.db)
+        self.library = library_service or MofaLibraryService(db_service=self.db)
 
     @staticmethod
     def _validate_years(year_from: int, year_to: int) -> tuple[int, int]:
@@ -143,6 +146,7 @@ class MofaWorkflowService:
                 volumes.append(volume)
 
             content_items = [item for item in all_items if item.item_kind == "content"]
+            self.library.cache_items(all_items)
             matched = [item for item in content_items if title_matches_keyword(item.title, keyword)]
             if mode == MOFA_MODE_MATCHED:
                 selected = matched

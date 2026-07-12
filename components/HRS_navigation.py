@@ -18,6 +18,7 @@ class Navigation(ctk.CTkFrame):
 
         self.nav_config = [
             {"icon": "\uf409", "label": "史料下载", "screen": "scraper"},
+            {"icon": "\uf02d", "label": "MOFA史料库", "screen": "mofa_library"},
             {"icon": "\uf05f", "label": "史料校对", "screen": "ocr"},
             {"icon": "\uf080", "label": "史料分析", "screen": "analysis"},
             {"icon": "\uf1ab", "label": "史料翻译", "screen": "translation"},

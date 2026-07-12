@@ -100,6 +100,7 @@ def main() -> int:
         assert not scan.selected_items
         assert not downloader.downloaded
         assert previews and progress
+        assert db.fetchone("SELECT COUNT(*) AS n FROM mofa_catalog_items")["n"] == 3
 
         matched = service.run(
             keyword="中国共産党",

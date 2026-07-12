@@ -3,6 +3,7 @@ from screens.ocr_screen import OCRScreen
 from screens.translation_screen import TranslationScreen
 from screens.analysis_screen import AnalysisScreen
 from screens.setting_screen import SettingScreen
+from screens.mofa_library_screen import MofaLibraryScreen
 from components.file_tree_sidebar import FileTreeSidebar
 import customtkinter as ctk
 import tkinter as tk
@@ -49,6 +50,7 @@ class ScreenManager(ctk.CTkFrame):
         self.translation_screen = TranslationScreen(self.content_frame)
         self.analysis_screen = AnalysisScreen(self.content_frame)
         self.setting_screen = SettingScreen(self.content_frame)
+        self.mofa_library_screen = MofaLibraryScreen(self.content_frame)
 
         self.screens = {
             "scraper": self.scraper_screen,
@@ -56,12 +58,16 @@ class ScreenManager(ctk.CTkFrame):
             "translation": self.translation_screen,
             "analysis": self.analysis_screen,
             "setting": self.setting_screen,
+            "mofa_library": self.mofa_library_screen,
         }
 
     def render(self, screen_name: str) -> None:
         for name, screen_obj in self.screens.items():
             if screen_name == name:
                 screen_obj.pack(expand=True, fill="both")
+                on_show = getattr(screen_obj, "on_show", None)
+                if callable(on_show):
+                    on_show()
             else:
                 screen_obj.pack_forget()
 
