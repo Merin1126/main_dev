@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox, ttk
 
 import customtkinter as ctk
@@ -13,6 +15,7 @@ from services.mofa_batch_download_service import (
     MofaBatchResult,
 )
 from services.mofa_library_service import MofaLibraryEntry, MofaLibraryService
+from utils.open_path import open_path_in_system, reveal_file_in_folder
 
 
 _KIND_LABELS = {
@@ -35,6 +38,7 @@ class MofaLibraryScreen(ctk.CTkFrame):
         self._syncing = False
         self.batch = MofaBatchDownloadService(db_service=self.service.db)
         self._downloading = False
+        self._context_native_id = ""
         self._build_ui()
         self.after(50, self.refresh_local)
 
@@ -209,16 +213,39 @@ class MofaLibraryScreen(ctk.CTkFrame):
         self.tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
         scrollbar.pack(side="right", fill="y", padx=(0, 10), pady=10)
         self.tree.bind("<<TreeviewSelect>>", self._on_selection)
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Button-2>", self._show_context_menu)
+        self.tree.bind("<Button-3>", self._show_context_menu)
+        self.tree.bind("<Control-Button-1>", self._show_context_menu)
+        self._build_context_menu()
 
+        detail_frame = ctk.CTkFrame(self, fg_color=Color.TRANSPARENT)
+        detail_frame.pack(fill="x", padx=22, pady=(0, 14))
         self.detail_label = ctk.CTkLabel(
-            self,
+            detail_frame,
             text="选择条目后显示本地路径与官网地址。",
             anchor="w",
             justify="left",
             font=("PingFang SC", 11),
             text_color=Color.TEXT_GRAY,
         )
-        self.detail_label.pack(fill="x", padx=24, pady=(0, 14))
+        self.detail_label.pack(side="left", fill="x", expand=True, padx=(2, 12))
+        self.open_pdf_btn = ctk.CTkButton(
+            detail_frame,
+            text="打开史料",
+            width=96,
+            state="disabled",
+            command=self.open_selected_pdf,
+        )
+        self.open_pdf_btn.pack(side="right", padx=(6, 0))
+        self.reveal_pdf_btn = ctk.CTkButton(
+            detail_frame,
+            text="在文件夹中显示",
+            width=122,
+            state="disabled",
+            command=self.reveal_selected_pdf,
+        )
+        self.reveal_pdf_btn.pack(side="right", padx=(6, 0))
 
     def on_show(self) -> None:
         """Refresh disk readiness whenever the route becomes visible."""
@@ -261,6 +288,7 @@ class MofaLibraryScreen(ctk.CTkFrame):
         )
         for item_id in self.tree.get_children():
             self.tree.delete(item_id)
+        self._context_native_id = ""
         for entry in self.entries:
             self.tree.insert(
                 "",
@@ -290,6 +318,8 @@ class MofaLibraryScreen(ctk.CTkFrame):
             self.summary_label.configure(
                 text="本地尚无 MOFA 目录缓存，请点击“同步官网目录”。"
             )
+        self.detail_label.configure(text="选择条目后显示本地路径与官网地址。")
+        self._update_action_buttons(None)
 
     def sync_official_catalog(self) -> None:
         if self._syncing or self._downloading:
@@ -318,17 +348,153 @@ class MofaLibraryScreen(ctk.CTkFrame):
         messagebox.showinfo("MOFA 目录同步完成", f"已缓存 {count} 个目录 PDF 条目。")
 
     def _on_selection(self, _event=None) -> None:
-        selected = self.tree.selection()
-        if not selected:
-            return
-        native_id = selected[0]
-        entry = next((item for item in self.entries if item.native_id == native_id), None)
+        entry = self._selected_entry()
         if entry is None:
+            self._update_action_buttons(None)
             return
         local = entry.pdf_path if entry.pdf_exists else f"未下载（规划目录：{entry.bundle_dir}）"
         self.detail_label.configure(
             text=f"{entry.native_id}\n本地：{local}\n官网：{entry.pdf_url}"
         )
+        self._update_action_buttons(entry)
+
+    def _entry_for_id(self, native_id: str) -> MofaLibraryEntry | None:
+        return next((entry for entry in self.entries if entry.native_id == native_id), None)
+
+    def _selected_entry(self) -> MofaLibraryEntry | None:
+        selected = self.tree.selection()
+        if not selected:
+            return None
+        focused = self.tree.focus()
+        native_id = focused if focused in selected else selected[0]
+        return self._entry_for_id(native_id)
+
+    def _action_entry(self, native_id: str = "") -> MofaLibraryEntry | None:
+        return self._entry_for_id(native_id) if native_id else self._selected_entry()
+
+    def _update_action_buttons(self, entry: MofaLibraryEntry | None) -> None:
+        pdf_ready = bool(entry and os.path.isfile(entry.pdf_path))
+        self.open_pdf_btn.configure(state="normal" if pdf_ready else "disabled")
+        self.reveal_pdf_btn.configure(state="normal" if pdf_ready else "disabled")
+
+    def _build_context_menu(self) -> None:
+        self.context_menu = tk.Menu(self, tearoff=False)
+        self.context_menu.add_command(label="打开史料", command=self.open_context_pdf)
+        self.context_menu.add_command(label="在文件夹中显示", command=self.reveal_context_pdf)
+        self.context_menu.add_command(label="打开史料文件夹", command=self.open_context_folder)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="在 MOFA 官网打开", command=self.open_context_official)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="复制本地路径", command=self.copy_context_path)
+        self.context_menu.add_command(label="复制 MOFA ID", command=self.copy_context_id)
+        self.context_menu.add_command(label="复制官网链接", command=self.copy_context_url)
+
+    def _show_context_menu(self, event) -> str:
+        native_id = self.tree.identify_row(event.y)
+        if not native_id:
+            return "break"
+        self._context_native_id = native_id
+        self.tree.selection_set(native_id)
+        self.tree.focus(native_id)
+        entry = self._entry_for_id(native_id)
+        self._on_selection()
+        pdf_ready = bool(entry and os.path.isfile(entry.pdf_path))
+        folder_ready = bool(entry and os.path.isdir(entry.bundle_dir))
+        self.context_menu.entryconfigure("打开史料", state="normal" if pdf_ready else "disabled")
+        self.context_menu.entryconfigure("在文件夹中显示", state="normal" if pdf_ready else "disabled")
+        self.context_menu.entryconfigure("打开史料文件夹", state="normal" if folder_ready else "disabled")
+        self.context_menu.entryconfigure("复制本地路径", state="normal" if pdf_ready else "disabled")
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+        return "break"
+
+    def _on_double_click(self, event) -> str:
+        native_id = self.tree.identify_row(event.y)
+        if native_id:
+            self.tree.selection_set(native_id)
+            self.tree.focus(native_id)
+            self.open_selected_pdf()
+        return "break"
+
+    def _ensure_pdf(self, entry: MofaLibraryEntry | None) -> str:
+        if entry is not None and os.path.isfile(entry.pdf_path):
+            return entry.pdf_path
+        messagebox.showwarning(
+            "本地史料不存在",
+            "该 PDF 尚未下载，或已在文件管理器中被移动/删除。请刷新本地状态。",
+        )
+        self.refresh_local()
+        return ""
+
+    def _run_open_action(self, action, *, error_title: str) -> None:
+        try:
+            action()
+        except Exception as exc:
+            messagebox.showerror(error_title, str(exc))
+
+    def open_selected_pdf(self) -> None:
+        self._open_pdf(self._selected_entry())
+
+    def reveal_selected_pdf(self) -> None:
+        self._reveal_pdf(self._selected_entry())
+
+    def open_context_pdf(self) -> None:
+        self._open_pdf(self._action_entry(self._context_native_id))
+
+    def reveal_context_pdf(self) -> None:
+        self._reveal_pdf(self._action_entry(self._context_native_id))
+
+    def _open_pdf(self, entry: MofaLibraryEntry | None) -> None:
+        path = self._ensure_pdf(entry)
+        if path:
+            self._run_open_action(lambda: open_path_in_system(path), error_title="无法打开史料")
+
+    def _reveal_pdf(self, entry: MofaLibraryEntry | None) -> None:
+        path = self._ensure_pdf(entry)
+        if path:
+            self._run_open_action(lambda: reveal_file_in_folder(path), error_title="无法定位史料")
+
+    def open_context_folder(self) -> None:
+        entry = self._action_entry(self._context_native_id)
+        if entry is None or not os.path.isdir(entry.bundle_dir):
+            messagebox.showwarning("文件夹不存在", "该史料的本地文件夹尚不存在，请先下载 PDF。")
+            return
+        self._run_open_action(
+            lambda: open_path_in_system(entry.bundle_dir),
+            error_title="无法打开史料文件夹",
+        )
+
+    def open_context_official(self) -> None:
+        entry = self._action_entry(self._context_native_id)
+        if entry and entry.pdf_url:
+            self._run_open_action(
+                lambda: webbrowser.open(entry.pdf_url, new=2),
+                error_title="无法打开 MOFA 官网",
+            )
+
+    def _copy_text(self, value: str, label: str) -> None:
+        if not value:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self.download_status_label.configure(text=f"已复制{label}。")
+
+    def copy_context_path(self) -> None:
+        entry = self._action_entry(self._context_native_id)
+        if entry and os.path.isfile(entry.pdf_path):
+            self._copy_text(entry.pdf_path, "本地路径")
+
+    def copy_context_id(self) -> None:
+        entry = self._action_entry(self._context_native_id)
+        if entry:
+            self._copy_text(entry.native_id, "MOFA ID")
+
+    def copy_context_url(self) -> None:
+        entry = self._action_entry(self._context_native_id)
+        if entry:
+            self._copy_text(entry.pdf_url, "官网链接")
 
     @staticmethod
     def _format_bytes(value: int) -> str:
