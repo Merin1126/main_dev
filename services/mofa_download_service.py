@@ -57,6 +57,47 @@ class MofaDownloadService:
             "Accept": "application/pdf,*/*;q=0.8",
             "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
         }
+        self._primed_catalog_urls: set[str] = set()
+
+    def _prime_catalog_session(self, catalog_url: str, *, force: bool = False) -> None:
+        """Warm the same HTTP connection on the volume page before PDF access.
+
+        MOFA's CDN may deny a cold direct PDF request even with a browser user
+        agent.  Visiting the referring catalog page in the same Session and
+        then sending Referer has been verified against the live 1927 corpus.
+        """
+        url = (catalog_url or "").strip()
+        if not url or (not force and url in self._primed_catalog_urls):
+            return
+        headers = dict(self.headers)
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        response = self.session.get(url, headers=headers, timeout=self.timeout)
+        try:
+            response.raise_for_status()
+        finally:
+            response.close()
+        self._primed_catalog_urls.add(url)
+
+    def _open_pdf_response(self, item: MofaCatalogItem):
+        self._prime_catalog_session(item.volume.catalog_url)
+        headers = dict(self.headers)
+        headers["Referer"] = item.volume.catalog_url
+        response = self.session.get(
+            item.pdf_url,
+            headers=headers,
+            timeout=self.timeout,
+            stream=True,
+        )
+        if response.status_code == 403:
+            response.close()
+            self._prime_catalog_session(item.volume.catalog_url, force=True)
+            response = self.session.get(
+                item.pdf_url,
+                headers=headers,
+                timeout=self.timeout,
+                stream=True,
+            )
+        return response
 
     @staticmethod
     def native_id_for_item(item: MofaCatalogItem) -> str:
@@ -244,12 +285,7 @@ class MofaDownloadService:
         part_path = pdf_path + ".part"
         downloaded = 0
         try:
-            with self.session.get(
-                item.pdf_url,
-                headers=self.headers,
-                timeout=self.timeout,
-                stream=True,
-            ) as response:
+            with self._open_pdf_response(item) as response:
                 response.raise_for_status()
                 raw_total = response.headers.get("Content-Length")
                 total = int(raw_total) if raw_total and raw_total.isdigit() else None

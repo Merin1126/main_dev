@@ -11,8 +11,9 @@ from services.mofa_download_service import MofaDownloadService
 
 
 class _FakeResponse:
-    def __init__(self, payload: bytes = b"%PDF-1.4\nfixture\n") -> None:
+    def __init__(self, payload: bytes = b"%PDF-1.4\nfixture\n", status_code: int = 200) -> None:
         self.payload = payload
+        self.status_code = status_code
         self.headers = {"Content-Length": str(len(payload))}
 
     def __enter__(self):
@@ -22,6 +23,11 @@ class _FakeResponse:
         return False
 
     def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+        return None
+
+    def close(self) -> None:
         return None
 
     def iter_content(self, chunk_size: int):
@@ -32,11 +38,25 @@ class _FakeResponse:
 class _FakeSession:
     def __init__(self, payload: bytes = b"%PDF-1.4\nfixture\n") -> None:
         self.calls = 0
+        self.pdf_calls = 0
         self.payload = payload
 
     def get(self, *args, **kwargs):
         self.calls += 1
-        assert kwargs["stream"] is True
+        if not kwargs.get("stream"):
+            return _FakeResponse(b"<html>catalog</html>")
+        self.pdf_calls += 1
+        return _FakeResponse(self.payload)
+
+
+class _RetrySession(_FakeSession):
+    def get(self, *args, **kwargs):
+        self.calls += 1
+        if not kwargs.get("stream"):
+            return _FakeResponse(b"<html>catalog</html>")
+        self.pdf_calls += 1
+        if self.pdf_calls == 1:
+            return _FakeResponse(b"<html>denied</html>", status_code=403)
         return _FakeResponse(self.payload)
 
 
@@ -98,7 +118,7 @@ def main() -> int:
         second = service.download_item(item, search_keyword="中国共産党")
         assert second.status == "already_downloaded"
         assert second.native_id == result.native_id
-        assert session.calls == 1
+        assert session.pdf_calls == 1
 
         invalid_item = MofaCatalogItem(
             volume=volume,
@@ -127,6 +147,22 @@ def main() -> int:
             )
         )
         assert not os.path.exists(invalid_bundle.pdf_path + ".part")
+
+        retry_item = MofaCatalogItem(
+            volume=volume,
+            title="CDN 403 重试测试",
+            pdf_url="https://www.mofa.go.jp/archives/pdfs/taisho10_2_retry.pdf",
+        )
+        retry_session = _RetrySession()
+        retry_service = MofaDownloadService(
+            project_root=root,
+            db_service=db,
+            storage_service=storage,
+            session=retry_session,
+        )
+        retry_result = retry_service.download_item(retry_item, search_keyword="Phase5A")
+        assert retry_result.status == "downloaded"
+        assert retry_session.pdf_calls == 2
         db.close()
 
     print("Phase 3 checks passed: download, PDF validation, bundle, sidecar, DB, deduplication.")

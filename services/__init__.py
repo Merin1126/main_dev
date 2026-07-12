@@ -23,6 +23,7 @@ __all__ = [
     "DocumentSourceService",
     "MofaDownloadService",
     "MofaWorkflowService",
+    "MofaPdfDiagnosticService",
 ]
 
 _SERVICE_MODULES = {
@@ -36,6 +37,7 @@ _SERVICE_MODULES = {
     "DocumentSourceService": "services.document_source_service",
     "MofaDownloadService": "services.mofa_download_service",
     "MofaWorkflowService": "services.mofa_workflow_service",
+    "MofaPdfDiagnosticService": "services.mofa_pdf_diagnostic_service",
 }
 
 
@@ -60,3 +62,4 @@ if TYPE_CHECKING:  # 仅静态分析时暴露具体类型，避免运行时强�
     from .document_source_service import DocumentSourceService
     from .mofa_download_service import MofaDownloadService
     from .mofa_workflow_service import MofaWorkflowService
+    from .mofa_pdf_diagnostic_service import MofaPdfDiagnosticService
