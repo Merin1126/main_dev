@@ -15,6 +15,11 @@ from services.document_storage_service import DocumentBundle, DocumentStorageSer
 
 
 ProgressCallback = Callable[[int, int | None], None]
+StopCallback = Callable[[], bool]
+
+
+class MofaDownloadCancelled(RuntimeError):
+    """Raised when the user stops an active MOFA stream download."""
 
 
 @dataclass(frozen=True)
@@ -147,6 +152,37 @@ class MofaDownloadService:
             status=status,
         )
 
+    def register_item(
+        self,
+        item: MofaCatalogItem,
+        *,
+        search_keyword: str,
+        run_id: int | None = None,
+    ) -> str:
+        """Register one selected item so the DB-driven monitor can show it."""
+        native_id, bundle = self._identity_and_bundle(item, search_keyword=search_keyword)
+        pdf_path = self.storage.resolve_write_path(bundle, "pdf", create_parent_dirs=True)
+        metadata = self._sidecar_payload(item, bundle)
+        already_downloaded = (
+            self.db.get_document_status("mofa", native_id) == "downloaded"
+            and os.path.isfile(pdf_path)
+        )
+        self._upsert_discovered(
+            item,
+            native_id=native_id,
+            search_keyword=search_keyword,
+            metadata=metadata,
+            status="downloaded" if already_downloaded else "discovered",
+        )
+        self.db.add_download_event(
+            native_id,
+            "succeeded" if already_downloaded else "queued",
+            message="already downloaded" if already_downloaded else "MOFA catalog item queued",
+            run_id=run_id,
+            source="mofa",
+        )
+        return bundle.identity.document_id
+
     def download_item(
         self,
         item: MofaCatalogItem,
@@ -154,6 +190,7 @@ class MofaDownloadService:
         search_keyword: str,
         run_id: int | None = None,
         on_progress: ProgressCallback | None = None,
+        should_stop: StopCallback | None = None,
     ) -> MofaDownloadResult:
         native_id, bundle = self._identity_and_bundle(item, search_keyword=search_keyword)
         pdf_path = self.storage.resolve_write_path(bundle, "pdf", create_parent_dirs=True)
@@ -218,6 +255,8 @@ class MofaDownloadService:
                 total = int(raw_total) if raw_total and raw_total.isdigit() else None
                 with open(part_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=64 * 1024):
+                        if should_stop is not None and should_stop():
+                            raise MofaDownloadCancelled("MOFA download stopped by user")
                         if not chunk:
                             continue
                         f.write(chunk)
@@ -252,6 +291,20 @@ class MofaDownloadService:
                 sidecar_path=sidecar_path,
                 bytes_downloaded=downloaded,
             )
+        except MofaDownloadCancelled as exc:
+            try:
+                if os.path.exists(part_path):
+                    os.remove(part_path)
+            finally:
+                self.db.mark_document_status("mofa", native_id, "discovered")
+                self.db.add_download_event(
+                    native_id,
+                    "aborted",
+                    message=str(exc),
+                    run_id=run_id,
+                    source="mofa",
+                )
+            raise
         except Exception as exc:
             try:
                 if os.path.exists(part_path):

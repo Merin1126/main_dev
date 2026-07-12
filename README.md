@@ -38,7 +38,8 @@ MOFA 数字合集是按年份、卷册和事项组织的编纂出版物目录，
 - Phase 1：通用史料身份、MOFA 编号/引用、sidecar/manifest v2。
 - Phase 2：1921—1927年卷册发现、PDF 目录解析、分类与去重。
 - Phase 3：PDF 下载、SQLite 审计、bundle 写入与物理自愈。
-- Phase 4—7：GUI、全文检索、研究流水线和回归工作待后续版本完成。
+- Phase 4：下载页来源切换、MOFA 安全默认扫描、目录结果展示、标题命中/全部正文显式下载、任务监控与中止。
+- Phase 5—7：全文检索、研究流水线和回归工作待后续版本完成。
 
 
 # HRS 史料全自动采集与 AI 校对系统 (v2.6.7)
@@ -232,6 +233,7 @@ HRS_Project/
 * **Phase 1**：新增通用 `DocumentIdentity`、MOFA 稳定编号、标准引用生成器、sidecar/manifest v2；存储层可从 manifest/sidecar 恢复 `source=mofa`，并保持旧 JACAR 数据兼容。
 * **Phase 2**：新增 MOFA 1921—1927 卷册目录采集器；官网验证可发现 20 个目标卷册，并解析事项 PDF、扉页/目录、索引与奥付。
 * **Phase 3**：新增 MOFA PDF 原子下载、文件头校验、SQLite 状态/文件登记、bundle sidecar/manifest 写入、重复下载跳过与物理自愈。
+* **Phase 4**：下载控制台增加 `JACAR / MOFA` 来源切换。MOFA 默认为“仅扫描目录”，必须显式选择才会下载“目录标题命中项”或“范围内全部正文 PDF”；扫描后独立展示卷册、PDF、正文和标题命中数量，下载任务复用 SQLite 监控弹窗。
 
 ### v2.6.7
 * **版本**：`config/settings.py` 中 `APP_VERSION = "V2.6.7"`，与窗口标题、导航栏版本显示保持同源常量。

@@ -3,6 +3,13 @@ import customtkinter as ctk
 from tkinter import messagebox
 from config.settings import Color
 from services import DbService
+from services.mofa_workflow_service import (
+    MOFA_MODE_ALL_CONTENT,
+    MOFA_MODE_MATCHED,
+    MOFA_MODE_SCAN,
+    MofaWorkflowResult,
+    MofaWorkflowService,
+)
 
 # 导入咱们刚移植过来的高级 UI 组件
 from components.ui.button import Button
@@ -10,6 +17,15 @@ from components.ui.input import Input
 
 # 导入核心爬虫打工人
 import core_scraper
+
+
+SOURCE_JACAR = "JACAR 原始档案"
+SOURCE_MOFA = "MOFA 日本外交文書"
+MOFA_MODE_LABELS = {
+    "仅扫描目录（推荐）": MOFA_MODE_SCAN,
+    "下载目录标题命中项": MOFA_MODE_MATCHED,
+    "下载范围内全部正文PDF": MOFA_MODE_ALL_CONTENT,
+}
 
 class ScraperScreen(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
@@ -25,6 +41,7 @@ class ScraperScreen(ctk.CTkFrame):
         self.monitor_list_frame = None
         self.monitor_title = None
         self.monitor_poll_job = None
+        self.mofa_result_window = None
 
         self._setup_ui()
 
@@ -39,7 +56,7 @@ class ScraperScreen(ctk.CTkFrame):
         title_lbl.pack(pady=(30, 10))
 
         # 中间的圆角主容器 (Main Card Container)
-        container = ctk.CTkFrame(
+        container = ctk.CTkScrollableFrame(
             self,
             corner_radius=15,
             fg_color=("#eceff4", "#2b2b31"),
@@ -49,6 +66,21 @@ class ScraperScreen(ctk.CTkFrame):
         container.pack(pady=20, padx=40, fill="both", expand=True)
 
         # ================= 表单输入区 =================
+        ctk.CTkLabel(
+            container,
+            text=" 史料来源:",
+            font=("Symbols Nerd Font", 15, "bold"),
+        ).pack(pady=(22, 5))
+        self.source_var = ctk.StringVar(value=SOURCE_JACAR)
+        self.source_menu = ctk.CTkOptionMenu(
+            container,
+            width=400,
+            values=[SOURCE_JACAR, SOURCE_MOFA],
+            variable=self.source_var,
+            command=self._on_source_changed,
+        )
+        self.source_menu.pack()
+
         ctk.CTkLabel(
             container,
             text="\ue68f 检索关键词:",
@@ -74,28 +106,51 @@ class ScraperScreen(ctk.CTkFrame):
         self.entry_end_year = Input(container, width=400, defaultValue="1927")
         self.entry_end_year.pack()
 
+        self.mofa_mode_frame = ctk.CTkFrame(container, fg_color=Color.TRANSPARENT)
+        ctk.CTkLabel(
+            self.mofa_mode_frame,
+            text="MOFA 执行方式:",
+            font=("Arial", 14, "bold"),
+        ).pack(pady=(14, 5))
+        self.mofa_mode_var = ctk.StringVar(value=next(iter(MOFA_MODE_LABELS)))
+        self.mofa_mode_menu = ctk.CTkOptionMenu(
+            self.mofa_mode_frame,
+            width=400,
+            values=list(MOFA_MODE_LABELS.keys()),
+            variable=self.mofa_mode_var,
+        )
+        self.mofa_mode_menu.pack()
+        self.mofa_hint_label = ctk.CTkLabel(
+            self.mofa_mode_frame,
+            text="默认只建立目录索引，不下载 PDF。全文检索将在 Phase 5 接入。",
+            font=("Arial", 12),
+            text_color=Color.TEXT_HINT_SOFT,
+        )
+        self.mofa_hint_label.pack(pady=(6, 0))
+
         self.headless_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
+        self.headless_checkbox = ctk.CTkCheckBox(
             container,
             text="无头模式（不打开浏览器窗口）",
             variable=self.headless_var,
             font=("Arial", 13),
-        ).pack(pady=(14, 0))
+        )
+        self.headless_checkbox.pack(pady=(14, 0))
 
         # ================= 操作按钮区 =================
-        btn_frame = ctk.CTkFrame(container, fg_color=Color.TRANSPARENT)
-        btn_frame.pack(pady=35)
+        self.btn_frame = ctk.CTkFrame(container, fg_color=Color.TRANSPARENT)
+        self.btn_frame.pack(pady=35)
 
         # 使用你刚移植的高级 Button 组件
         self.btn_start = Button(
-            btn_frame, text="开始抓取", width=160,
+            self.btn_frame, text="开始抓取", width=160,
             fg_color=Color.BTN_SUCCESS_ALT, hover_color=Color.BTN_SUCCESS_ALT_HOVER, 
             command=self.start_scraping_thread
         )
         self.btn_start.pack(side="left", padx=20)
 
         self.btn_stop = Button(
-            btn_frame, text="🛑 停止抓取", width=160, 
+            self.btn_frame, text="🛑 停止抓取", width=160,
             fg_color=Color.BTN_DANGER, hover_color=Color.BTN_DANGER_HOVER, 
             command=self.stop_scraping
         )
@@ -109,6 +164,26 @@ class ScraperScreen(ctk.CTkFrame):
         self.progress_bar = ctk.CTkProgressBar(container, width=500, height=12, corner_radius=6)
         self.progress_bar.set(0)
         self.progress_bar.pack(pady=10)
+        self._on_source_changed(SOURCE_JACAR)
+
+    def _on_source_changed(self, selected_source: str):
+        if selected_source == SOURCE_MOFA:
+            self.headless_checkbox.pack_forget()
+            self.mofa_mode_frame.pack(pady=(2, 0), before=self.btn_frame)
+            if hasattr(self, "btn_start"):
+                self.btn_start.configure(text="执行 MOFA 任务")
+            if hasattr(self, "lbl_status"):
+                self.lbl_status.configure(
+                    text="MOFA 默认仅扫描 1921—1927 卷册目录，不下载 PDF。",
+                    text_color=Color.TEXT_MUTED,
+                )
+        else:
+            self.mofa_mode_frame.pack_forget()
+            self.headless_checkbox.pack(pady=(14, 0), before=self.btn_frame)
+            if hasattr(self, "btn_start"):
+                self.btn_start.configure(text="开始抓取")
+            if hasattr(self, "lbl_status"):
+                self.lbl_status.configure(text="等待分配任务...", text_color=Color.TEXT_MUTED)
 
     # ==========================================
     # ⚙️ 以下为你的核心打工人调度逻辑 (Worker Logic)
@@ -119,6 +194,14 @@ class ScraperScreen(ctk.CTkFrame):
             if total > 0:
                 self.progress_bar.set(current / total)
         self.after(0, _update)
+
+    def _set_scraper_controls_running(self, running: bool):
+        state = "disabled" if running else "normal"
+        self.source_menu.configure(state=state)
+        self.mofa_mode_menu.configure(state=state)
+        self.headless_checkbox.configure(state=state)
+        self.btn_start.configure(state="disabled" if running else "normal")
+        self.btn_stop.configure(state="normal" if running else "disabled")
 
     def _open_monitor_window(self):
         if self.monitor_window is not None and self.monitor_window.winfo_exists():
@@ -378,12 +461,117 @@ class ScraperScreen(ctk.CTkFrame):
     def finish_scraping(self, message="🎉 任务圆满完成！所有文件已下载。"):
         def _finish():
             self.lbl_status.configure(text=message, text_color=Color.TEXT_SUCCESS)
-            self.btn_start.configure(state="normal")
-            self.btn_stop.configure(state="disabled")
+            self._set_scraper_controls_running(False)
             if self.monitor_window and self.monitor_window.winfo_exists():
                 self.monitor_window.attributes("-topmost", False)
             messagebox.showinfo("提示", message)
         self.after(0, _finish)
+
+    def finish_scraping_cancelled(self, message: str):
+        def _finish():
+            self.lbl_status.configure(text=message, text_color=Color.TEXT_WARNING)
+            self._set_scraper_controls_running(False)
+            if self.monitor_window and self.monitor_window.winfo_exists():
+                self.monitor_window.attributes("-topmost", False)
+            messagebox.showinfo("任务已中止", message)
+        self.after(0, _finish)
+
+    def finish_scraping_error(self, message: str):
+        def _finish():
+            self.lbl_status.configure(text=message, text_color=Color.RED)
+            self._set_scraper_controls_running(False)
+            if self.monitor_window and self.monitor_window.winfo_exists():
+                self.monitor_window.attributes("-topmost", False)
+            messagebox.showerror("任务失败", message)
+        self.after(0, _finish)
+
+    def _show_mofa_catalog_result(self, result: MofaWorkflowResult):
+        def _show():
+            if self.mofa_result_window is not None and self.mofa_result_window.winfo_exists():
+                self.mofa_result_window.destroy()
+            self.mofa_result_window = ctk.CTkToplevel(self)
+            self.mofa_result_window.title("MOFA 目录扫描结果")
+            self.mofa_result_window.geometry("980x680")
+
+            content_count = len(result.content_items)
+            summary = (
+                f"{result.year_from}—{result.year_to} · 卷册 {len(result.volumes)} · "
+                f"PDF {len(result.all_items)} · 正文 {content_count} · "
+                f"标题命中 {len(result.matched_items)} · "
+                f"待下载 {len(result.selected_items)}"
+            )
+            ctk.CTkLabel(
+                self.mofa_result_window,
+                text="MOFA 《日本外交文書》目录结果",
+                font=("Arial", 20, "bold"),
+                text_color=Color.TEXT,
+            ).pack(pady=(16, 5))
+            ctk.CTkLabel(
+                self.mofa_result_window,
+                text=summary,
+                font=("Arial", 13),
+                text_color=Color.TEXT_MUTED,
+            ).pack(pady=(0, 10))
+
+            display_items = result.matched_items if result.keyword and result.matched_items else result.all_items
+            matched_urls = {item.pdf_url for item in result.matched_items}
+            textbox = ctk.CTkTextbox(
+                self.mofa_result_window,
+                width=930,
+                height=570,
+                font=("Menlo", 12),
+                wrap="word",
+            )
+            textbox.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+            lines = []
+            for index, item in enumerate(display_items, start=1):
+                marker = "命中" if item.pdf_url in matched_urls else item.item_kind
+                lines.append(
+                    f"{index:04d}  [{marker}]  {item.volume.gregorian_year}  "
+                    f"{item.volume.volume_label}  |  {item.title}\n{item.pdf_url}\n"
+                )
+            textbox.insert("1.0", "\n".join(lines) if lines else "当前范围内没有可展示的目录条目。")
+            textbox.configure(state="disabled")
+        self.after(0, _show)
+
+    @staticmethod
+    def _mofa_finish_message(result: MofaWorkflowResult) -> str:
+        if result.aborted:
+            return (
+                f"MOFA 任务已中止。已扫描 {len(result.volumes)} 个卷册，"
+                f"新下载 {result.downloaded} 份，跳过 {result.skipped} 份。"
+            )
+        if result.mode == MOFA_MODE_SCAN:
+            return (
+                f"MOFA 目录扫描完成：{len(result.volumes)} 个卷册，"
+                f"{len(result.all_items)} 个 PDF，其中正文 {len(result.content_items)} 个，"
+                f"标题命中 {len(result.matched_items)} 个。未下载 PDF。"
+            )
+        return (
+            f"MOFA 下载任务完成：选中 {len(result.selected_items)} 份，"
+            f"新下载 {result.downloaded} 份，已存在/修复 {result.skipped} 份，"
+            f"失败 {result.failed} 份。"
+        )
+
+    def _run_mofa_workflow(self, keyword: str, start_year: int, end_year: int, mode: str):
+        try:
+            service = MofaWorkflowService(db_service=self.db_service)
+            result = service.run(
+                keyword=keyword,
+                year_from=start_year,
+                year_to=end_year,
+                mode=mode,
+                stop_event=self.stop_event,
+                on_progress=self.update_progress,
+                on_run_started=self.on_run_started,
+                on_catalog_ready=self._show_mofa_catalog_result,
+            )
+            if result.aborted:
+                self.finish_scraping_cancelled(self._mofa_finish_message(result))
+            else:
+                self.finish_scraping(self._mofa_finish_message(result))
+        except Exception as exc:
+            self.finish_scraping_error(f"MOFA 任务失败：{exc}")
 
     def stop_scraping(self):
         self.stop_event.set()
@@ -396,18 +584,47 @@ class ScraperScreen(ctk.CTkFrame):
         sy = self.entry_start_year.getValue().strip()
         ey = self.entry_end_year.getValue().strip()
 
-        if not kw:
+        selected_source = self.source_var.get()
+        mofa_mode = MOFA_MODE_LABELS.get(self.mofa_mode_var.get(), MOFA_MODE_SCAN)
+
+        if not kw and not (selected_source == SOURCE_MOFA and mofa_mode == MOFA_MODE_SCAN):
             messagebox.showwarning("提示", "检索关键词不能为空哦！")
             return
 
+        if selected_source == SOURCE_MOFA:
+            try:
+                start_year = int(sy)
+                end_year = int(ey)
+                if start_year > end_year or start_year < 1921 or end_year > 1927:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("提示", "MOFA 年份范围请输入 1921—1927，且起始年不得晚于结束年。")
+                return
+
         self.stop_event.clear()
-        self.btn_start.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.lbl_status.configure(text="🚀 正在启动浏览器并连接数据库...", text_color=Color.PRIMARY)
+        self._set_scraper_controls_running(True)
+        self.lbl_status.configure(
+            text=(
+                "正在读取 MOFA 卷册目录..."
+                if selected_source == SOURCE_MOFA
+                else "🚀 正在启动浏览器并连接数据库..."
+            ),
+            text_color=Color.PRIMARY,
+        )
         self.progress_bar.set(0)
         self.awaiting_run_id = True
         self.current_run_id = None
-        self._open_monitor_window()
+        if selected_source != SOURCE_MOFA or mofa_mode != MOFA_MODE_SCAN:
+            self._open_monitor_window()
+
+        if selected_source == SOURCE_MOFA:
+            scraper_thread = threading.Thread(
+                target=self._run_mofa_workflow,
+                args=(kw, start_year, end_year, mofa_mode),
+                daemon=True,
+            )
+            scraper_thread.start()
+            return
 
         # 启动后台爬虫线程
         scraper_thread = threading.Thread(
