@@ -12,6 +12,7 @@ from components.document_rename_dialog import DocumentRenameDialog
 from components.ui.button import Button
 from config.settings import Color
 from services.cache_service import CacheService
+from services.document_storage_service import DocumentStorageService
 from services.sidebar_pdf_index_service import PdfListItem, SidebarPdfIndexService
 from utils.app_state import AppState
 
@@ -56,6 +57,10 @@ class FileTreeSidebar(ctk.CTkFrame):
 
         self._project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.download_dir = os.path.join(self._project_root, "JACAR_Downloads")
+        self.storage_service = DocumentStorageService(
+            project_root=self._project_root,
+            cache_service=self.cache_service,
+        )
         self._cache_dirs = [
             os.path.join(self._project_root, "OCR_Cache"),
             os.path.join(self._project_root, "Translation_Cache"),
@@ -271,9 +276,10 @@ class FileTreeSidebar(ctk.CTkFrame):
         self._update_folder_toggle_label()
 
     def _has_any_cache(self, pdf_path: str) -> bool:
-        for d in self._cache_dirs:
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+        for kind in ("ocr", "translation", "analysis"):
             try:
-                cache_path = self.cache_service.build_cache_path(pdf_path, d)
+                cache_path, _layout = self.storage_service.resolve_read_path_with_fallback(bundle, kind)
             except Exception:
                 continue
             if os.path.exists(cache_path):

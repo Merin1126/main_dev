@@ -12,7 +12,15 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-__all__ = ["PdfService", "CacheService", "LlmService", "TemplateService", "DbService", "ReportService"]
+__all__ = [
+    "PdfService",
+    "CacheService",
+    "LlmService",
+    "TemplateService",
+    "DbService",
+    "ReportService",
+    "DocumentStorageService",
+]
 
 _SERVICE_MODULES = {
     "PdfService": "services.pdf_service",
@@ -21,6 +29,7 @@ _SERVICE_MODULES = {
     "TemplateService": "services.template_service",
     "DbService": "services.db_service",
     "ReportService": "services.report_service",
+    "DocumentStorageService": "services.document_storage_service",
 }
 
 
@@ -41,3 +50,4 @@ if TYPE_CHECKING:  # 仅静态分析时暴露具体类型，避免运行时强�
     from .template_service import TemplateService
     from .db_service import DbService
     from .report_service import ReportService
+    from .document_storage_service import DocumentStorageService

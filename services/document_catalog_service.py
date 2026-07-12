@@ -7,12 +7,14 @@ from datetime import datetime
 from typing import Any, Literal
 
 from services.cache_service import CacheService
+from services.document_storage_service import DocumentStorageService
 from services.document_audit_service import DocumentAuditService
 from services.document_rename_service import DocumentRenameService, resolve_existing_pdf_path
 from services.db_service import DbService
 from services.html_preview_service import HtmlPreviewService
 from utils.catalog_export import export_catalog_docx, export_catalog_pdf
 from utils.jacar_filename import parse_jacar_pdf_filename
+from utils.jacar_sidecar import sidecar_path_for_pdf
 from utils.reporting import safe_filename
 
 SortKey = Literal["keyword", "title", "ref", "updated_at"]
@@ -94,6 +96,10 @@ class DocumentCatalogService:
         )
         self.db_service = db_service or DbService()
         self.cache_service = CacheService()
+        self.storage_service = DocumentStorageService(
+            project_root=self.project_root,
+            cache_service=self.cache_service,
+        )
         self.rename_service = DocumentRenameService(
             project_root=self.project_root,
             db_service=self.db_service,
@@ -254,8 +260,9 @@ class DocumentCatalogService:
                     for name in names:
                         if not name.lower().endswith(".pdf"):
                             continue
-                        if ref in name.upper():
-                            pdf_resolved = os.path.join(base, name)
+                        candidate = os.path.join(base, name)
+                        if ref in name.upper() or ref in candidate.upper():
+                            pdf_resolved = candidate
                             break
                     if pdf_resolved:
                         break
@@ -263,12 +270,16 @@ class DocumentCatalogService:
         entry.pdf_path = pdf_resolved or entry.pdf_path
         entry.pdf_ok = bool(pdf_resolved and os.path.isfile(pdf_resolved))
         entry.standard_filename = bool(
-            pdf_resolved and parse_jacar_pdf_filename(pdf_resolved) is not None
+            pdf_resolved
+            and (
+                parse_jacar_pdf_filename(pdf_resolved) is not None
+                or os.path.basename(pdf_resolved) == "document.pdf"
+            )
         )
 
         side = self._resolve_path(entry.sidecar_path)
         if entry.pdf_ok and not os.path.isfile(side):
-            side = os.path.splitext(pdf_resolved)[0] + ".json"
+            side = sidecar_path_for_pdf(pdf_resolved)
         entry.sidecar_ok = bool(side and os.path.isfile(side))
         entry.sidecar_path = side if entry.sidecar_ok else entry.sidecar_path
 
@@ -279,15 +290,13 @@ class DocumentCatalogService:
             notes.append("非标准文件名")
         if entry.pdf_ok:
             try:
-                entry.ocr_ok = os.path.isfile(
-                    self.cache_service.build_cache_path(pdf_resolved, self._ocr_dir)
-                )
-                entry.analysis_ok = os.path.isfile(
-                    self.cache_service.build_cache_path(pdf_resolved, self._analysis_dir)
-                )
-                entry.translation_ok = os.path.isfile(
-                    self.cache_service.build_cache_path(pdf_resolved, self._translation_dir)
-                )
+                bundle = self.storage_service.resolve_bundle_from_pdf(pdf_resolved)
+                ocr_path, _ = self.storage_service.resolve_read_path_with_fallback(bundle, "ocr")
+                analysis_path, _ = self.storage_service.resolve_read_path_with_fallback(bundle, "analysis")
+                translation_path, _ = self.storage_service.resolve_read_path_with_fallback(bundle, "translation")
+                entry.ocr_ok = os.path.isfile(ocr_path)
+                entry.analysis_ok = os.path.isfile(analysis_path)
+                entry.translation_ok = os.path.isfile(translation_path)
             except OSError:
                 pass
         if not entry.sidecar_ok:

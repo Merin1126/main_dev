@@ -22,7 +22,8 @@ from config.settings import (
     ANALYSIS_CACHE_AUTO_REFRESH_TTL,
 )
 from config.api_key_store import load_google_api_key as load_gemini_api_key
-from services import CacheService, LlmService, PdfService
+from services import CacheService, DocumentStorageService, LlmService, PdfService
+from services.docx_sync_service import DocxSyncService
 from services.report_service import ReportService
 from services.vertical_historical_docx_export_service import VerticalHistoricalDocxExportService
 from utils.app_state import AppState
@@ -201,8 +202,10 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
     MISSING_OCR_FOR_CURRENT_PAGE_MSG = "请先在「史料校对」页面完成当前页的 OCR 提取与校对！"
 
     def _build_ocr_cache_path(self, pdf_path: str) -> str:
-        """与 OCR 页相同的哈希规则，定位 OCR_Cache 下的 paged_v1 文件。"""
-        return self.cache_service.build_cache_path(pdf_path, self._ocr_cache_dir)
+        """定位 OCR paged_v1 缓存；Phase 1 仍优先 legacy 哈希路径。"""
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+        cache_path, _layout = self.storage_service.resolve_read_path_with_fallback(bundle, "ocr")
+        return cache_path
 
     @staticmethod
     def _ocr_cached_plaintext_is_usable(text: str) -> bool:
@@ -388,6 +391,10 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         self._analysis_cache_dir = os.path.join(base_dir, "Analysis_Cache")
         self._translation_cache_dir = os.path.join(base_dir, "Translation_Cache")
         self._report_service = ReportService(project_root=base_dir)
+        self.storage_service = DocumentStorageService(
+            project_root=base_dir,
+            cache_service=self.cache_service,
+        )
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
         if not os.path.exists(self.document_cache_dir):
@@ -650,6 +657,13 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             font=("Arial", 12, "bold"),
         ).pack(anchor="w", padx=12, pady=(4, 4))
 
+        Button(
+            self.action_frame,
+            text="史料文件夹",
+            height=30,
+            command=self.open_document_folder,
+        ).pack(fill="x", padx=12, pady=(0, 4))
+
         # 操作区较窄（paned minsize≈180）：并排两列时右侧按钮会被裁切，故改为纵向全宽。
         artifact_cache_col = ctk.CTkFrame(self.action_frame, fg_color=Color.TRANSPARENT)
         artifact_cache_col.pack(fill="x", padx=12, pady=(0, 4))
@@ -681,7 +695,19 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             self.export_document,
             height=40,
         )
-        self.btn_export.pack(pady=(6, 14), padx=12, fill="x")
+        self.btn_export.pack(pady=(6, 8), padx=12, fill="x")
+
+        if type(self).cache_dir_name in {"OCR_Cache", "Translation_Cache"}:
+            self.btn_sync_docx = self._build_icon_button(
+                self.action_frame,
+                "\U000F04E6",
+                "同步 DOCX 修改",
+                Color.BG_BUTTON_MUTED,
+                Color.BG_BUTTON_MUTED_HOVER,
+                self.sync_docx_changes,
+                height=36,
+            )
+            self.btn_sync_docx.pack(pady=(0, 14), padx=12, fill="x")
 
         self.ocr_progress_label = ctk.CTkLabel(
             self.action_frame,
@@ -989,7 +1015,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             messagebox.showerror("错误", f"无法打开 PDF 文件: {e}")
 
     def _load_cached_ocr_for_pdf(self, pdf_path):
-        cache_path = self._build_cache_path(pdf_path)
+        cache_path = self._build_cache_write_path(pdf_path)
         if not os.path.exists(cache_path):
             return False
         try:
@@ -1172,7 +1198,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
                 return
 
             pages_text[page_index] = (result or "").strip() or type(self).empty_page_marker
-            cache_path = self._build_cache_path(self.selected_pdf_path)
+            cache_path = self._build_cache_write_path(self.selected_pdf_path)
             cache_payload = self.cache_service.write_paged_cache(cache_path, pages_text)
             self._trace_cache_write(
                 cache_path=cache_path,
@@ -1309,12 +1335,13 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         if total_pages == 0:
             return [""], False
 
-        cache_path = self._build_cache_path(pdf_path)
+        read_cache_path = self._build_cache_path(pdf_path)
+        cache_path = self._build_cache_write_path(pdf_path)
         all_page_texts = [""] * total_pages
         start_page = 0
 
-        if os.path.exists(cache_path):
-            cached_pages = self.cache_service.read_paged_cache(cache_path)
+        if os.path.exists(read_cache_path):
+            cached_pages = self.cache_service.read_paged_cache(read_cache_path)
             if cached_pages:
                 usable = min(len(cached_pages), total_pages)
                 all_page_texts[:usable] = cached_pages[:usable]
@@ -1507,7 +1534,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         if not self.ocr_pages:
             messagebox.showwarning("提示", "没有可保存的内容。")
             return
-        cache_path = self._build_cache_path(self.selected_pdf_path)
+        cache_path = self._build_cache_write_path(self.selected_pdf_path)
         pages = ["" if p is None else str(p) for p in self.ocr_pages]
         try:
             self.cache_service.write_paged_cache(cache_path, pages)
@@ -1516,8 +1543,102 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             return
         messagebox.showinfo("提示", "当前修改已成功保存至本地缓存！")
 
+    def sync_docx_changes(self) -> None:
+        if not self.selected_pdf_path:
+            messagebox.showwarning("提示", "请先在左侧选择一个 PDF 文件。")
+            return
+        kind = self._docx_sync_kind_for_screen()
+        if not kind:
+            messagebox.showwarning("提示", "当前页面不支持 DOCX 修改同步。")
+            return
+
+        pdf_path = self.selected_pdf_path
+        export_service = VerticalHistoricalDocxExportService(
+            project_root=self._project_root,
+            cache_service=self.cache_service,
+        )
+        docx_path = export_service.resolve_output_docx_path(pdf_path, kind)
+        cache_path = self._build_cache_write_path(pdf_path)
+        sync_service = DocxSyncService(
+            project_root=self._project_root,
+            cache_service=self.cache_service,
+        )
+
+        try:
+            preview = sync_service.preview_docx_changes(
+                docx_path=docx_path,
+                cache_path=cache_path,
+                kind=kind,
+            )
+        except (OSError, ValueError) as e:
+            messagebox.showerror("同步失败", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("同步失败", f"同步 DOCX 修改时发生异常：\n{e}")
+            return
+
+        if not preview.changed_pages:
+            messagebox.showinfo("提示", "未检测到可同步的 DOCX 修改。")
+            return
+
+        page_summary = "、".join(str(i + 1) for i in preview.changed_pages[:10])
+        if len(preview.changed_pages) > 10:
+            page_summary += f" 等 {len(preview.changed_pages)} 页"
+        message = (
+            f"检测到 {len(preview.changed_pages)} 页、{preview.changed_blocks} 个段落有修改。\n"
+            f"将回写页码：{page_summary}\n\n"
+            "是否同步到当前缓存并刷新界面？"
+        )
+        if not messagebox.askyesno("同步 DOCX 修改", message):
+            return
+
+        try:
+            sync_service.apply_docx_changes(preview=preview, cache_path=cache_path)
+        except OSError as e:
+            messagebox.showerror("同步失败", f"写入缓存失败：{e}")
+            return
+
+        self.ocr_pages = preview.updated_pages
+        if self.current_ocr_page_index >= len(self.ocr_pages):
+            self.current_ocr_page_index = max(0, len(self.ocr_pages) - 1)
+        self._show_current_ocr_page()
+        self.ocr_progress_label.configure(
+            text=self._status_colon(f"已同步 DOCX 修改：{len(preview.changed_pages)} 页")
+        )
+        messagebox.showinfo("提示", "DOCX 修改已同步到缓存并刷新当前界面。")
+
     def _build_cache_path(self, pdf_path):
-        return self.cache_service.build_cache_path(pdf_path, self.document_cache_dir)
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+        cache_path, _layout = self.storage_service.resolve_read_path_with_fallback(
+            bundle,
+            self._paged_artifact_kind_for_screen(),
+        )
+        return cache_path
+
+    def _build_cache_write_path(self, pdf_path):
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+        return self.storage_service.resolve_write_path(
+            bundle,
+            self._paged_artifact_kind_for_screen(),
+        )
+
+    def _paged_artifact_kind_for_screen(self) -> str:
+        cache_dir_name = type(self).cache_dir_name
+        if cache_dir_name == "OCR_Cache":
+            return "ocr"
+        if cache_dir_name == "Analysis_Cache":
+            return "analysis"
+        if cache_dir_name == "Translation_Cache":
+            return "translation"
+        raise ValueError(f"Unsupported cache_dir_name: {cache_dir_name}")
+
+    def _docx_sync_kind_for_screen(self) -> str | None:
+        cache_dir_name = type(self).cache_dir_name
+        if cache_dir_name == "OCR_Cache":
+            return "ocr"
+        if cache_dir_name == "Translation_Cache":
+            return "translation"
+        return None
 
     def _selected_pdf_or_warn(self) -> str | None:
         path = self.selected_pdf_path
@@ -1540,6 +1661,21 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         except Exception as exc:
             messagebox.showerror("打开失败", f"无法打开 {label}：\n{exc}")
 
+    def open_document_folder(self) -> None:
+        pdf_path = self._selected_pdf_or_warn()
+        if not pdf_path:
+            return
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+        folder = bundle.root_dir
+        if not os.path.isdir(folder):
+            folder = os.path.dirname(pdf_path)
+        try:
+            open_path_in_system(folder)
+        except FileNotFoundError:
+            messagebox.showinfo("文件夹不存在", f"史料文件夹不存在。\n\n{folder}")
+        except Exception as exc:
+            messagebox.showerror("打开失败", f"无法打开史料文件夹：\n{exc}")
+
     def open_ocr_cache_file(self) -> None:
         pdf_path = self._selected_pdf_or_warn()
         if not pdf_path:
@@ -1551,14 +1687,16 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         pdf_path = self._selected_pdf_or_warn()
         if not pdf_path:
             return
-        cache_path = self.cache_service.build_cache_path(pdf_path, self._analysis_cache_dir)
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+        cache_path, _layout = self.storage_service.resolve_read_path_with_fallback(bundle, "analysis")
         self._open_existing_file(cache_path, label="分析缓存文件")
 
     def open_translation_cache_file(self) -> None:
         pdf_path = self._selected_pdf_or_warn()
         if not pdf_path:
             return
-        cache_path = self.cache_service.build_cache_path(pdf_path, self._translation_cache_dir)
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+        cache_path, _layout = self.storage_service.resolve_read_path_with_fallback(bundle, "translation")
         self._open_existing_file(cache_path, label="Translation 缓存文件")
 
     def open_summary_report_file(self) -> None:
@@ -1861,7 +1999,7 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             return None
 
         ttl_seconds = self._effective_context_cache_ttl_seconds()
-        cache_path = self._build_cache_path(pdf_path)
+        cache_path = self._build_cache_write_path(pdf_path)
         system_prompt_version = hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()
         source_fingerprint = self._build_context_source_fingerprint(
             pdf_path=pdf_path,
@@ -2470,11 +2608,17 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
         if not self._is_analysis_context_cache_enabled():
             return stats
         cache_dir = self.document_cache_dir
-        if not cache_dir or not os.path.isdir(cache_dir):
+        if not cache_dir and not self.storage_service.is_bundle_layout():
             return stats
 
         known_cache_names: set[str] = set()
-        sidecar_paths = glob.glob(os.path.join(cache_dir, "*.context.json"))
+        sidecar_paths = []
+        if cache_dir and os.path.isdir(cache_dir):
+            sidecar_paths.extend(glob.glob(os.path.join(cache_dir, "*.context.json")))
+        if self.storage_service.is_bundle_layout():
+            sidecar_paths.extend(
+                glob.glob(os.path.join(self.download_dir, "*", "*", "analysis.context.json"))
+            )
         for sidecar_path in sidecar_paths:
             stats["scanned_sidecars"] += 1
             try:

@@ -6,6 +6,8 @@ import os
 import re
 from typing import Any, List, Tuple
 
+from config.settings import BUNDLE_REL_ANALYSIS, BUNDLE_REL_ANALYSIS_CONTEXT
+
 
 class CacheService:
     """封装缓存路径、读写与目录清理。"""
@@ -68,6 +70,8 @@ class CacheService:
 
     @staticmethod
     def build_context_sidecar_path(cache_path: str) -> str:
+        if os.path.basename(cache_path) == BUNDLE_REL_ANALYSIS:
+            return os.path.join(os.path.dirname(cache_path), BUNDLE_REL_ANALYSIS_CONTEXT)
         base, _ext = os.path.splitext(cache_path)
         return f"{base}.context.json"
 

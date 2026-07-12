@@ -24,7 +24,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
-from services import DbService
+from config.settings import BUNDLE_REL_SCRATCH_DIR, BUNDLE_REL_SIDECAR
+from services import DbService, DocumentStorageService
+from utils.jacar_filename import extract_jacar_ref_from_path
 
 _PRINT_LOCK = threading.Lock()
 _STATUS_LINE_LEN = 0
@@ -283,11 +285,35 @@ def _write_sidecar_metadata(
     logger: logging.Logger | None = None,
 ) -> str:
     """为 PDF 写入同名 Sidecar JSON，返回 json 路径。"""
-    json_path = os.path.splitext(save_path)[0] + ".json"
+    json_path = _sidecar_path_for_pdf(save_path)
+    os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(metadata or {}, jf, ensure_ascii=False, indent=4)
     _emit(logger, f"  -> 🧾 Sidecar 元数据已保存: {os.path.basename(json_path)}")
     return json_path
+
+
+def _sidecar_path_for_pdf(save_path: str) -> str:
+    """Bundle layout uses sidecar.json; legacy keeps PDF basename + .json."""
+    if _is_bundle_pdf_path(save_path):
+        return os.path.join(os.path.dirname(os.path.abspath(save_path)), BUNDLE_REL_SIDECAR)
+    return os.path.splitext(os.path.abspath(save_path))[0] + ".json"
+
+
+def _is_bundle_pdf_path(save_path: str) -> bool:
+    ref = extract_jacar_ref_from_path(save_path)
+    return bool(ref and os.path.basename(os.path.dirname(os.path.abspath(save_path))).upper() == ref.upper())
+
+
+def _touch_bundle_manifest(save_path: str, task: dict) -> None:
+    if not _is_bundle_pdf_path(save_path):
+        return
+    try:
+        storage = DocumentStorageService(project_root=task.get("project_root") or None)
+        bundle = storage.resolve_bundle_from_pdf(save_path)
+        storage.touch_manifest_artifact(bundle)
+    except Exception:
+        pass
 
 
 def _wait_dom_ready(driver, timeout=25):
@@ -322,6 +348,8 @@ def _extract_first_digits(text: str, default: str = "1") -> str:
 
 def _iiif_resume_dir(save_path: str) -> str:
     """IIIF 页级断点目录。"""
+    if _is_bundle_pdf_path(save_path):
+        return os.path.join(os.path.dirname(os.path.abspath(save_path)), BUNDLE_REL_SCRATCH_DIR, "iiif_resume")
     return os.path.splitext(save_path)[0] + ".iiif_resume"
 
 
@@ -443,6 +471,8 @@ def api_download_worker(
 
         viewer_url = task.get("url", "")
         save_path = task.get("save_path", "")
+        if save_path:
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
         doc_title = task.get("title", "未知文档")
         doc_metadata = task.get("metadata", {}) or {}
         task_mode = task.get("mode", "download_and_sidecar")
@@ -488,11 +518,12 @@ def api_download_worker(
 
             if task_mode == "sidecar_only":
                 _write_sidecar_metadata(save_path, doc_metadata, logger)
+                _touch_bundle_manifest(save_path, task)
                 db_service.mark_downloaded_with_files(
                     source=source,
                     native_id=native_id,
                     pdf_path=save_path if os.path.exists(save_path) else None,
-                    sidecar_path=os.path.splitext(save_path)[0] + ".json",
+                    sidecar_path=_sidecar_path_for_pdf(save_path),
                 )
                 db_service.add_download_event(
                     native_id,
@@ -514,7 +545,7 @@ def api_download_worker(
 
             # 物理自愈兜底：数据库状态丢失但 PDF 已存在时，直接修复数据库并跳过网络下载
             if os.path.exists(save_path):
-                sidecar_path = os.path.splitext(save_path)[0] + ".json"
+                sidecar_path = _sidecar_path_for_pdf(save_path)
                 db_service.mark_downloaded_with_files(
                     source=source,
                     native_id=native_id,
@@ -626,11 +657,12 @@ def api_download_worker(
                             )
                             continue
                 _write_sidecar_metadata(save_path, doc_metadata, logger)
+                _touch_bundle_manifest(save_path, task)
                 db_service.mark_downloaded_with_files(
                     source=source,
                     native_id=native_id,
                     pdf_path=save_path,
-                    sidecar_path=os.path.splitext(save_path)[0] + ".json",
+                    sidecar_path=_sidecar_path_for_pdf(save_path),
                 )
                 db_service.add_download_event(
                     native_id,
@@ -853,11 +885,12 @@ def api_download_worker(
                 finally:
                     pdf_doc.close()
                 _write_sidecar_metadata(save_path, doc_metadata, logger)
+                _touch_bundle_manifest(save_path, task)
                 db_service.mark_downloaded_with_files(
                     source=source,
                     native_id=native_id,
                     pdf_path=save_path,
-                    sidecar_path=os.path.splitext(save_path)[0] + ".json",
+                    sidecar_path=_sidecar_path_for_pdf(save_path),
                 )
                 db_service.add_download_event(
                     native_id,
@@ -887,7 +920,7 @@ def api_download_worker(
             elif "hojishinbun.hoover.org" in viewer_url:
                 _emit(logger, "  -> ⚠️ 检测到胡佛研究所链接，当前服务器宕机，暂时跳过。", logging.WARNING)
                 pending_path = os.path.join(os.path.dirname(save_path), "Hoover_Pending_Tasks.txt")
-                sidecar_path = os.path.splitext(save_path)[0] + ".json"
+                sidecar_path = _sidecar_path_for_pdf(save_path)
                 pending_exists = _hoover_pending_has_url(pending_path, viewer_url)
                 sidecar_exists = os.path.exists(sidecar_path)
 
@@ -925,6 +958,7 @@ def api_download_worker(
                 hoover_metadata["Download_Note"] = "Hoover source currently unavailable; download deferred."
                 if not sidecar_exists:
                     _write_sidecar_metadata(save_path, hoover_metadata, logger)
+                    _touch_bundle_manifest(save_path, task)
                     _emit(
                         logger,
                         f"  -> 🧾 已为胡佛任务写入同格式 Sidecar 元数据 JSON: {os.path.basename(save_path)}",
@@ -1024,6 +1058,7 @@ def jacar_auto_search(
     base_download_dir = os.path.join(application_path, "JACAR_Downloads")
     download_dir = os.path.join(base_download_dir, target_keyword)
     os.makedirs(download_dir, exist_ok=True)
+    storage_service = DocumentStorageService(project_root=application_path)
 
     logger: logging.Logger | None = None
     log_path = ""
@@ -1317,7 +1352,13 @@ def jacar_auto_search(
                         f"（第1—{scale}画像目）、『{parent_name}』（{repo_name}）"
                     )
                     safe_target_name = _sanitize_filename(raw_target_name)
-                    final_save_path = os.path.join(download_dir, safe_target_name + ".pdf")
+                    legacy_save_path = os.path.join(download_dir, safe_target_name + ".pdf")
+                    final_save_path = storage_service.planned_pdf_path(
+                        source=source_for_task,
+                        native_id=ref_code,
+                        search_keyword=target_keyword,
+                        legacy_fallback_path=legacy_save_path,
+                    )
                     task_id = f"{source_for_task}:{ref_code}" if ref_code and ref_code != "Unknown_Ref" else final_save_path
 
                     # 监控列表：在遍历到结果行时就建立条目，不依赖是否入队下载
@@ -1371,6 +1412,7 @@ def jacar_auto_search(
                             "native_id": ref_code,
                             "search_keyword": target_keyword,
                             "run_id": run_id,
+                            "project_root": application_path,
                         }
                     )
                     db_service.add_download_event(

@@ -15,7 +15,7 @@ from docx.shared import Inches, Pt
 
 from config.api_key_store import load_google_api_key
 from config.settings import GEMINI_SUMMARY_MODEL_DEFAULT
-from services import CacheService, LlmService, PdfService, TemplateService
+from services import CacheService, DocumentStorageService, LlmService, PdfService, TemplateService
 from utils.docx_export import (
     COMPARISON_FONT_ANALYSIS,
     COMPARISON_FONT_OCR,
@@ -57,6 +57,10 @@ class ReportService:
         self.project_root = os.path.abspath(project_root)
         self.cache_service = CacheService()
         self.pdf_service = PdfService()
+        self.storage_service = DocumentStorageService(
+            project_root=self.project_root,
+            cache_service=self.cache_service,
+        )
 
     def default_index_path(self) -> str:
         return os.path.join(self.project_root, "Reports", "report_index.json")
@@ -130,8 +134,13 @@ class ReportService:
         comparison_dir = os.path.abspath(comparison_dir or self.default_comparison_dir())
         summary_dir = os.path.abspath(summary_dir or self.default_summary_dir())
         ref = extract_jacar_ref_from_path(pdf_path)
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
 
-        docx_expected = self.expected_comparison_docx_path(pdf_path, comparison_dir)
+        docx_expected = (
+            self.storage_service.artifact_path(bundle, "export_comparison_docx")
+            if bundle.layout == "bundle_v1"
+            else self.expected_comparison_docx_path(pdf_path, comparison_dir)
+        )
         docx_exists, docx_hit = self._find_existing_export_file(
             comparison_dir,
             pdf_path,
@@ -140,7 +149,11 @@ class ReportService:
             suffix=".docx",
         )
 
-        md_expected = self.expected_summary_md_path(pdf_path, summary_dir)
+        md_expected = (
+            self.storage_service.artifact_path(bundle, "summary")
+            if bundle.layout == "bundle_v1"
+            else self.expected_summary_md_path(pdf_path, summary_dir)
+        )
         md_exists, md_hit = self._find_existing_export_file(
             summary_dir,
             pdf_path,
@@ -320,6 +333,7 @@ class ReportService:
         image_dpi: float = COMPARISON_IMAGE_TARGET_DPI,
         progress_cb: ProgressCallback | None = None,
     ) -> ExportResult:
+        use_bundle_output = output_dir is None and self.storage_service.is_bundle_layout()
         output_dir = os.path.abspath(output_dir or self.default_comparison_dir())
         os.makedirs(output_dir, exist_ok=True)
         entries = index_data.get("entries", []) or []
@@ -348,6 +362,7 @@ class ReportService:
                 out = self._render_single_docx(
                     entry=entry,
                     output_dir=output_dir,
+                    use_bundle_output=use_bundle_output,
                     include_analysis_raw=include_analysis_raw,
                     image_dpi=float(image_dpi),
                 )
@@ -378,6 +393,7 @@ class ReportService:
         *,
         entry: dict[str, Any],
         output_dir: str,
+        use_bundle_output: bool,
         include_analysis_raw: bool,
         image_dpi: float,
     ) -> str:
@@ -410,8 +426,13 @@ class ReportService:
                 if i < total - 1:
                     append_docx_page_break(doc)
 
-        name = safe_filename(os.path.splitext(os.path.basename(pdf_path))[0]) + "_按页对照报告.docx"
-        out_path = os.path.join(output_dir, name)
+        if use_bundle_output:
+            bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+            out_path = self.storage_service.resolve_write_path(bundle, "export_comparison_docx")
+        else:
+            name = safe_filename(os.path.splitext(os.path.basename(pdf_path))[0]) + "_按页对照报告.docx"
+            out_path = os.path.join(output_dir, name)
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
         doc.save(out_path)
         return out_path
 
@@ -566,6 +587,7 @@ class ReportService:
         skip_existing: bool = True,
         progress_cb: ProgressCallback | None = None,
     ) -> ExportResult:
+        use_bundle_output = output_dir is None and self.storage_service.is_bundle_layout()
         output_dir = os.path.abspath(output_dir or self.default_summary_dir())
         os.makedirs(output_dir, exist_ok=True)
         entries = index_data.get("entries", []) or []
@@ -604,8 +626,12 @@ class ReportService:
             }
             try:
                 doc_name = os.path.basename(entry["pdf_path"])
-                out_name = safe_filename(os.path.splitext(doc_name)[0]) + ".summary.md"
-                out_path = os.path.join(output_dir, out_name)
+                if use_bundle_output:
+                    bundle = self.storage_service.resolve_bundle_from_pdf(entry["pdf_path"])
+                    out_path = self.storage_service.resolve_write_path(bundle, "summary")
+                else:
+                    out_name = safe_filename(os.path.splitext(doc_name)[0]) + ".summary.md"
+                    out_path = os.path.join(output_dir, out_name)
                 if skip_existing and os.path.isfile(out_path):
                     row["status"] = "skipped_existing"
                     row["output_summary"] = out_path

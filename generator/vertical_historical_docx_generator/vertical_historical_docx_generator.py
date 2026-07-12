@@ -229,6 +229,15 @@ def apply_layout(doc, layout):
     normal.paragraph_format.line_spacing = 1.0
 
 
+def add_sync_marker_run(paragraph, block, *, font, size):
+    block_id = str(block.get("block_id") or "").strip()
+    if not block_id:
+        return
+    run = paragraph.add_run(f"[[HRS_BLOCK:{block_id}]]")
+    run.font.hidden = True
+    set_run_font(run, font=font, size=size, bold=False)
+
+
 def add_paragraph_block(doc, block, layout):
     if block.get("role") == "page_number":
         return
@@ -263,6 +272,12 @@ def add_paragraph_block(doc, block, layout):
         pf.first_line_indent = Pt(size * first_line_indent_chars)
 
     text = normalize_text(block["text"], layout.get("normalization", {}))
+    add_sync_marker_run(
+        p,
+        block,
+        font=block.get("font", layout.get("font", DEFAULT_FONT)),
+        size=size,
+    )
     run = p.add_run(text)
     set_run_font(
         run,

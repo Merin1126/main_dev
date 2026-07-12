@@ -15,6 +15,8 @@ from generator.vertical_historical_docx_generator import (
 from services.cache_index_service import CacheIndexService
 from services.cache_service import CacheService
 from services.db_service import DbService
+from services.document_storage_service import DocumentStorageService
+from services.docx_sync_service import DocxSyncService
 from utils.jacar_filename import extract_jacar_ref_from_path, parse_jacar_pdf_filename
 from utils.reporting import ensure_dir, safe_filename
 
@@ -35,9 +37,17 @@ class VerticalHistoricalDocxExportService:
         )
         self.cache_service = cache_service or CacheService()
         self.db_service = db_service or DbService()
+        self.storage_service = DocumentStorageService(
+            project_root=self.project_root,
+            cache_service=self.cache_service,
+        )
         self.cache_index_service = CacheIndexService(
             project_root=self.project_root,
             db_service=self.db_service,
+        )
+        self.docx_sync_service = DocxSyncService(
+            project_root=self.project_root,
+            cache_service=self.cache_service,
         )
         self._ocr_cache_dir = os.path.join(self.project_root, "OCR_Cache")
         self._translation_cache_dir = os.path.join(self.project_root, "Translation_Cache")
@@ -77,6 +87,10 @@ class VerticalHistoricalDocxExportService:
         return "未分类"
 
     def resolve_output_docx_path(self, pdf_path: str, kind: ExportKind) -> str:
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+        if bundle.layout == "bundle_v1":
+            artifact = "export_translation_docx" if kind == "translation" else "export_ocr_docx"
+            return self.storage_service.resolve_write_path(bundle, artifact)  # type: ignore[arg-type]
         keyword = safe_filename(self.resolve_search_keyword(pdf_path)) or "未分类"
         basename = safe_filename(os.path.splitext(os.path.basename(pdf_path))[0])
         if kind == "translation":
@@ -93,7 +107,9 @@ class VerticalHistoricalDocxExportService:
         return self._translation_cache_dir
 
     def build_cache_path(self, pdf_path: str, kind: ExportKind) -> str:
-        return self.cache_service.build_cache_path(pdf_path, self.cache_dir_for(kind))
+        bundle = self.storage_service.resolve_bundle_from_pdf(pdf_path)
+        cache_path, _layout = self.storage_service.resolve_read_path_with_fallback(bundle, kind)
+        return cache_path
 
     @staticmethod
     def cache_key_from_path(cache_path: str) -> str:
@@ -127,6 +143,10 @@ class VerticalHistoricalDocxExportService:
         if memory_pages:
             normalized = ["" if p is None else str(p) for p in memory_pages]
             if any(str(p).strip() for p in normalized):
+                cache_path = self.storage_service.resolve_write_path(
+                    self.storage_service.resolve_bundle_from_pdf(pdf_path),
+                    kind,
+                )
                 self.cache_service.write_paged_cache(cache_path, normalized)
                 disk_pages = self.cache_service.read_paged_cache(cache_path)
                 if disk_pages:
@@ -168,7 +188,7 @@ class VerticalHistoricalDocxExportService:
         input_meta = {"export_source": meta.get("source", "unknown"), "input_format": meta.get("input_format", "paged_v1")}
 
         if kind == "ocr":
-            return ocr_cleaner.build_schema_from_pages(
+            schema = ocr_cleaner.build_schema_from_pages(
                 pages,
                 source_path=cache_path,
                 cache_key=cache_key,
@@ -178,8 +198,9 @@ class VerticalHistoricalDocxExportService:
                 jacar_ref_override=jacar_ref,
                 input_meta=input_meta,
             )
+            return self.docx_sync_service.attach_block_ids(schema, kind=kind)
 
-        return translation_cleaner.build_schema_from_pages(
+        schema = translation_cleaner.build_schema_from_pages(
             pages,
             source_path=cache_path,
             cache_key=cache_key,
@@ -189,6 +210,7 @@ class VerticalHistoricalDocxExportService:
             jacar_ref_override=jacar_ref,
             input_meta=input_meta,
         )
+        return self.docx_sync_service.attach_block_ids(schema, kind=kind)
 
     def export_to_docx(
         self,
@@ -214,6 +236,15 @@ class VerticalHistoricalDocxExportService:
                 flow_pages=False,
                 merge_pages=True,
             )
+        source = schema.get("source") or {}
+        cache_path = source.get("ocr_cache" if kind == "ocr" else "translation_cache") or self.build_cache_path(pdf_path, kind)
+        sync_path = self.docx_sync_service.write_sync_manifest(
+            docx_path=output_docx,
+            schema=schema,
+            kind=kind,
+            pdf_path=pdf_path,
+            cache_path=cache_path,
+        )
 
         try:
             self.cache_index_service.index_pdf(pdf_path)
@@ -226,4 +257,5 @@ class VerticalHistoricalDocxExportService:
             "title": (schema.get("source") or {}).get("title") or "",
             "jacar_ref": (schema.get("source") or {}).get("jacar_ref") or "",
             "search_keyword": self.resolve_search_keyword(pdf_path),
+            "sync_path": sync_path,
         }

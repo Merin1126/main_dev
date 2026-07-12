@@ -12,6 +12,7 @@ from google import genai
 from google.genai import types
 
 from config.api_key_store import load_trace_config
+from services.document_storage_service import DocumentStorageService
 from utils.gemini_trace_logger import append_trace_event, build_cache_event, build_context_cache_event
 from utils.token_logger import log_context_cache_event, log_gemini_usage
 
@@ -1029,16 +1030,27 @@ class LlmService:
         if enrich_json_data and selected_pdf_path:
             data = enrich_json_data(data, selected_pdf_path)
 
-        db_dir = os.path.join(self.project_root, "Database_JSON")
-        os.makedirs(db_dir, exist_ok=True)
         doc_id = data.get("Document_ID", file_name.replace(".pdf", ""))
         safe_doc_id = re.sub(r'[\\/:*?"<>|]+', "_", str(doc_id)).strip("_") or "unknown_document"
         page_match = re.search(r"第(\d+)页", file_name)
+        page_num: int | None = None
         if page_match:
-            page_suffix = f"_p{int(page_match.group(1)):04d}"
+            page_num = int(page_match.group(1))
+            page_suffix = f"_p{page_num:04d}"
         else:
             page_suffix = f"_seg_{abs(hash(file_name)) % 100000:05d}"
-        json_save_path = os.path.join(db_dir, f"{safe_doc_id}{page_suffix}.json")
+        storage_service = DocumentStorageService(project_root=self.project_root)
+        if selected_pdf_path and storage_service.is_bundle_layout() and page_num is not None:
+            bundle = storage_service.resolve_bundle_from_pdf(selected_pdf_path)
+            json_save_path = storage_service.resolve_write_path(
+                bundle,
+                "structured_page",
+                page_index=page_num - 1,
+            )
+        else:
+            db_dir = os.path.join(self.project_root, "Database_JSON")
+            os.makedirs(db_dir, exist_ok=True)
+            json_save_path = os.path.join(db_dir, f"{safe_doc_id}{page_suffix}.json")
         with open(json_save_path, "w", encoding="utf-8") as jf:
             json.dump(data, jf, ensure_ascii=False, indent=2)
         self.trace_cache_write(

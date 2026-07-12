@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from services import CacheService, PdfService
+from services import CacheService, DocumentStorageService, PdfService
 
 
 _FENCED_JSON_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", flags=re.DOTALL)
@@ -128,10 +128,10 @@ def build_report_entry(
     cache_service: CacheService,
     pdf_service: PdfService,
 ) -> ReportDocumentEntry:
-    ocr_dir = os.path.join(project_root, "OCR_Cache")
-    analysis_dir = os.path.join(project_root, "Analysis_Cache")
-    ocr_cache_path = cache_service.build_cache_path(pdf_path, ocr_dir)
-    analysis_cache_path = cache_service.build_cache_path(pdf_path, analysis_dir)
+    storage_service = DocumentStorageService(project_root=project_root, cache_service=cache_service)
+    bundle = storage_service.resolve_bundle_from_pdf(pdf_path)
+    ocr_cache_path, _ocr_layout = storage_service.resolve_read_path_with_fallback(bundle, "ocr")
+    analysis_cache_path, _analysis_layout = storage_service.resolve_read_path_with_fallback(bundle, "analysis")
 
     page_count = pdf_service.count_pages(pdf_path)
     ocr_pages = cache_service.read_paged_cache(ocr_cache_path)

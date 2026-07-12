@@ -4,11 +4,16 @@ from __future__ import annotations
 import json
 import os
 
+from config.settings import BUNDLE_REL_SIDECAR
+from utils.jacar_filename import extract_jacar_ref_from_path
 from utils.jacar_filename import JacarFilenameParts
 
 
 def sidecar_path_for_pdf(pdf_path: str) -> str:
     """与 core_scraper 一致：PDF 主文件名 + .json。"""
+    ref = extract_jacar_ref_from_path(pdf_path)
+    if ref and os.path.basename(os.path.dirname(os.path.abspath(pdf_path))).upper() == ref.upper():
+        return os.path.join(os.path.dirname(os.path.abspath(pdf_path)), BUNDLE_REL_SIDECAR)
     return os.path.splitext(os.path.abspath(pdf_path))[0] + ".json"
 
 

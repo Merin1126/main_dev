@@ -80,8 +80,6 @@ def refs_equal(a: str, b: str) -> bool:
 
 def extract_jacar_ref_from_path(path: str) -> str:
     """从路径或文件名中提取 JACAR 编号（如 B03041041300）。"""
-    import os
-
-    name = os.path.basename(path or "")
+    name = str(path or "")
     match = _JACAR_REF_RE.search(name)
     return match.group(0).upper() if match else ""

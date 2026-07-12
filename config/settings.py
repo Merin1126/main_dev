@@ -4,6 +4,31 @@ from pathlib import Path
 # 定义项目根目录
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# 史料存储布局：legacy 保持当前 PDF + 哈希缓存目录；bundle_v1 预留给单篇史料文件夹布局。
+DOCUMENT_STORAGE_LAYOUT = "bundle_v1"
+DOCUMENT_BUNDLE_ROOT = BASE_DIR / "JACAR_Downloads"
+
+# Legacy 缓存目录（Phase 0/1 仍作为实际读写位置）。
+LEGACY_OCR_CACHE_DIR = BASE_DIR / "OCR_Cache"
+LEGACY_ANALYSIS_CACHE_DIR = BASE_DIR / "Analysis_Cache"
+LEGACY_TRANSLATION_CACHE_DIR = BASE_DIR / "Translation_Cache"
+LEGACY_DATABASE_JSON_DIR = BASE_DIR / "Database_JSON"
+
+# Bundle v1 目录内相对路径（Phase 1 用于统一接口与后续迁移）。
+BUNDLE_REL_PDF = "document.pdf"
+BUNDLE_REL_SIDECAR = "sidecar.json"
+BUNDLE_REL_MANIFEST = "manifest.json"
+BUNDLE_REL_OCR = "ocr.paged.json"
+BUNDLE_REL_ANALYSIS = "analysis.paged.json"
+BUNDLE_REL_TRANSLATION = "translation.paged.json"
+BUNDLE_REL_ANALYSIS_CONTEXT = "analysis.context.json"
+BUNDLE_REL_SUMMARY = "summary.md"
+BUNDLE_REL_EXPORT_OCR_DOCX = "export/ocr.docx"
+BUNDLE_REL_EXPORT_TRANSLATION_DOCX = "export/translation.docx"
+BUNDLE_REL_EXPORT_COMPARISON_DOCX = "export/comparison.docx"
+BUNDLE_REL_STRUCTURED_DIR = "structured"
+BUNDLE_REL_SCRATCH_DIR = "_scratch"
+
 #全局版本号配置
 APP_VERSION = "V3.2.0"
 
