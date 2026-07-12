@@ -189,4 +189,4 @@ class OCRScreen(BaseDocumentScreen):
         return render_ocr_prompt()
 
     def export_document(self) -> None:
-        self._export_text_pages_default()
+        self._export_vertical_historical_docx(kind="ocr", dialog_title=self.export_dialog_title)

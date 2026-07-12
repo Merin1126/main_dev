@@ -17,3 +17,16 @@ def open_path_in_system(path: str) -> None:
         os.startfile(target)  # type: ignore[attr-defined]
     else:
         subprocess.run(["xdg-open", target], check=True)
+
+
+def reveal_file_in_folder(path: str) -> None:
+    """在文件管理器中打开所在文件夹并选中该文件。"""
+    target = os.path.abspath(path)
+    if not os.path.isfile(target):
+        raise FileNotFoundError(target)
+    if sys.platform.startswith("darwin"):
+        subprocess.run(["open", "-R", target], check=True)
+    elif os.name == "nt":
+        subprocess.run(["explorer", "/select,", target], check=True)
+    else:
+        subprocess.run(["xdg-open", os.path.dirname(target)], check=True)

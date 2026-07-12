@@ -162,4 +162,4 @@ class TranslationScreen(BaseDocumentScreen):
         )
 
     def export_document(self) -> None:
-        self._export_text_pages_default()
+        self._export_vertical_historical_docx(kind="translation", dialog_title=self.export_dialog_title)

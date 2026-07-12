@@ -13,6 +13,7 @@ from screens.document_catalog_window import DocumentCatalogWindow
 from screens.report_summary_window import ReportSummaryWindow
 from services import LlmService
 from services.db_disk_sync_service import DbDiskSyncService
+from services.cache_index_service import CacheIndexService
 from services.sidecar_filename_sync_service import SidecarFilenameSyncService
 from services.scraper_health_check_service import ScraperHealthCheckService, ScraperHealthCheckResult
 from utils.trace_report import convert_current_trace_to_md, delete_current_converted_trace_md
@@ -289,6 +290,41 @@ class SettingScreen(ctk.CTkFrame):
             justify="left",
         )
         self.sidecar_sync_hint_label.pack(anchor="w", padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(
+            container,
+            text="缓存 ↔ Ref 反向索引",
+            font=("Arial", 14),
+        ).pack(anchor="w", padx=16, pady=(10, 6))
+
+        ctk.CTkLabel(
+            container,
+            text=(
+                "扫描 JACAR_Downloads 与 OCR/Analysis/Translation 缓存目录，"
+                "建立哈希缓存文件与 JACAR Ref 的对应关系，便于从缓存文件名反查史料。"
+            ),
+            font=("Arial", 12),
+            text_color=Color.TEXT_HINT_TUPLE,
+            wraplength=560,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        Button(
+            container,
+            text="重建缓存 Ref 索引",
+            width=280,
+            height=40,
+            command=self.rebuild_cache_ref_index,
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        self.cache_index_hint_label = ctk.CTkLabel(
+            container,
+            text="尚未重建缓存索引。",
+            font=("Arial", 12),
+            wraplength=560,
+            justify="left",
+        )
+        self.cache_index_hint_label.pack(anchor="w", padx=16, pady=(0, 8))
 
         ctk.CTkLabel(
             container,
@@ -688,6 +724,39 @@ class SettingScreen(ctk.CTkFrame):
     def _apply_sidecar_sync_error(self, err: str) -> None:
         self.sidecar_sync_hint_label.configure(text="JSON 同步失败。")
         messagebox.showerror("同步失败", f"无法同步 JSON 文件名：\n{err}")
+
+    def rebuild_cache_ref_index(self) -> None:
+        if not messagebox.askyesno(
+            "重建缓存 Ref 索引",
+            "将扫描全部 PDF 与 OCR/Analysis/Translation 缓存文件，"
+            "并重建 SQLite 中的 document_cache_index 表。\n\n是否继续？",
+            parent=self.winfo_toplevel(),
+        ):
+            return
+        self.cache_index_hint_label.configure(text="正在重建缓存 Ref 索引，请稍候…")
+        threading.Thread(target=self._run_cache_index_rebuild, daemon=True).start()
+
+    def _run_cache_index_rebuild(self) -> None:
+        try:
+            stats = CacheIndexService(project_root=self.project_root).rebuild_all()
+            report = "\n".join(stats.summary_lines())
+            summary = (
+                f"缓存索引：PDF {stats.pdfs_scanned} 个；"
+                f"索引 {stats.entries_written} 条；"
+                f"孤儿 {stats.orphans_found} 条"
+            )
+            self.after(0, lambda: self._apply_cache_index_result(summary, report))
+        except Exception as exc:
+            err = str(exc)
+            self.after(0, lambda: self._apply_cache_index_error(err))
+
+    def _apply_cache_index_result(self, summary: str, report: str) -> None:
+        self.cache_index_hint_label.configure(text=summary)
+        self._show_cache_check_dialog("缓存 Ref 索引重建结果", report)
+
+    def _apply_cache_index_error(self, err: str) -> None:
+        self.cache_index_hint_label.configure(text="缓存索引重建失败。")
+        messagebox.showerror("重建失败", f"无法重建缓存 Ref 索引：\n{err}")
 
     def test_scraper_health(self) -> None:
         self.scraper_test_btn.configure(state="disabled")

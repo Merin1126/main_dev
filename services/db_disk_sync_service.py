@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from services.cache_index_service import CacheIndexService
 from services.db_service import DbService
 from services.document_rename_service import DocumentRenameService
 from utils.jacar_sidecar import sidecar_path_for_pdf
@@ -115,6 +116,14 @@ class DbDiskSyncService:
         if fix_missing_files:
             stats.db_rows_relinked, reset_count = self._relink_and_prune_db(ref_to_pdf)
             stats.missing_files_reset = reset_count
+
+        try:
+            cache_stats = CacheIndexService(project_root=self.project_root).rebuild_all()
+            stats.notes.append(
+                f"缓存 Ref 索引：{cache_stats.entries_written} 条（孤儿 {cache_stats.orphans_found}）"
+            )
+        except Exception as exc:
+            stats.notes.append(f"缓存 Ref 索引重建失败：{exc}")
 
         return stats
 

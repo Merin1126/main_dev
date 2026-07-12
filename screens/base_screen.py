@@ -24,9 +24,11 @@ from config.settings import (
 from config.api_key_store import load_google_api_key as load_gemini_api_key
 from services import CacheService, LlmService, PdfService
 from services.report_service import ReportService
+from services.vertical_historical_docx_export_service import VerticalHistoricalDocxExportService
 from utils.app_state import AppState
 from utils.docx_export import write_pages_to_docx
-from utils.open_path import open_path_in_system
+from utils.open_path import open_path_in_system, reveal_file_in_folder
+from utils.reporting import safe_filename
 from utils.token_logger import log_context_cache_event, storage_hours_between
 
 class DocumentTaskState(Enum):
@@ -307,6 +309,54 @@ class BaseDocumentScreen(ctk.CTkFrame, ABC):
             messagebox.showinfo("成功", f"文件已成功保存至:\n{file_path}")
         except Exception as e:
             messagebox.showerror("导出失败", f"保存出错:\n{e}")
+
+    def _export_vertical_historical_docx(self, *, kind: str, dialog_title: str | None = None) -> None:
+        if not self.selected_pdf_path or not os.path.isfile(self.selected_pdf_path):
+            messagebox.showwarning("提示", "请先在左侧选择一个 PDF 文件。")
+            return
+
+        self._save_current_ocr_page()
+        if not self.ocr_pages:
+            messagebox.showwarning("提示", "导出内容为空！")
+            return
+
+        pdf_path = self.selected_pdf_path
+        export_service = VerticalHistoricalDocxExportService(project_root=self._project_root)
+        file_path = export_service.resolve_output_docx_path(pdf_path, kind)  # type: ignore[arg-type]
+
+        if os.path.isfile(file_path):
+            if not messagebox.askyesno(
+                "文件已存在",
+                f"以下 DOCX 已存在，是否覆盖替换？\n\n{file_path}",
+                parent=self.winfo_toplevel(),
+            ):
+                return
+
+        memory_pages = ["" if p is None else str(p) for p in self.ocr_pages]
+        try:
+            result = export_service.export_to_docx(
+                kind=kind,  # type: ignore[arg-type]
+                pdf_path=pdf_path,
+                output_docx=file_path,
+                memory_pages=memory_pages,
+            )
+        except Exception as e:
+            messagebox.showerror("导出失败", f"竖排 DOCX 生成失败：\n{e}")
+            return
+
+        ref = result.get("jacar_ref") or ""
+        ref_line = f"\nJACAR Ref：{ref}" if ref else ""
+        keyword = result.get("search_keyword") or ""
+        keyword_line = f"\n专题：{keyword}" if keyword else ""
+        messagebox.showinfo(
+            "成功",
+            f"竖排 DOCX 已保存至：\n{file_path}\n"
+            f"共 {result.get('page_count', 0)} 页{keyword_line}{ref_line}",
+        )
+        try:
+            reveal_file_in_folder(file_path)
+        except Exception as exc:
+            messagebox.showwarning("提示", f"文件已保存，但无法在文件夹中定位：\n{exc}")
 
     def __init__(self, master, **kwargs):
         cls = type(self)

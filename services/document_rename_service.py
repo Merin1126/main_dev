@@ -5,6 +5,7 @@ import json
 import os
 from dataclasses import dataclass, field
 
+from services.cache_index_service import CacheIndexService
 from services.cache_service import CacheService
 from services.db_service import DbService
 from services.document_audit_service import DocumentAuditService
@@ -243,6 +244,11 @@ class DocumentRenameService:
                 new_pdf_path=new_pdf_path,
                 source=audit_source,
             )
+
+            try:
+                CacheIndexService(project_root=self.project_root).index_pdf(new_pdf_path)
+            except Exception:
+                pass
 
             return DocumentRenameResult(
                 success=True,
