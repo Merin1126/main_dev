@@ -256,6 +256,7 @@ HRS_Project/
 * **Phase 5A**：修复 MOFA CDN PDF 冷直连 403（同 Session 卷册页预热 + Referer + 一次强制重试）；新增逐页文本层/图像诊断、OCR 待处理页列表、实时目录规模估算 CLI。真实样本验证表明抽查的1921/1925/1927年正文均为纯影像 PDF。
 * **Phase 5B-0**：新增统一根目录 `Historical_Documents`。JACAR 新写入路径为 `jacar/<Ref>/`，MOFA 为 `mofa/<年份>/<卷代码>/<native_id>/`，物理目录不再由检索关键词决定。SQLite 继续以 `source:native_id` 防重，并新增 `document_keywords` 多对多表保存一份史料的全部关键词命中关系。
 * **Phase 5B-1**：新增独立导航页“MOFA史料库”。官网1921—1927目录同步后缓存至 SQLite `mofa_catalog_items`，离线仍可按年份、卷册、事项类型和处理状态浏览。页面实时检测每项的 PDF、`mineru/raw`、`mineru/imported` 与 `search/search_text.paged.json`，显示“未下载 → 待OCR → 待导入 → 待生成检索文本 → 可检索”的处理阶段；现有 MOFA 扫描工作流会复用并更新同一目录缓存。
+* **Phase 5B-2**：MOFA 下载入口统一迁入“MOFA史料库”，支持表格多选、下载当前筛选范围内缺失 PDF、顺序下载、队列暂停/继续、停止当前任务和基于 SQLite/物理文件状态的再次续跑。已完成文件自动跳过，停止时只清理当前 `.part`，不会删除成功 PDF。原“史料下载”页面恢复为 JACAR 专用，避免两套 MOFA 下载入口产生状态分叉；MOFA 后端工作流继续保留用于兼容和测试。
 
 #### Historical_Documents 迁移规则
 

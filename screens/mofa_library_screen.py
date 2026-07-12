@@ -7,6 +7,11 @@ from tkinter import messagebox, ttk
 import customtkinter as ctk
 
 from config.settings import Color
+from services.mofa_batch_download_service import (
+    MofaBatchDownloadService,
+    MofaBatchProgress,
+    MofaBatchResult,
+)
 from services.mofa_library_service import MofaLibraryEntry, MofaLibraryService
 
 
@@ -28,6 +33,8 @@ class MofaLibraryScreen(ctk.CTkFrame):
         self.service = MofaLibraryService()
         self.entries: list[MofaLibraryEntry] = []
         self._syncing = False
+        self.batch = MofaBatchDownloadService(db_service=self.service.db)
+        self._downloading = False
         self._build_ui()
         self.after(50, self.refresh_local)
 
@@ -120,6 +127,50 @@ class MofaLibraryScreen(ctk.CTkFrame):
         self.search_entry.pack(side="left", fill="x", expand=True, padx=(8, 12), pady=10)
         self.search_entry.bind("<Return>", lambda _event: self.refresh_local())
 
+        download_bar = ctk.CTkFrame(self, fg_color=Color.BG_CARD, corner_radius=10)
+        download_bar.pack(fill="x", padx=22, pady=(0, 10))
+        self.download_selected_btn = ctk.CTkButton(
+            download_bar,
+            text="下载选中缺失项",
+            width=132,
+            command=self.download_selected,
+        )
+        self.download_selected_btn.pack(side="left", padx=(12, 6), pady=10)
+        self.download_filtered_btn = ctk.CTkButton(
+            download_bar,
+            text="下载当前筛选缺失项",
+            width=156,
+            command=self.download_filtered,
+        )
+        self.download_filtered_btn.pack(side="left", padx=6, pady=10)
+        self.pause_btn = ctk.CTkButton(
+            download_bar,
+            text="暂停队列",
+            width=94,
+            state="disabled",
+            command=self.toggle_pause,
+        )
+        self.pause_btn.pack(side="left", padx=(18, 6), pady=10)
+        self.stop_btn = ctk.CTkButton(
+            download_bar,
+            text="停止",
+            width=76,
+            state="disabled",
+            fg_color=Color.RED,
+            command=self.stop_download,
+        )
+        self.stop_btn.pack(side="left", padx=6, pady=10)
+        self.download_progress = ctk.CTkProgressBar(download_bar, width=180)
+        self.download_progress.set(0)
+        self.download_progress.pack(side="right", padx=(8, 12), pady=10)
+        self.download_status_label = ctk.CTkLabel(
+            download_bar,
+            text="可按 Command/Ctrl 或 Shift 多选；暂停在当前文件完成后生效。",
+            font=("PingFang SC", 11),
+            text_color=Color.TEXT_GRAY,
+        )
+        self.download_status_label.pack(side="right", fill="x", expand=True, padx=8, pady=10)
+
         table_frame = ctk.CTkFrame(self, fg_color=Color.BG_CARD, corner_radius=10)
         table_frame.pack(fill="both", expand=True, padx=22, pady=(0, 10))
         style = ttk.Style()
@@ -131,7 +182,7 @@ class MofaLibraryScreen(ctk.CTkFrame):
             columns=columns,
             show="headings",
             style="Mofa.Treeview",
-            selectmode="browse",
+            selectmode="extended",
         )
         headings = {
             "year": "年份",
@@ -241,7 +292,7 @@ class MofaLibraryScreen(ctk.CTkFrame):
             )
 
     def sync_official_catalog(self) -> None:
-        if self._syncing:
+        if self._syncing or self._downloading:
             return
         self._syncing = True
         self.sync_btn.configure(state="disabled", text="同步中…")
@@ -277,4 +328,155 @@ class MofaLibraryScreen(ctk.CTkFrame):
         local = entry.pdf_path if entry.pdf_exists else f"未下载（规划目录：{entry.bundle_dir}）"
         self.detail_label.configure(
             text=f"{entry.native_id}\n本地：{local}\n官网：{entry.pdf_url}"
+        )
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        amount = float(max(0, value))
+        for unit in ("B", "KB", "MB", "GB"):
+            if amount < 1024 or unit == "GB":
+                return f"{amount:.1f}{unit}"
+            amount /= 1024
+        return f"{amount:.1f}GB"
+
+    def _missing_entries(self, values: list[MofaLibraryEntry]) -> list[MofaLibraryEntry]:
+        seen: set[str] = set()
+        result: list[MofaLibraryEntry] = []
+        for entry in values:
+            if entry.pdf_exists or entry.native_id in seen:
+                continue
+            seen.add(entry.native_id)
+            result.append(entry)
+        return result
+
+    def download_selected(self) -> None:
+        selected_ids = set(self.tree.selection())
+        if not selected_ids:
+            messagebox.showwarning("请选择史料", "请先在表格中选择一个或多个目录事项。")
+            return
+        targets = self._missing_entries(
+            [entry for entry in self.entries if entry.native_id in selected_ids]
+        )
+        self._confirm_and_start(targets, scope_label="选中范围")
+
+    def download_filtered(self) -> None:
+        self._confirm_and_start(
+            self._missing_entries(self.entries),
+            scope_label="当前筛选范围",
+        )
+
+    def _confirm_and_start(self, targets: list[MofaLibraryEntry], *, scope_label: str) -> None:
+        if self._downloading:
+            messagebox.showinfo("下载进行中", "当前已有 MOFA 下载队列正在运行。")
+            return
+        if not targets:
+            messagebox.showinfo("无需下载", f"{scope_label}内没有缺失的 PDF。")
+            return
+        if not messagebox.askyesno(
+            "确认 MOFA 批量下载",
+            f"将下载{scope_label}内 {len(targets)} 份缺失 PDF。\n\n"
+            "文件将写入 Historical_Documents/mofa；已存在文件会自动跳过。\n"
+            "大范围下载可能需要较长时间，是否继续？",
+        ):
+            return
+        items = self.service.catalog_items(entry.native_id for entry in targets)
+        if len(items) != len(targets):
+            messagebox.showerror("目录数据不完整", "部分选中条目无法从本地目录缓存恢复，请先同步官网目录。")
+            return
+        self._downloading = True
+        self._set_download_controls(True)
+        self.download_progress.set(0)
+        self.download_status_label.configure(text=f"正在建立队列：{len(items)} 份…")
+        threading.Thread(
+            target=self._download_worker,
+            args=(items,),
+            daemon=True,
+        ).start()
+
+    def _set_download_controls(self, running: bool) -> None:
+        normal = "disabled" if running else "normal"
+        self.download_selected_btn.configure(state=normal)
+        self.download_filtered_btn.configure(state=normal)
+        self.sync_btn.configure(state=normal)
+        self.local_refresh_btn.configure(state=normal)
+        self.pause_btn.configure(state="normal" if running else "disabled")
+        self.stop_btn.configure(state="normal" if running else "disabled")
+        if not running:
+            self.pause_btn.configure(text="暂停队列")
+
+    def _download_worker(self, items) -> None:
+        try:
+            result = self.batch.run(items, on_progress=self._on_batch_progress)
+        except Exception as exc:
+            self.after(0, lambda message=str(exc): self._finish_batch(error=message))
+            return
+        self.after(0, lambda value=result: self._finish_batch(result=value))
+
+    def _on_batch_progress(self, progress: MofaBatchProgress) -> None:
+        self.after(0, lambda value=progress: self._apply_batch_progress(value))
+
+    def _apply_batch_progress(self, progress: MofaBatchProgress) -> None:
+        base = max(0, progress.current_index - 1)
+        fraction = 0.0
+        if progress.current_total_bytes:
+            fraction = min(1.0, progress.current_bytes / progress.current_total_bytes)
+        overall = (base + fraction) / max(1, progress.total)
+        if progress.state in {"running", "completed", "cancelled"}:
+            overall = progress.current_index / max(1, progress.total)
+        self.download_progress.set(min(1.0, overall))
+        if progress.state == "paused":
+            text = f"队列已暂停 · 已完成 {progress.downloaded + progress.skipped}/{progress.total}"
+        elif progress.state == "downloading":
+            byte_text = self._format_bytes(progress.current_bytes)
+            if progress.current_total_bytes:
+                byte_text += f"/{self._format_bytes(progress.current_total_bytes)}"
+            text = f"{progress.current_index}/{progress.total} · {byte_text} · {progress.current_title}"
+        else:
+            text = (
+                f"完成 {progress.downloaded + progress.skipped + progress.failed}/{progress.total} · "
+                f"新下载 {progress.downloaded} · 跳过 {progress.skipped} · 失败 {progress.failed}"
+            )
+        self.download_status_label.configure(text=text)
+
+    def toggle_pause(self) -> None:
+        if not self._downloading:
+            return
+        if self.batch.paused:
+            self.batch.resume()
+            self.pause_btn.configure(text="暂停队列")
+            self.download_status_label.configure(text="队列已继续。")
+        else:
+            self.batch.pause()
+            self.pause_btn.configure(text="继续队列")
+            self.download_status_label.configure(text="将在当前 PDF 完成后暂停队列。")
+
+    def stop_download(self) -> None:
+        if not self._downloading:
+            return
+        if messagebox.askyesno("停止 MOFA 下载", "停止后会删除当前未完成的 .part 文件，已完成 PDF 保留。是否继续？"):
+            self.batch.cancel()
+            self.stop_btn.configure(state="disabled")
+            self.download_status_label.configure(text="正在停止当前下载并保存已完成进度…")
+
+    def _finish_batch(self, *, result: MofaBatchResult | None = None, error: str = "") -> None:
+        self._downloading = False
+        self._set_download_controls(False)
+        self.refresh_local()
+        if error:
+            self.download_status_label.configure(text="MOFA 下载队列异常结束；已完成文件仍然保留。")
+            messagebox.showerror("MOFA 下载失败", error)
+            return
+        if result is None:
+            return
+        status = "已停止" if result.cancelled else "已完成"
+        self.download_status_label.configure(
+            text=(
+                f"队列{status} · 新下载 {result.downloaded} · "
+                f"已存在 {result.skipped} · 失败 {result.failed}"
+            )
+        )
+        messagebox.showinfo(
+            f"MOFA 下载队列{status}",
+            f"新下载：{result.downloaded}\n已存在/修复：{result.skipped}\n"
+            f"失败：{result.failed}\n未完成项可再次按当前筛选范围继续下载。",
         )

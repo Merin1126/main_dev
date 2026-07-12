@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from typing import Iterable
 
-from scrapers.mofa_catalog_scraper import MofaCatalogItem, MofaCatalogScraper
+from scrapers.mofa_catalog_scraper import MofaCatalogItem, MofaCatalogScraper, MofaVolume
 from services.db_service import DbService
 from services.document_source_service import build_mofa_native_id
 from services.document_storage_service import DocumentStorageService
@@ -255,3 +255,34 @@ class MofaLibraryService:
                 (int(year),),
             )
         return [str(row["volume_code"]) for row in rows]
+
+    def catalog_items(self, native_ids: Iterable[str]) -> list[MofaCatalogItem]:
+        """Rebuild downloader input objects from the cached offline catalog."""
+        ordered_ids = [str(value) for value in native_ids if str(value).strip()]
+        if not ordered_ids:
+            return []
+        placeholders = ",".join("?" for _ in ordered_ids)
+        rows = self.db.fetchall(
+            f"""
+            SELECT * FROM mofa_catalog_items
+            WHERE native_id IN ({placeholders})
+            """,
+            ordered_ids,
+        )
+        by_id = {}
+        for row in rows:
+            volume = MofaVolume(
+                era_code=str(row["era_code"]),
+                era_year=int(row["era_year"]),
+                gregorian_year=int(row["gregorian_year"]),
+                volume_code=str(row["volume_code"]),
+                volume_label=str(row["volume_label"]),
+                catalog_url=str(row["catalog_url"]),
+            )
+            by_id[str(row["native_id"])] = MofaCatalogItem(
+                volume=volume,
+                title=str(row["title"]),
+                pdf_url=str(row["pdf_url"]),
+                item_kind=str(row["item_kind"]),
+            )
+        return [by_id[native_id] for native_id in ordered_ids if native_id in by_id]
