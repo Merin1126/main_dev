@@ -26,6 +26,7 @@ from config.settings import (
     LEGACY_TRANSLATION_CACHE_DIR,
 )
 from services.cache_service import CacheService
+from services.document_source_service import DocumentIdentity, identity_from_metadata
 from utils.jacar_filename import extract_jacar_ref_from_path
 from utils.jacar_sidecar import sidecar_path_for_pdf
 
@@ -48,14 +49,6 @@ ArtifactKind = Literal[
     "scratch_dir",
     "iiif_resume_dir",
 ]
-
-
-@dataclass(frozen=True)
-class DocumentIdentity:
-    source: str
-    native_id: str
-    search_keyword: str
-    document_id: str
 
 
 @dataclass(frozen=True)
@@ -126,18 +119,24 @@ class DocumentStorageService:
     def resolve_bundle_from_pdf(self, pdf_path: str) -> DocumentBundle:
         """Return a best-effort bundle object for UI actions and future writes."""
         abs_pdf = os.path.abspath(pdf_path)
-        ref = (extract_jacar_ref_from_path(abs_pdf) or "").upper()
         search_keyword = self._search_keyword_from_path(abs_pdf)
-        identity = DocumentIdentity(
-            source="jacar",
-            native_id=ref,
-            search_keyword=search_keyword,
-            document_id=f"jacar:{ref}" if ref else "",
-        )
-        if self.is_bundle_layout() and ref:
-            root_dir = os.path.join(self.bundle_root, search_keyword or "未分类", ref)
+        identity = self._identity_from_bundle_files(abs_pdf, search_keyword=search_keyword)
+        if identity is None:
+            ref = (extract_jacar_ref_from_path(abs_pdf) or "").upper()
+            identity = DocumentIdentity.build(
+                source="jacar",
+                native_id=ref,
+                search_keyword=search_keyword,
+            )
+
+        parent_dir = os.path.dirname(abs_pdf)
+        parent_name = os.path.basename(parent_dir).upper()
+        if self.is_bundle_layout() and identity.native_id and parent_name == identity.native_id.upper():
+            root_dir = parent_dir
+        elif self.is_bundle_layout() and identity.native_id:
+            root_dir = self.planned_bundle_dir(identity)
         else:
-            root_dir = os.path.dirname(abs_pdf)
+            root_dir = parent_dir
         return DocumentBundle(
             root_dir=os.path.abspath(root_dir),
             identity=identity,
@@ -151,14 +150,15 @@ class DocumentStorageService:
         source: str,
         native_id: str,
         search_keyword: str,
+        collection: str = "",
+        citation_text: str = "",
     ) -> DocumentIdentity:
-        ref = (native_id or "").strip().upper()
-        source_clean = (source or "jacar").strip() or "jacar"
-        return DocumentIdentity(
-            source=source_clean,
-            native_id=ref,
-            search_keyword=(search_keyword or "未分类").strip() or "未分类",
-            document_id=f"{source_clean}:{ref}" if ref else "",
+        return DocumentIdentity.build(
+            source=source,
+            native_id=native_id,
+            search_keyword=search_keyword,
+            collection=collection,
+            citation_text=citation_text,
         )
 
     def planned_bundle_dir(self, identity: DocumentIdentity) -> str:
@@ -263,7 +263,7 @@ class DocumentStorageService:
             return ""
         manifest_path = self.artifact_path(bundle, "manifest", create_parent_dirs=True)
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "layout": "bundle_v1",
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "identity": {
@@ -271,6 +271,8 @@ class DocumentStorageService:
                 "native_id": bundle.identity.native_id,
                 "search_keyword": bundle.identity.search_keyword,
                 "document_id": bundle.identity.document_id,
+                "collection": bundle.identity.collection,
+                "citation_text": bundle.identity.citation_text,
             },
             "pdf": {
                 "path": os.path.relpath(bundle.pdf_path, bundle.root_dir),
@@ -378,6 +380,37 @@ class DocumentStorageService:
         if len(parts) > 1 and parts[0] not in {"", ".", ".."}:
             return parts[0]
         return "未分类"
+
+    def _identity_from_bundle_files(
+        self,
+        pdf_path: str,
+        *,
+        search_keyword: str,
+    ) -> DocumentIdentity | None:
+        root_dir = os.path.dirname(os.path.abspath(pdf_path))
+        candidates = (
+            os.path.join(root_dir, BUNDLE_REL_MANIFEST),
+            os.path.join(root_dir, BUNDLE_REL_SIDECAR),
+            sidecar_path_for_pdf(pdf_path),
+        )
+        seen: set[str] = set()
+        for candidate in candidates:
+            candidate = os.path.abspath(candidate)
+            if candidate in seen or not os.path.isfile(candidate):
+                continue
+            seen.add(candidate)
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except (OSError, ValueError, TypeError):
+                continue
+            identity = identity_from_metadata(
+                payload,
+                default_search_keyword=search_keyword,
+            )
+            if identity is not None:
+                return identity
+        return None
 
     @staticmethod
     def _find_bundle_pdf_path(root_dir: str) -> str | None:

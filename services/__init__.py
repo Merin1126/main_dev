@@ -20,6 +20,7 @@ __all__ = [
     "DbService",
     "ReportService",
     "DocumentStorageService",
+    "DocumentSourceService",
 ]
 
 _SERVICE_MODULES = {
@@ -30,6 +31,7 @@ _SERVICE_MODULES = {
     "DbService": "services.db_service",
     "ReportService": "services.report_service",
     "DocumentStorageService": "services.document_storage_service",
+    "DocumentSourceService": "services.document_source_service",
 }
 
 
@@ -51,3 +53,4 @@ if TYPE_CHECKING:  # 仅静态分析时暴露具体类型，避免运行时强�
     from .db_service import DbService
     from .report_service import ReportService
     from .document_storage_service import DocumentStorageService
+    from .document_source_service import DocumentSourceService
