@@ -12,6 +12,7 @@ from scrapers.mofa_catalog_scraper import MofaCatalogItem
 from services.db_service import DbService
 from services.document_source_service import build_mofa_native_id, build_sidecar_v2
 from services.document_storage_service import DocumentBundle, DocumentStorageService
+from services.mofa_filename_service import build_mofa_pdf_filename
 
 
 ProgressCallback = Callable[[int, int | None], None]
@@ -147,7 +148,18 @@ class MofaDownloadService:
             str(item.volume.gregorian_year),
             str(item.volume.volume_code),
         )
-        return native_id, self.storage.ensure_bundle_dir(identity, hierarchy=hierarchy)
+        bundle = self.storage.ensure_bundle_dir(identity, hierarchy=hierarchy)
+        if not os.path.isfile(bundle.pdf_path):
+            bundle = DocumentBundle(
+                root_dir=bundle.root_dir,
+                identity=bundle.identity,
+                layout=bundle.layout,
+                pdf_path=os.path.join(
+                    bundle.root_dir,
+                    build_mofa_pdf_filename(item.title, native_id),
+                ),
+            )
+        return native_id, bundle
 
     @staticmethod
     def _source_metadata(item: MofaCatalogItem) -> dict:

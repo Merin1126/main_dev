@@ -443,6 +443,10 @@ class DocumentStorageService:
         pdfs.sort(key=lambda p: (os.path.basename(p) == "document.pdf", os.path.basename(p)))
         return os.path.abspath(pdfs[0])
 
+    def find_bundle_pdf_path(self, root_dir: str) -> str | None:
+        """Public read-only resolver for the canonical PDF in a bundle root."""
+        return self._find_bundle_pdf_path(root_dir)
+
     def _bundle_docx_export_path(self, root_dir: str, *, translation: bool) -> str:
         pdf_path = self._find_bundle_pdf_path(root_dir)
         if pdf_path:

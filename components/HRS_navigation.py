@@ -6,7 +6,7 @@ class Navigation(ctk.CTkFrame):
         # 继承原作者的深色导航栏风格
         super().__init__(master, width=84, corner_radius=0, fg_color=Color.BG_NAV_DARK, **kwargs)
         self.master = master
-        self.expanded_width = 150
+        self.expanded_width = 190
         self.collapsed_width = 84
         self.current_width = self.collapsed_width
         self.is_expanded = False
@@ -19,6 +19,8 @@ class Navigation(ctk.CTkFrame):
         self.nav_config = [
             {"icon": "\uf409", "label": "史料下载", "screen": "scraper"},
             {"icon": "\uf02d", "label": "MOFA史料库", "screen": "mofa_library"},
+            {"icon": "\uf002", "label": "MOFA全文检索", "screen": "mofa_search"},
+            {"icon": "\uf46d", "label": "MOFA候选清单", "screen": "mofa_candidates"},
             {"icon": "\uf05f", "label": "史料校对", "screen": "ocr"},
             {"icon": "\uf080", "label": "史料分析", "screen": "analysis"},
             {"icon": "\uf1ab", "label": "史料翻译", "screen": "translation"},

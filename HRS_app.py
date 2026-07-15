@@ -13,21 +13,21 @@ class HRSApp(ctk.CTk):
         self.height = 700
         self.title(f"四川大学日本研究中心 HRS 日本史料数据处理系统 {APP_VERSION}")
         self.minsize(800, 600)
-        self._center_window() # 调用原作者优雅的居中算法
+        self._center_window()
 
         # 全局外观设置
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
 
         # ==========================================
-        # 🎭 舞台布置区 (Layout)
+        # 🎭  (Layout)
         # ==========================================
         
-        # 左侧：导航栏 (Navigation Bar) - 正式接入！
+        # Navigation Bar
         self.navigation = Navigation(self)
         self.navigation.pack(side="left", fill="y")
 
-        # 右侧：屏幕大管家 (Screen Manager)
+        # Screen Manager
         self.screen_manager = ScreenManager(self)
         self.screen_manager.pack(side="right", fill="both", expand=True)
 

@@ -2,7 +2,7 @@
 
 ***
 
-# HRS 史料全自动采集与 AI 校对系统 (v3.2.0)
+# HRS 史料全自动采集与 AI 校对系统 (v3.8.0)
 
 ## MOFA 《日本外交文书》接入规范（开发中）
 
@@ -40,7 +40,93 @@ MOFA 数字合集是按年份、卷册和事项组织的编纂出版物目录，
 - Phase 3：PDF 下载、SQLite 审计、bundle 写入与物理自愈。
 - Phase 4：下载页来源切换、MOFA 安全默认扫描、目录结果展示、标题命中/全部正文显式下载、任务监控与中止。
 - Phase 5A：真实 PDF 获取验证、文本层诊断、OCR 页识别与全语料规模估算。
-- Phase 5B—7：本地全文索引、选择性 OCR、研究流水线和回归工作待后续版本完成。
+- Phase 5B-0—4.1：统一史料目录、MOFA史料库、下载管理、双页拆分、MinerU 导入与 200 页分段。
+- Phase 5B-5：MinerU OCR 标准化 Generation、旧 run 兼容、页码/文本块坐标保留与分页检索文本产出。
+- Phase 5B-6：SQLite FTS 页级/文本块双层索引、增量构建与 MOFA 全文检索页面。
+- Phase 5B-7：HRS 内嵌 PDF 阅读器、检索结果跳页、单页/原始双页切换及文本块高亮。
+- Phase 5B-8：真实语料全链路验收、问题分类、定向修复与索引性能探针。
+- Phase 6A：页级候选史料清单、检索来源合并、研究状态、备注、标签与可复现检索条件。
+- Phase 6B：版本化检索词库、新旧字体/OCR/历史术语分层扩展、可解释召回与用户维护界面。
+
+### MOFA 双页拆分与 MinerU 输入规范
+
+- MOFA bundle 目录仍以稳定的 `native_id` 定位，但面向用户的 PDF 使用可读名称：`标题 [MOFA_ID].pdf`。标题中的路径特殊字符会转换为全角字符，MOFA ID 用于防重与程序定位。
+- 旧版 `document.pdf` 可在“MOFA史料库”点击“规范化文件名”原地迁移；迁移只重命名本地文件并同步 SQLite/manifest，不重新下载、不改写 PDF 内容。
+- 横向扫描页视为日文书籍双页，以中缝 50% 为分界，按“右页 → 左页”生成单一印刷页输出；竖向页保持不变。
+- MinerU 规范化输入写入 `mineru/input/标题 [MOFA_ID] single-pages.pdf`。MinerU 结果目录因此同时具备人类可读标题和可机器解析的 MOFA ID；对应的 `split_manifest.json` 记录源文件/产物 SHA-256、拆分参数与源 PDF 页到输出 PDF 页的映射。
+- MinerU 单次最多解析 200 页。完整单页 PDF 超过 200 页时，HRS 保留完整文件，并额外在 `mineru/input/chunks/` 中生成 `... p0001-p0200.pdf`、`... p0201-p0400.pdf` 等投喂段。`chunk_manifest.json` 记录每段的全局起止页、顺序、SHA-256 及完整输入校验值；200 页以内则记为单段，不复制 PDF。
+- 当原始 PDF 或拆分参数变化时，旧产物视为过期并可重新生成；校验值和参数完全一致时自动跳过。
+
+### MinerU 结果导入与目录监控规范
+
+- “MOFA史料库”可选择 MinerU 桌面端结果的上级目录，手动扫描或启动轮询监控。监控只在结果目录连续两次文件数、总字节数和修改时间均不变后导入，避免读取尚未写完的产物。
+- 新规范文件名中的 `MOFA_ID` 和 `p0001-p0200` 用于直接归属史料及页段，并校验对应分段 PDF 的页数和页面指纹；旧的 `document...` 匿名结果使用 `*_origin.pdf` 与本地全部输入段的页数及首/中/末页渲染指纹匹配。只有唯一匹配才自动归档，无匹配或多匹配只报告待确认项。
+- 导入产物原子复制到 `mineru/raw/mineru-<版本>_<后端>-<effort>_p<页段>_<签名>/`，并写入 `import_manifest.json`。manifest 保存 MinerU 局部页码到史料全局页码的映射；SQLite `mofa_mineru_runs` 记录分段起止页与输入 SHA-256 用于去重和完整性检查。默认不移动、不删除 MinerU 原始目录。分段未齐时状态为“OCR分段未完成”，全部归档后才进入“待整理”。
+- 监控目录保存在 SQLite `mofa_mineru_settings`，但应用重启后不会自动开始监控，需要用户显式点击“开始监控”。
+
+### MinerU 标准化 Generation 规范
+
+- “MOFA史料库”的“标准化当前范围”只处理已完成全部 MinerU 分段归档的条目。标准化是显式后台任务，不会在目录监控或应用启动时自动执行，避免导入过程与派生数据构建互相影响。
+- 标准化主输入固定为 MinerU 扁平 `*_content_list.json`；`layout.json` 提供页面尺寸与页数校验，`full.md` 因缺少稳定的页码和文本块坐标，不作为检索数据源。表格正文从 `table_body` HTML 提取，页码、页脚、图像和空 block 保留审计记录但不进入检索文本。
+- 每份完整结果形成一个确定性的 Generation。SQLite `mofa_ocr_generations` 记录来源 run、规则版本、完整单页 PDF SHA-256、页数、block 数和派生产物路径；`mofa_ocr_active_generations` 原子指向当前版本。相同来源和规则重复执行会跳过，旧 Generation 与 `mineru/raw` 均保留。
+- 多段 OCR 必须与当前 `chunk_manifest.json` 的 `input_sha256 + chunk_start + chunk_end` 完全匹配并连续覆盖完整 single-pages PDF。同一页段存在多个有效 run 时默认选择最新完整版本，并在 manifest 中记录被替代的 run。旧版无 chunk 字段的结果仅在当前史料只有一个输入段且页数一致时按 `chunk_start=1` 兼容。
+- 标准化产物写入 `mineru/imported/<generation_id>/normalized_manifest.json` 与 `ocr_pages.v1.jsonl`；当前分页文本原子写入 `search/search_text.paged.json`。每个 block 同时保留 MinerU 原文、版本化旧新字体规范化文本、0—1 左上原点相对坐标、来源 run 和局部页码。原始 PDF、single-pages PDF 与 MinerU raw 永不改写。
+- 页码换算统一为 `single_pages_index_0 = chunk_start_1 - 1 + mineru_page_idx_0`。`split_manifest.json` 同时用于保存 single-pages PDF 页到原双页 PDF 页及右/左区域的映射；印刷页码仅作为 OCR 提示字段，不参与定位。
+
+### MOFA 本地全文索引与检索规范
+
+- “MOFA全文检索”是独立导航页。“更新全文索引”仅读取当前 active OCR Generation；Generation 未变化时跳过，变化时以史料为单位在单一 SQLite 事务中替换旧索引，避免同一史料同时命中新旧 OCR 版本。
+- 索引采用页级与 block 级双层结构。`mofa_search_pages` / `mofa_search_pages_fts` 负责完整页召回，可命中跨相邻 block 的连续词；`mofa_search_blocks` / `mofa_search_blocks_fts` 保存命中文本块与 `bbox_norm`，作为 PDF 高亮定位依据。
+- FTS5 使用 `trigram` tokenizer，适合无空格的日文及连续汉字。三字及以上走 FTS 排序；一至二字短词自动使用规范化文本的 `instr` 精确包含查询，规避 trigram 最短三字符限制。
+- 检索提供“精确短语 / 包含全部词 / 包含任一词”三种模式，并复用标准化阶段的 NFKC 与版本化旧字体折叠规则。当前的“包含任一词”属于词项关联召回，不宣称语义检索；OCR 混淆字扩展和向量语义召回将作为独立、可审计的后续层。
+- 检索结果定位到 `generation_id + document_id + page_index`，同时返回原 PDF 页、右/左页区域、印刷页码提示、命中 block 与 bbox。页面可查看命中块及页级 OCR，并打开或定位 single-pages PDF。
+
+### MOFA 内嵌 PDF 定位与高亮规范
+
+- 全文检索结果被选中时，内嵌阅读器自动打开对应史料并跳到命中页；PDF 通过 PyMuPDF 按阅读区宽度即时渲染，支持 50%—300% 缩放、前后翻页及“返回命中页”。默认适应宽度而非强制显示整页，避免竖版史料在较矮窗口内退化成缩略图。渲染缓存仅存在于界面内存，不生成或改写 PDF。
+- 阅读器采用 2 倍超采样后以 Lanczos 缩放到显示尺寸，优先利用原扫描图像细节。鼠标左键可直接拖动画布；滚轮以指针所在位置为锚点连续缩放，按钮缩放和横纵滚动条继续保留。结果表固定为较矮的上方区域，阅读器占据主要纵向空间，OCR 文本栏约占右侧 28%。
+- 默认“单页视图”显示 MinerU 实际处理的 `single-pages.pdf`，OCR block 的 0—1 bbox 可直接映射到页面。切换“原始双页”后，阅读器使用 `split_manifest.json` 的 `source_pdf_page`、`source_region` 与 `split_ratio` 将 bbox 反算到原始 PDF 的左/右半页；竖向保留页按整页坐标处理。
+- 高亮只使用当前 active Generation 中命中 block 的 bbox。黄色填充通过 PIL RGBA 直接与渲染图像混合（约 18% 不透明度），不再依赖 macOS Tk 对 `stipple` 的不稳定模拟，因此底层文字保持可读；橙色边框用于确认 block 边界。用户手动翻离命中页时不显示误导性高亮，“返回命中页”恢复定位。若关键词跨多个 OCR block 而不存在单一 block 命中，页级召回仍然保留，但不会伪造精确矩形。
+- 右侧 OCR 栏使用浅黄色区分完整命中 block，并以更深的黄色、深色文字和下划线标出具体查询词。字符位置基于与索引相同的 NFKC/旧字体规范化结果反向映射到 MinerU 原文，因此检索“反帝国主義”时仍能在原文“反帝國主義”上正确着色，而不会改写展示文本。文本 tag 不覆盖字体，以保持 CustomTkinter 的缩放兼容性。
+- 原始下载 PDF、single-pages PDF 和 OCR 数据均保持只读。该实现是 HRS 内部视觉叠加层，并非向 PDF 永久写入 OCR 文字层；未来如需导出可检索 PDF，应作为独立派生文件生成。
+
+### MOFA 真实语料验收与定向修复规范
+
+- “MOFA史料库”的“验收当前范围”按当前年份、卷册、事项类型、处理状态和标题筛选执行。验收读取 `PDF → single-pages → MinerU 分段/run → active Generation → search JSON → FTS 页/块`，不修改 PDF、OCR 或索引内容；报告及问题清单写入 SQLite `mofa_corpus_audit_runs`、`mofa_corpus_audit_issues` 供追溯。
+- 验收逐项检查 single-pages 可读性与页数、MinerU 分段归档覆盖、Generation manifest/JSONL 文件、连续 `page_index`、Generation/page/block 计数、0—1 bbox 合法性、分页检索 JSON 的 Generation/页数，以及 FTS state、实际页行和可检索 block 行是否一致。
+- 问题按 `download / split / import / standardize / viewer / index` 分类，并给出机器可执行的 `repair_action`。报告窗口仅对确实可从本地派生数据恢复的项目提供“生成分页、强制重新标准化、强制重建索引”；缺失 MinerU OCR 的项目标记为 `import`，不会伪造或自动调用外部 OCR。
+- 验收同时记录总耗时、SQLite 主文件/WAL/SHM 总大小、全库索引史料/页/block 数，并用固定查询“共産党”记录 FTS 命中页数和查询耗时。索引属于可重建派生数据；原始 PDF 与 MinerU raw 始终是恢复源。
+
+#### Phase 5B-8 真实验收结果（2026-07-15）
+
+- 验收范围：MOFA 1921—1927 正文 240 份。
+- 全链路健康：134 份；其 active Generation、8,630 页、81,884 个可检索 block 与 FTS 完全一致，未发现过期 Generation、索引缺行、页数错位或非法 bbox。
+- 待处理：106 份，问题全部位于 `import` 阶段，即已有 PDF/single-pages，但 MinerU 结果尚未完整归档；不属于系统损坏，不应自动修复。
+- 验收耗时约 1.59 秒；SQLite（含 WAL/SHM）约 279.0 MB；FTS 探针“共産党”命中 191 页，查询约 10.884 ms。
+
+### MOFA 候选史料清单规范
+
+- 全文检索页支持“加入候选”“全部加入候选”和“保存当前检索”。候选对象以 `document_id + page_index` 唯一标识，同一史料同一页被多个关键词召回时只保留一条候选记录；新的检索条件和命中 block 合并写入，不复制页面。
+- 候选记录保存当前 `generation_id`、single-pages 页码、原 PDF 页码/左右区域、印刷页码、页级 OCR 和创建/更新时间。候选页再次从新 Generation 加入时更新页面内容并清理旧 Generation block；既有研究状态、备注和标签不被重置。
+- `mofa_saved_searches` 保存检索词、规范化词、精确/全部/任一模式、年份、卷册、结果页数和最近使用时间；相同条件使用确定性 signature 合并。`mofa_candidate_search_sources` 建立候选页与多组检索条件的多对多来源关系，保证召回过程可复现。
+- `mofa_candidate_blocks` 保存每次命中的 block、bbox 与原文；`mofa_candidate_tags` 保存用户标签。候选状态固定为 `candidate / relevant / excluded`，对应“候选 / 相关 / 排除”，排除是可逆状态而非删除。
+- 独立“MOFA候选清单”页面支持状态、年份、标签和任意文字筛选，批量调整研究状态，编辑备注与标签，查看召回关键词和页级 OCR，并打开或定位对应 single-pages PDF。“已保存检索”窗口用于回看检索条件；Phase 7 再把相关页/连续页送入高精度 OCR、分析与翻译工作台。
+
+### MOFA 分层检索词库与可解释扩展规范
+
+- Phase 6B 不把所有关系混成单一“语义词典”。规则分为 `glyph / ocr / alias / related` 四类，分别对应新旧字体、OCR 混淆、历史术语/别称和关联概念。前两类允许在查询词内部替换；历史术语和关联概念只在整个词项相等时扩展，避免把“共産党”在较长词组中机械替换成不成立的新词。
+- 检索页提供“仅精确 / 新旧字体 / OCR容错 / 历史关联”四级范围。后一级包含前一级，但结果会分别标记“精确命中、新旧字体、OCR混淆、历史术语、关联概念”，并显示实际命中词和权重；扩展检索先按最高命中权重排列，再沿用 FTS 排序。每个基础词最多生成 16 个变体，防止双向规则或多条关系造成组合爆炸。
+- 现有 Generation v1 的保守旧字体折叠规则同步显示为只读内置规则；它们已经参与 OCR 标准化，不能在不重建 Generation 的情况下停用。研究者新增的字形、OCR 和历史概念规则均为自定义规则，可编辑、启停和删除，不需要重新生成 OCR 或重建 FTS 索引。
+- “检索词库”窗口支持类别/状态/文字筛选、单向或双向关系、0—1 权重、研究说明和出处依据，以及 JSON/CSV 导入导出。右侧 OCR 文本中选中词语后可通过右键直接带入“新旧字体 / OCR混淆 / 历史术语 / 关联概念”新建表单。批量导入不会自动接受无法解析或重复的规则；用户可查看新增与跳过数量。系统不静默学习 OCR 错误，所有研究规则都必须由用户确认。
+- 每次新增、编辑、启停或删除都会生成一份不可变的完整词库 revision，SQLite 保存当前规则、revision 元数据和每个历史版本的全量规则快照。“版本历史”可把自定义规则恢复到任一旧 revision，当前内置规则保持不变，后续快照也不会被删除；内置规则与自定义规则在界面中明确区分。
+- 保存检索或把页面加入候选清单时，同时记录扩展级别、词库 revision 和当次实际查询展开快照。候选来源因此可以重现“原始查询 → 展开词 → 关系类型 → 词库版本”，不会把关联召回误记成直接关键词命中。
+- 语义向量不属于本阶段的人工词库字段。未来若增加向量检索，向量应由模型对页或 block 自动生成并单独版本化；人工维护的历史术语关系继续作为可解释知识层，向量结果必须另行标记。
+
+#### Phase 6B 真实语料验收结果（2026-07-15）
+
+- 在既有 134 份、8,630 页、81,884 个 block 的真实索引上完成 additive migration；初始词库为 r1，包含 34 条与 Generation v1 一致的只读旧字体规则，未擅自加入任何需要研究判断的自定义历史概念。
+- 固定精确查询结果为：“共産党”191 页、“中国共産党”5 页、“反帝国主義”35 页、“赤化”180 页。在尚无自定义规则时，四级扩展的结果与精确层一致，确认升级不会无故扩大或缩小既有召回范围。
+- 隔离测试库已验证：自定义字形替换、OCR 混淆、历史术语和关联概念能分层生效；多词 `ALL` 查询保留“组内 OR、组间 AND”语义；短词继续回退 `instr`；同一页按最高命中权重优先排列；规则启停、删除、批量导入、版本恢复和候选来源快照均可重现。
 
 ### Phase 5A 实测结论（2026-07-13）
 
@@ -248,6 +334,30 @@ HRS_Project/
 ---
 
 ## 📈 版本更迭记录 (Changelog)
+### v3.8.0 · Versioned MOFA search lexicon
+* **Phase 6B-1—4**：新增版本化 MOFA 检索词库，区分新旧字体、OCR 混淆、历史术语和关联概念；每次规则变更保存完整 revision 快照，支持用户筛选、编辑、启停、删除及 JSON/CSV 导入导出。全文检索增加四级扩展范围和可解释召回标签，结果高亮实际命中扩展词；保存检索与候选来源同时固化扩展级别、词库版本和展开快照。向量语义检索明确留到独立试验阶段。
+
+### v3.7.0 · MOFA research candidate basket
+* **Phase 6A**：新增页级候选史料清单。全文检索结果可单页或批量加入，同一史料页自动防重，多关键词、检索模式、筛选条件和命中 block 合并留痕。新增独立“MOFA候选清单”页面，支持候选/相关/排除状态、年份/标签/文字筛选、批量状态调整、备注与标签编辑、OCR 查看及 PDF 快捷打开；检索条件可单独保存并回看。
+
+### v3.6.0 · MOFA real-corpus acceptance and recovery
+* **Phase 5B-8**：新增当前筛选范围全链路验收。检查 PDF、拆页、MinerU 分段、active Generation、标准化 JSONL/search JSON、bbox 和 FTS 页/块一致性，报告持久化到 SQLite；问题按阶段和修复动作分类，可仅强制重建失败分页、标准化结果或全文索引。报告记录耗时、数据库体积、全库索引规模与固定 FTS 性能探针。真实 240 份正文验收确认 134 份/8,630 页/81,884 块全链路健康，其余 106 份仅待 MinerU 结果导入。
+
+### v3.5.2 · MOFA highlight readability and navigation width
+* **Phase 5B-7 高亮优化**：PDF 命中块改为真正的 RGBA 低透明度叠加，解决 macOS 下黄色矩形遮挡文字的问题；右侧 OCR 栏新增命中 block 底色和查询词级高亮，并支持新旧字体规范化后的原文位置回映。文本标签只使用颜色和下划线，兼容 CustomTkinter 缩放。导航栏展开宽度由 150 调整为 190，完整容纳“MOFA史料库”和“MOFA全文检索”。
+
+### v3.5.1 · MOFA PDF viewer clarity and interaction
+* **Phase 5B-7 UI 优化**：PDF 预览由“适应整页”改为“适应宽度”，增加最高 2× 超采样与 Lanczos 高质量缩放；结果列表压低，阅读器获得主要纵向空间。新增鼠标拖动平移和以指针为锚点的滚轮缩放；高倍率下动态限制超采样像素量，避免大页渲染造成内存峰值。
+
+### v3.5.0 · MOFA internal PDF viewer and highlights
+* **Phase 5B-7**：在“MOFA全文检索”页面加入内嵌 PDF 阅读器。选择结果后自动跳到命中页，支持缩放、翻页、返回命中页、single-pages 与原始双页切换；依据 block bbox 叠加高亮，并利用拆页清单将右/左半页坐标准确反算到原始 PDF。全部操作只读，不修改史料 PDF 或 OCR 产物。
+
+### v3.4.0 · MOFA local full-text search
+* **Phase 5B-6**：新增 SQLite FTS5 trigram 全文索引，按 active OCR Generation 增量构建页级与文本块双层数据；支持旧字体规范化、短词回退、精确短语/全部词/任一词检索、年份卷册过滤和 bbox 命中返回。新增独立“MOFA全文检索”页面，可更新索引、浏览命中页、查看命中块及完整页 OCR，并打开或定位对应 single-pages PDF。
+
+### v3.3.0 · MOFA OCR normalization generation
+* **Phase 5B-5**：新增 MinerU 标准化 Generation。支持多段 OCR 完整性检查、旧版单段 run 兼容、重复 OCR active 版本选择、表格文字提取、旧新字体规范化、页级文本及 block bbox 保留；标准化文件写入 `mineru/imported` 与 `search/search_text.paged.json`，SQLite 保存 Generation 审计和当前激活版本。MOFA史料库增加“标准化当前范围”后台入口，标准化过程不修改任何 PDF 或 MinerU raw。
+
 ### v3.2.0 · MOFA integration（开发分支）
 * **Phase 1**：新增通用 `DocumentIdentity`、MOFA 稳定编号、标准引用生成器、sidecar/manifest v2；存储层可从 manifest/sidecar 恢复 `source=mofa`，并保持旧 JACAR 数据兼容。
 * **Phase 2**：新增 MOFA 1921—1927 卷册目录采集器；官网验证可发现 20 个目标卷册，并解析事项 PDF、扉页/目录、索引与奥付。
@@ -255,9 +365,13 @@ HRS_Project/
 * **Phase 4**：下载控制台增加 `JACAR / MOFA` 来源切换。MOFA 默认为“仅扫描目录”，必须显式选择才会下载“目录标题命中项”或“范围内全部正文 PDF”；扫描后独立展示卷册、PDF、正文和标题命中数量，下载任务复用 SQLite 监控弹窗。
 * **Phase 5A**：修复 MOFA CDN PDF 冷直连 403（同 Session 卷册页预热 + Referer + 一次强制重试）；新增逐页文本层/图像诊断、OCR 待处理页列表、实时目录规模估算 CLI。真实样本验证表明抽查的1921/1925/1927年正文均为纯影像 PDF。
 * **Phase 5B-0**：新增统一根目录 `Historical_Documents`。JACAR 新写入路径为 `jacar/<Ref>/`，MOFA 为 `mofa/<年份>/<卷代码>/<native_id>/`，物理目录不再由检索关键词决定。SQLite 继续以 `source:native_id` 防重，并新增 `document_keywords` 多对多表保存一份史料的全部关键词命中关系。
-* **Phase 5B-1**：新增独立导航页“MOFA史料库”。官网1921—1927目录同步后缓存至 SQLite `mofa_catalog_items`，离线仍可按年份、卷册、事项类型和处理状态浏览。页面实时检测每项的 PDF、`mineru/raw`、`mineru/imported` 与 `search/search_text.paged.json`，显示“未下载 → 待OCR → 待导入 → 待生成检索文本 → 可检索”的处理阶段；现有 MOFA 扫描工作流会复用并更新同一目录缓存。
+* **Phase 5B-1**：新增独立导航页“MOFA史料库”。官网1921—1927目录同步后缓存至 SQLite `mofa_catalog_items`，离线仍可按年份、卷册、事项类型和处理状态浏览。页面实时检测每项的 PDF、`mineru/raw`、`mineru/imported` 与 `search/search_text.paged.json`，并显示 OCR 分段归档进度。
 * **Phase 5B-2**：MOFA 下载入口统一迁入“MOFA史料库”，支持表格多选、下载当前筛选范围内缺失 PDF、顺序下载、队列暂停/继续、停止当前任务和基于 SQLite/物理文件状态的再次续跑。已完成文件自动跳过，停止时只清理当前 `.part`，不会删除成功 PDF。原“史料下载”页面恢复为 JACAR 专用，避免两套 MOFA 下载入口产生状态分叉；MOFA 后端工作流继续保留用于兼容和测试。
-* **Phase 5B-2.1**：MOFA史料库增加本地史料快捷操作。双击条目用系统默认 PDF 阅读器打开；详情区常驻“打开史料 / 在文件夹中显示”按钮；右键菜单提供打开史料、Finder/资源管理器定位、打开 bundle 文件夹、访问 MOFA 官网以及复制本地路径、MOFA ID、官网链接。右键会先选中目标行，缺失或被移动的文件会禁用本地操作并提示刷新状态。
+* **Phase 5B-2.1**：MOFA史料库增加本地史料快捷操作。双击条目用系统默认 PDF 阅读器打开；详情区常驻“打开史料 / 在文件夹中显示”按钮；右键菜单提供打开史料、Finder/资源管理器定位原始 PDF、打开 MinerU 投喂文件夹（超过 200 页时直接打开 `mineru/input/chunks/`）、访问 MOFA 官网以及复制本地路径、MOFA ID、官网链接。右键会先选中目标行，缺失或被移动的文件会禁用本地操作并提示刷新状态。
+* **Phase 5B-3**：MOFA史料库增加 MinerU 单页 PDF 生成工具。支持多选批量拆分，横向双页扫描按日文阅读顺序“右 → 左”输出，竖向页原样保留；原始史料 PDF 不变，产物与可追溯页映射清单写入 `mineru/input/`。页面增加“单页PDF”状态列，右键可生成、打开和定位产物。
+* **Phase 5B-3.1**：MOFA 本地文件改用 `标题 [MOFA_ID].pdf`，MinerU 单页输入改用 `标题 [MOFA_ID] single-pages.pdf`。新增无下载迁移入口，原地重命名既有 PDF，并同步 SQLite、bundle manifest 与 `split_manifest.json`；内部目录继续以稳定 native ID 组织，兼顾人工阅读与防重定位。
+* **Phase 5B-4**：新增 MinerU 结果导入器与可启停的目录监控器。规范文件名以 MOFA ID 归属，旧匿名结果以页数+页面指纹找回；结果经完整性校验后原子复制到 bundle `mineru/raw/`，写入可追溯 manifest 和 SQLite 运行记录，原始 MinerU 目录保留不变。
+* **Phase 5B-4.1**：适配 MinerU 单件 200 页解析上限。完整单页 PDF 超限时自动生成带 `p0001-p0200` 全局页段的投喂 PDF 和 `chunk_manifest.json`；导入器按 MOFA ID+页段+页面指纹校验，SQLite 记录全局页码映射，史料库显示 `已归档段/总段数`，防止局部 OCR 被误判为完整。
 
 #### Historical_Documents 迁移规则
 

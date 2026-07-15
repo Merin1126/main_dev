@@ -12,6 +12,7 @@ from services.document_audit_service import DocumentAuditService
 from services.document_rename_service import DocumentRenameService, resolve_existing_pdf_path
 from services.db_service import DbService
 from services.html_preview_service import HtmlPreviewService
+from services.mofa_filename_service import extract_mofa_native_id
 from utils.catalog_export import export_catalog_docx, export_catalog_pdf
 from utils.jacar_filename import parse_jacar_pdf_filename
 from utils.jacar_sidecar import sidecar_path_for_pdf
@@ -282,6 +283,11 @@ class DocumentCatalogService:
             and (
                 parse_jacar_pdf_filename(pdf_resolved) is not None
                 or os.path.basename(pdf_resolved) == "document.pdf"
+                or (
+                    entry.source == "mofa"
+                    and extract_mofa_native_id(os.path.basename(pdf_resolved))
+                    == entry.native_id.upper()
+                )
             )
         )
 

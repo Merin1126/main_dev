@@ -8,6 +8,7 @@ from scrapers.mofa_catalog_scraper import MofaCatalogItem, MofaVolume
 from services.db_service import DbService
 from services.document_storage_service import DocumentStorageService
 from services.mofa_download_service import MofaDownloadService
+from services.mofa_filename_service import build_mofa_pdf_filename
 
 
 class _FakeResponse:
@@ -102,6 +103,10 @@ def main() -> int:
             result.native_id,
         )
         assert os.path.isfile(result.pdf_path)
+        assert os.path.basename(result.pdf_path) == build_mofa_pdf_filename(
+            item.title,
+            result.native_id,
+        )
         assert os.path.isfile(result.sidecar_path)
         assert progress
 

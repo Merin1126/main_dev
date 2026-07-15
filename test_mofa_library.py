@@ -6,6 +6,7 @@ import tempfile
 
 from scrapers.mofa_catalog_scraper import MofaCatalogItem, MofaVolume
 from services.db_service import DbService
+from services.mofa_filename_service import build_mineru_input_filename, build_mofa_pdf_filename
 from services.mofa_library_service import MofaLibraryService
 
 
@@ -48,14 +49,45 @@ def main() -> int:
         assert entry.readiness == "未下载"
 
         os.makedirs(entry.bundle_dir)
-        with open(entry.pdf_path, "wb") as stream:
+        legacy_pdf = os.path.join(entry.bundle_dir, "document.pdf")
+        with open(legacy_pdf, "wb") as stream:
             stream.write(b"%PDF-1.4\n")
         os.makedirs(os.path.join(entry.bundle_dir, "mineru", "raw", "run-1"))
         with open(os.path.join(entry.bundle_dir, "mineru", "raw", "run-1", "content_list.json"), "w") as stream:
             json.dump([], stream)
         refreshed = service.list_entries()[0]
         assert refreshed.pdf_exists and refreshed.mineru_raw_exists
-        assert refreshed.readiness == "待导入"
+        assert not refreshed.split_pdf_exists
+        assert refreshed.readiness == "待整理"
+
+        input_dir = os.path.join(entry.bundle_dir, "mineru", "input")
+        os.makedirs(input_dir, exist_ok=True)
+        legacy_split = os.path.join(input_dir, "document.single-pages.pdf")
+        with open(legacy_split, "wb") as stream:
+            stream.write(b"%PDF-1.4\n")
+        with open(os.path.join(input_dir, "split_manifest.json"), "w", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "source": {"path": "document.pdf"},
+                    "output": {"path": "mineru/input/document.single-pages.pdf"},
+                },
+                stream,
+            )
+        migration = service.normalize_local_filenames([refreshed])
+        assert migration.renamed_pdfs == 1
+        assert migration.renamed_split_pdfs == 1
+        refreshed = service.list_entries()[0]
+        assert os.path.basename(refreshed.pdf_path) == build_mofa_pdf_filename(
+            content.title,
+            refreshed.native_id,
+        )
+        assert os.path.basename(refreshed.split_pdf_path) == build_mineru_input_filename(
+            content.title,
+            refreshed.native_id,
+        )
+        assert refreshed.split_pdf_exists
+        assert service.summarize([refreshed]).split_pdf_ready == 1
 
         os.makedirs(os.path.join(entry.bundle_dir, "search"))
         with open(
