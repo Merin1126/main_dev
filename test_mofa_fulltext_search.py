@@ -71,6 +71,23 @@ def main() -> int:
         assert len(phrase_hits) == 2
         assert phrase_hits[0].matching_blocks
         assert phrase_hits[0].matching_blocks[0].bbox == (0.1, 0.1, 0.9, 0.25)
+        linked_page = service.get_indexed_page(
+            phrase_hits[0].document_id,
+            phrase_hits[0].generation_id,
+            phrase_hits[0].page_index,
+        )
+        assert linked_page and linked_page.raw_text == phrase_hits[0].raw_text
+        assert service.indexed_document_page_count(
+            phrase_hits[0].document_id,
+            phrase_hits[0].generation_id,
+        ) == 2
+        if phrase_hits[0].source_pdf_page is not None:
+            original_pages = service.indexed_pages_for_source_pdf(
+                phrase_hits[0].document_id,
+                phrase_hits[0].generation_id,
+                phrase_hits[0].source_pdf_page,
+            )
+            assert phrase_hits[0].page_index in {page.page_index for page in original_pages}
 
         old_style_hits = service.search("反帝國主義")
         assert len(old_style_hits) == 1
@@ -135,7 +152,10 @@ def main() -> int:
         assert page_rows and int(page_rows["value"]) == 2
         db.close()
 
-    print("MOFA FTS checks passed: generation indexing, trigram, short terms, and bbox hits.")
+    print(
+        "MOFA FTS checks passed: generation indexing, page linkage, trigram, "
+        "short terms, and bbox hits."
+    )
     return 0
 
 

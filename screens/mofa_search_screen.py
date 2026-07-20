@@ -16,6 +16,7 @@ from services.mofa_fulltext_search_service import (
     SEARCH_MODE_ANY,
     SEARCH_MODE_PHRASE,
     MofaFullTextSearchService,
+    MofaIndexedPage,
     MofaIndexBatchResult,
     MofaIndexResult,
     MofaSearchExecution,
@@ -76,6 +77,7 @@ class MofaSearchScreen(ctk.CTkFrame):
         self._viewer_render_after: str | None = None
         self._viewer_split_ratio = 0.5
         self._zoom_anchor: tuple[float, float, float, float] | None = None
+        self._detail_sync_key: tuple | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -699,6 +701,7 @@ class MofaSearchScreen(ctk.CTkFrame):
                 f"原PDF第 {hit.source_pdf_page or '—'} 页/{region}"
             )
         )
+        self._detail_sync_key = None
         self._populate_detail_text(hit)
         entry = self.entries_by_native_id.get(hit.native_id)
         ready = bool(entry and os.path.isfile(entry.split_pdf_path))
@@ -706,9 +709,9 @@ class MofaSearchScreen(ctk.CTkFrame):
         self.reveal_btn.configure(state="normal" if ready else "disabled")
         status = self.candidate_service.status_for_page(hit.document_id, hit.page_index)
         status_labels = {
-            "candidate": "已在候选",
-            "relevant": "已标相关",
-            "excluded": "已排除",
+            "candidate": "取消候选",
+            "relevant": "取消候选",
+            "excluded": "取消候选",
         }
         self.add_candidate_btn.configure(
             state="normal",
@@ -776,7 +779,104 @@ class MofaSearchScreen(ctk.CTkFrame):
         self.detail_text.configure(state="disabled")
         self.detail_text.see("1.0")
 
+    def _linked_pages_for_viewer(self) -> tuple[MofaIndexedPage, ...]:
+        hit = self._viewer_hit
+        if hit is None:
+            return ()
+        if self._is_original_view():
+            return self.search_service.indexed_pages_for_source_pdf(
+                hit.document_id,
+                hit.generation_id,
+                self._viewer_page_index + 1,
+            )
+        page = self.search_service.get_indexed_page(
+            hit.document_id,
+            hit.generation_id,
+            self._viewer_page_index,
+        )
+        return (page,) if page else ()
+
+    def _sync_detail_to_viewer_page(self) -> None:
+        hit = self._viewer_hit
+        if hit is None:
+            return
+        key = (
+            hit.document_id,
+            hit.generation_id,
+            self.view_mode_var.get(),
+            self._viewer_page_index,
+            hit.page_index,
+            tuple(block.block_key for block in hit.matching_blocks),
+            self._active_query_terms(),
+        )
+        if key == self._detail_sync_key:
+            return
+        self._detail_sync_key = key
+        pages = self._linked_pages_for_viewer()
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        if hit.matched_terms:
+            explanations = "；".join(
+                f"{item.label}：{item.term}（权重 {item.weight:g}）"
+                for item in hit.matched_terms
+            )
+            self.detail_text.insert(
+                "end",
+                f"召回说明 · 词库 r{hit.lexicon_revision} · {explanations}\n\n",
+                ("section_heading",),
+            )
+        if not pages:
+            self.detail_text.insert(
+                "end",
+                "当前 PDF 页没有可联动的 active Generation OCR 文本。",
+                ("section_heading",),
+            )
+            self.detail_text.configure(state="disabled")
+            self.detail_title.configure(
+                text=f"PDF 第 {self._viewer_page_index + 1} 页 · OCR 未找到对应页"
+            )
+            return
+
+        linked_labels: list[str] = []
+        for index, page in enumerate(pages):
+            if index:
+                self.detail_text.insert("end", "\n\n")
+            role = "命中页" if page.page_index == hit.page_index else "联动页"
+            region = {"right": "右半页", "left": "左半页", "full": "整页"}.get(
+                page.source_region,
+                page.source_region or "未知区域",
+            )
+            linked_labels.append(f"single-pages {page.display_page}（{region}）")
+            self.detail_text.insert(
+                "end",
+                f"—— {role} · single-pages 第 {page.display_page} 页"
+                f" · 印刷页码 {page.printed_page_label or '—'} ——\n",
+                ("section_heading",),
+            )
+            if page.page_index == hit.page_index and hit.matching_blocks:
+                for block in hit.matching_blocks:
+                    self.detail_text.insert(
+                        "end",
+                        f"[命中块 {block.block_order + 1} · {block.block_type}]\n",
+                        ("match_heading",),
+                    )
+                    self._insert_highlighted_text(block.raw_text, base_tag="match_block")
+                    self.detail_text.insert("end", "\n")
+                self.detail_text.insert("end", "\n—— 本页完整 OCR ——\n", ("section_heading",))
+            self._insert_highlighted_text(page.raw_text)
+        self.detail_text.configure(state="disabled")
+        self.detail_text.see("1.0")
+        view_label = (
+            f"原 PDF 第 {self._viewer_page_index + 1} 页"
+            if self._is_original_view()
+            else f"single-pages 第 {self._viewer_page_index + 1} 页"
+        )
+        self.detail_title.configure(
+            text=f"{hit.title} · {view_label} · OCR联动：{'、'.join(linked_labels)}"
+        )
+
     def _clear_detail(self, text: str) -> None:
+        self._detail_sync_key = None
         self.detail_title.configure(text=text)
         self.detail_text.configure(state="normal")
         self.detail_text.delete("1.0", "end")
@@ -833,6 +933,33 @@ class MofaSearchScreen(ctk.CTkFrame):
         hit = self._selected_hit()
         if hit is None:
             return
+        existing_status = self.candidate_service.status_for_page(hit.document_id, hit.page_index)
+        if existing_status:
+            if not messagebox.askyesno(
+                "确认取消候选",
+                f"将“{hit.title}”第 {hit.display_page} 页从候选清单撤回？\n\n"
+                "候选备注、标签和候选召回关系将被删除；OCR、全文索引和原 PDF 不受影响。",
+                parent=self,
+            ):
+                return
+            removal = self.candidate_service.remove_candidates(
+                [self.candidate_service.candidate_id_for_page(hit.document_id, hit.page_index)]
+            )
+            if removal.protected:
+                messagebox.showwarning(
+                    "无法取消候选",
+                    "该页已加入 MOFA 研究工作包，为保护溯源证据链未执行撤回。\n"
+                    f"工作包：{'、'.join(removal.package_ids)}",
+                    parent=self,
+                )
+                return
+            self.add_candidate_btn.configure(text="加入候选")
+            messagebox.showinfo(
+                "已取消候选",
+                f"已从候选清单撤回：{hit.title}\nPDF 第 {hit.display_page} 页",
+                parent=self,
+            )
+            return
         query, mode, year, volume = self._current_search_context()
         level, revision, snapshot = self._current_expansion_context()
         result = self.candidate_service.add_hits(
@@ -846,7 +973,7 @@ class MofaSearchScreen(ctk.CTkFrame):
             lexicon_revision=revision,
             expansion_snapshot=snapshot,
         )
-        self.add_candidate_btn.configure(text="已在候选")
+        self.add_candidate_btn.configure(text="取消候选")
         action = "新增" if result.created else "合并检索来源"
         messagebox.showinfo(
             "候选史料已更新",
@@ -1108,11 +1235,13 @@ class MofaSearchScreen(ctk.CTkFrame):
                 else "disabled"
             )
         )
+        self._sync_detail_to_viewer_page()
 
     def _clear_viewer(self, message: str = "选择检索结果后在此显示 PDF 命中页") -> None:
         self._viewer_hit = None
         self._viewer_photo = None
         self._viewer_page_count = 0
+        self._detail_sync_key = None
         self._zoom_anchor = None
         self.pdf_canvas.delete("all")
         width = max(120, self.pdf_canvas.winfo_width())

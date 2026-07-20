@@ -104,9 +104,25 @@ def main() -> int:
         assert saved_expanded.expansion_level == EXPANSION_CONCEPT
         assert saved_expanded.lexicon_revision == search.lexicon.current_revision()
         assert saved_expanded.expansion_snapshot["groups"][0][1]["term"] == "中国共産党"
+        service.add_hit(expanded.hits[0], saved_expanded)
+        highlight_terms = service.highlight_terms_for_candidate(candidate.candidate_id)
+        assert "中共" in highlight_terms
+        assert "中国共産党" in highlight_terms
+
+        removal = service.remove_candidates((second_id, "missing-candidate"))
+        assert removal.requested == 2
+        assert removal.removed == 1
+        assert removal.protected == 0
+        assert removal.missing == 1
+        assert service.status_for_page(hits[1].document_id, hits[1].page_index) == ""
+        assert service.summary()["total"] == 1
+        assert not db.fetchone(
+            "SELECT 1 FROM mofa_candidate_search_sources WHERE candidate_id = ?",
+            (second_id,),
+        )
         db.close()
 
-    print("MOFA candidate checks passed: page dedupe, provenance merge, status, notes, and tags.")
+    print("MOFA candidate checks passed: dedupe, provenance, status, metadata, and removal.")
     return 0
 
 

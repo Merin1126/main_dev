@@ -2,7 +2,7 @@
 
 ***
 
-# HRS 史料全自动采集与 AI 校对系统 (v3.8.0)
+# HRS 史料全自动采集与 AI 校对系统 (v3.9.4)
 
 ## MOFA 《日本外交文书》接入规范（开发中）
 
@@ -47,6 +47,7 @@ MOFA 数字合集是按年份、卷册和事项组织的编纂出版物目录，
 - Phase 5B-8：真实语料全链路验收、问题分类、定向修复与索引性能探针。
 - Phase 6A：页级候选史料清单、检索来源合并、研究状态、备注、标签与可复现检索条件。
 - Phase 6B：版本化检索词库、新旧字体/OCR/历史术语分层扩展、可解释召回与用户维护界面。
+- Phase 7A：MOFA 候选页段合并、上下文扩展与来源明确的研究工作包。
 
 ### MOFA 双页拆分与 MinerU 输入规范
 
@@ -88,6 +89,7 @@ MOFA 数字合集是按年份、卷册和事项组织的编纂出版物目录，
 - 默认“单页视图”显示 MinerU 实际处理的 `single-pages.pdf`，OCR block 的 0—1 bbox 可直接映射到页面。切换“原始双页”后，阅读器使用 `split_manifest.json` 的 `source_pdf_page`、`source_region` 与 `split_ratio` 将 bbox 反算到原始 PDF 的左/右半页；竖向保留页按整页坐标处理。
 - 高亮只使用当前 active Generation 中命中 block 的 bbox。黄色填充通过 PIL RGBA 直接与渲染图像混合（约 18% 不透明度），不再依赖 macOS Tk 对 `stipple` 的不稳定模拟，因此底层文字保持可读；橙色边框用于确认 block 边界。用户手动翻离命中页时不显示误导性高亮，“返回命中页”恢复定位。若关键词跨多个 OCR block 而不存在单一 block 命中，页级召回仍然保留，但不会伪造精确矩形。
 - 右侧 OCR 栏使用浅黄色区分完整命中 block，并以更深的黄色、深色文字和下划线标出具体查询词。字符位置基于与索引相同的 NFKC/旧字体规范化结果反向映射到 MinerU 原文，因此检索“反帝国主義”时仍能在原文“反帝國主義”上正确着色，而不会改写展示文本。文本 tag 不覆盖字体，以保持 CustomTkinter 的缩放兼容性。
+- PDF 翻页与右侧 OCR 栏按当前视图双向统一页码语义：“单页视图”按 `page_index` 显示一个 OCR 页；“原始双页”按 `source_pdf_page` 同时显示对应的右、左半页 OCR。缩放不会重置文本滚动位置，只有页码、视图或检索命中改变时刷新文本。
 - 原始下载 PDF、single-pages PDF 和 OCR 数据均保持只读。该实现是 HRS 内部视觉叠加层，并非向 PDF 永久写入 OCR 文字层；未来如需导出可检索 PDF，应作为独立派生文件生成。
 
 ### MOFA 真实语料验收与定向修复规范
@@ -110,7 +112,7 @@ MOFA 数字合集是按年份、卷册和事项组织的编纂出版物目录，
 - 候选记录保存当前 `generation_id`、single-pages 页码、原 PDF 页码/左右区域、印刷页码、页级 OCR 和创建/更新时间。候选页再次从新 Generation 加入时更新页面内容并清理旧 Generation block；既有研究状态、备注和标签不被重置。
 - `mofa_saved_searches` 保存检索词、规范化词、精确/全部/任一模式、年份、卷册、结果页数和最近使用时间；相同条件使用确定性 signature 合并。`mofa_candidate_search_sources` 建立候选页与多组检索条件的多对多来源关系，保证召回过程可复现。
 - `mofa_candidate_blocks` 保存每次命中的 block、bbox 与原文；`mofa_candidate_tags` 保存用户标签。候选状态固定为 `candidate / relevant / excluded`，对应“候选 / 相关 / 排除”，排除是可逆状态而非删除。
-- 独立“MOFA候选清单”页面支持状态、年份、标签和任意文字筛选，批量调整研究状态，编辑备注与标签，查看召回关键词和页级 OCR，并打开或定位对应 single-pages PDF。“已保存检索”窗口用于回看检索条件；Phase 7 再把相关页/连续页送入高精度 OCR、分析与翻译工作台。
+- 独立“MOFA候选清单”页面支持状态、年份、标签和任意文字筛选，批量调整研究状态，编辑备注与标签，查看召回关键词和页级 OCR，并打开或定位对应 single-pages PDF。下方 OCR 栏以候选命中页为锚点支持前后翻页和“返回命中页”，显示当前页相对命中页的偏移；高亮词来自所有保存检索及当时词库 revision 的实际展开快照，因此关联召回的真实命中词也能正确标色。“已保存检索”窗口用于回看检索条件；Phase 7 再把相关页/连续页送入高精度 OCR、分析与翻译工作台。
 
 ### MOFA 分层检索词库与可解释扩展规范
 
@@ -127,6 +129,17 @@ MOFA 数字合集是按年份、卷册和事项组织的编纂出版物目录，
 - 在既有 134 份、8,630 页、81,884 个 block 的真实索引上完成 additive migration；初始词库为 r1，包含 34 条与 Generation v1 一致的只读旧字体规则，未擅自加入任何需要研究判断的自定义历史概念。
 - 固定精确查询结果为：“共産党”191 页、“中国共産党”5 页、“反帝国主義”35 页、“赤化”180 页。在尚无自定义规则时，四级扩展的结果与精确层一致，确认升级不会无故扩大或缩小既有召回范围。
 - 隔离测试库已验证：自定义字形替换、OCR 混淆、历史术语和关联概念能分层生效；多词 `ALL` 查询保留“组内 OR、组间 AND”语义；短词继续回退 `instr`；同一页按最高命中权重优先排列；规则启停、删除、批量导入、版本恢复和候选来源快照均可重现。
+
+### MOFA 研究工作包规范
+
+- Phase 7A 的工作包只接受 `source=mofa` 的候选页。机器 ID 固定使用 `MOFA-RP-<20位大写摘要>`，类型为 `mofa_research_package`；本地目录固定为 `Historical_Documents/research/mofa/MOFA-RP-.../`，清单固定命名为 `mofa_research_package.json`。即使用户自定义显示名称，系统也会自动补充“MOFA研究工作包”前缀，避免与 JACAR 或未来其他来源混淆。
+- 候选清单支持多选创建工作包。创建窗口默认纳入命中页前后各 1 页，并实时预览候选页、实际纳入页段和 OCR Generation；用户可将前后范围分别调整为 0—50 页。同一史料中扩展后重叠或相邻的区间自动合并，不同史料分别保存页段。
+- 创建窗口提供“候选页段 / 整份PDF”可视化分段选择。“整份PDF”将所选候选页涉及的每份 MOFA 文书从第 1 页到末页全部纳入，并禁用前后文参数；如果所选候选跨越多份文书，则这些 PDF 全部纳入同一个工作包。manifest 使用 `selection_scope=full_document`，命中页标记 `selected`，其余页标记 `document_scope`；页数按后续 Gemini 实际处理的 single-pages/OCR 页统计，同时完整引用原 PDF。
+- 工作包以排序后的候选 ID、前置页数和后置页数计算稳定 signature。相同选择和上下文重复创建时返回既有 `MOFA-RP`，刷新 manifest 而不复制任务；更改上下文范围会形成新的工作包。
+- 工作包不复制原始 PDF 或 single-pages PDF。manifest 以项目相对路径引用来源 bundle、原 PDF、single-pages PDF，并锁定 `document_id + native_id + generation_id + page_index range`；候选页标记为 `selected`，补入的前后文标记为 `context`。候选来自旧 Generation、single-pages PDF 缺失或全文索引页段不一致时拒绝创建，避免后续处理错页。
+- manifest 同时保存页段、原 PDF 页/左右区域、印刷页码提示、候选研究状态与备注，以及保存检索中的查询词、扩展层级、词库 revision 和展开快照。原始 MinerU OCR 文本不复制到工作包，仍以 active Generation 和候选记录为证据来源。
+- 每个工作包预建 `ocr/`、`analysis/`、`translation/`、`export/` 四个空目录，供 Phase 7B—7D 写入派生产物。工作包状态预留 `draft / ready / processing / completed / archived`；当前管理窗口支持草稿、待处理状态切换，以及打开目录、打开或定位 manifest。
+- 工作包管理器提供“删除工作包（保留候选）”和“删除工作包并取消候选”两种操作。后者仅撤回没有被其他工作包引用的候选页；共享候选继续保留。删除只允许用于 `draft / ready`，`processing / completed / archived` 默认受溯源保护。操作删除工作包数据库记录与本地派生目录，不删除原 PDF、OCR、全文索引或已保存检索。
 
 ### Phase 5A 实测结论（2026-07-13）
 
@@ -266,7 +279,7 @@ HRS_Project/
 ├── Historical_Documents/       # 📚 新版统一史料根目录（按来源与原生 ID 组织）
 │   ├── jacar/<JACAR_REF>/
 │   ├── mofa/<年份>/<卷代码>/<MOFA_ID>/
-│   └── research/               # 后续候选史料工作包
+│   └── research/mofa/<MOFA-RP-ID>/ # MOFA候选页研究工作包（只引用来源PDF）
 ├── JACAR_Downloads/            # 📂 旧版 JACAR 数据；迁移期间只读兼容保留
 ├── OCR_Cache/                  # 💾 OCR 结果缓存（paged_v1，哈希文件名，运行时生成）
 ├── Database_JSON/              #分析 JSON 单页归档（运行时生成；与 Analysis_Cache 的 paged_v1 形成「数据库轨 / UI 轨」分工）
@@ -334,6 +347,21 @@ HRS_Project/
 ---
 
 ## 📈 版本更迭记录 (Changelog)
+### v3.9.4 · MOFA full-document research packages
+* **整份 PDF 纳入**：MOFA 工作包创建窗口新增“候选页段 / 整份PDF”分段按钮。整份模式对每份被选候选页涉及的 MOFA 文书建立 `1—末页` 页段，生成独立 `MOFA整份PDF研究工作包｜...` 名称和稳定 ID。SQLite 与 manifest 新增 `selection_scope=full_document`，为后续整本 Gemini OCR、分析或翻译提供无歧义任务边界。
+
+### v3.9.3 · MOFA linked OCR paging
+* **PDF/OCR 页码联动**：MOFA 全文检索内嵌 PDF 阅读器翻页时，右侧 OCR 同步切换到当前 single-pages 页；原始双页视图会合并展示同一原 PDF 页下的右/左 OCR 页，命中页仍保留 block 和查询词高亮。MOFA 候选页的 OCR 栏新增前后翻页、页码和返回命中页，并按保存检索的扩展快照高亮实际召回词。
+
+### v3.9.2 · MOFA research package deletion
+* **受保护删除**：MOFA 工作包管理器新增可视化按钮和右键菜单，可选择只删除工作包或同时取消独占候选。共享候选按其他 `MOFA-RP` 引用自动保留；处理中、已完成和已归档工作包禁止删除。工作包目录删除前校验其必须位于受管 `Historical_Documents/research/mofa/` 根下，不会触及原始史料与索引。
+
+### v3.9.1 · MOFA candidate withdrawal
+* **候选撤回**：MOFA 全文检索页的候选状态按钮支持再次点击撤回；MOFA 候选清单新增单选/多选“取消候选”按钮与右键菜单。撤回只删除候选自有的状态、备注、标签、命中块副本及召回关系，不影响 OCR、FTS 索引、原 PDF 和已保存检索；已被 `MOFA-RP` 工作包引用的候选页自动受保护，防止破坏研究溯源链。
+
+### v3.9.0 · MOFA research work packages
+* **Phase 7A**：在候选清单中新增多选“创建MOFA研究工作包”和工作包管理器。工作包以 `MOFA-RP-...` 命名并存储于 `Historical_Documents/research/mofa/`，支持前后文扩展、同文档相邻/重叠页段合并、稳定防重、Generation/索引/PDF 完整性校验、搜索来源留痕和原子 manifest；不复制来源 PDF，并预建后续 OCR、分析、翻译和导出目录。
+
 ### v3.8.0 · Versioned MOFA search lexicon
 * **Phase 6B-1—4**：新增版本化 MOFA 检索词库，区分新旧字体、OCR 混淆、历史术语和关联概念；每次规则变更保存完整 revision 快照，支持用户筛选、编辑、启停、删除及 JSON/CSV 导入导出。全文检索增加四级扩展范围和可解释召回标签，结果高亮实际命中扩展词；保存检索与候选来源同时固化扩展级别、词库版本和展开快照。向量语义检索明确留到独立试验阶段。
 

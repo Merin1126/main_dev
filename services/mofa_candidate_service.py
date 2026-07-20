@@ -66,6 +66,17 @@ class MofaCandidateAddResult:
     search_id: str
 
 
+@dataclass(frozen=True)
+class MofaCandidateRemovalResult:
+    requested: int
+    removed: int
+    protected: int
+    missing: int
+    removed_ids: tuple[str, ...]
+    protected_ids: tuple[str, ...]
+    package_ids: tuple[str, ...]
+
+
 class MofaCandidateService:
     def __init__(self, *, db_service: DbService | None = None) -> None:
         self.db = db_service or DbService()
@@ -420,6 +431,56 @@ class MofaCandidateService:
                 )
         return len(values)
 
+    def remove_candidates(self, candidate_ids: Iterable[str]) -> MofaCandidateRemovalResult:
+        """Remove candidates that are not already part of a research package.
+
+        Candidate-owned search links, blocks, tags, notes, and status are deleted by
+        SQLite cascades.  Saved searches, OCR generations, the FTS index, and source
+        documents remain untouched.  Package members are deliberately protected so
+        an established research evidence chain cannot be broken from the basket UI.
+        """
+        requested = tuple(dict.fromkeys(str(value) for value in candidate_ids if value))
+        if not requested:
+            return MofaCandidateRemovalResult(0, 0, 0, 0, (), (), ())
+
+        placeholders = ", ".join("?" for _ in requested)
+        existing_rows = self.db.fetchall(
+            f"SELECT candidate_id FROM mofa_research_candidates WHERE candidate_id IN ({placeholders})",
+            requested,
+        )
+        existing = {str(row["candidate_id"]) for row in existing_rows}
+        protected_rows = self.db.fetchall(
+            f"""
+            SELECT pc.candidate_id, pc.package_id
+            FROM mofa_research_package_candidates pc
+            WHERE pc.candidate_id IN ({placeholders})
+            ORDER BY pc.package_id, pc.candidate_id
+            """,
+            requested,
+        )
+        protected_ids = {
+            str(row["candidate_id"])
+            for row in protected_rows
+        }
+        removable = tuple(value for value in requested if value in existing and value not in protected_ids)
+        if removable:
+            with self.db.transaction() as conn:
+                conn.executemany(
+                    "DELETE FROM mofa_research_candidates WHERE candidate_id = ?",
+                    ((candidate_id,) for candidate_id in removable),
+                )
+        protected = tuple(value for value in requested if value in protected_ids)
+        packages = tuple(dict.fromkeys(str(row["package_id"]) for row in protected_rows))
+        return MofaCandidateRemovalResult(
+            requested=len(requested),
+            removed=len(removable),
+            protected=len(protected),
+            missing=sum(value not in existing for value in requested),
+            removed_ids=removable,
+            protected_ids=protected,
+            package_ids=packages,
+        )
+
     def update_notes(self, candidate_id: str, notes: str) -> None:
         self.db.execute(
             "UPDATE mofa_research_candidates SET notes = ?, updated_at = ? WHERE candidate_id = ?",
@@ -461,6 +522,37 @@ class MofaCandidateService:
             )
         ]
 
+    def highlight_terms_for_candidate(self, candidate_id: str) -> tuple[str, ...]:
+        rows = self.db.fetchall(
+            """
+            SELECT s.query_text, s.search_mode, s.expansion_snapshot_json
+            FROM mofa_candidate_search_sources cs
+            JOIN mofa_saved_searches s ON s.search_id = cs.search_id
+            WHERE cs.candidate_id = ?
+            ORDER BY s.saved_at, s.query_text
+            """,
+            (candidate_id,),
+        )
+        terms: list[str] = []
+        for row in rows:
+            query = str(row["query_text"] or "").strip()
+            if query:
+                if str(row["search_mode"]) == "phrase":
+                    terms.append(query)
+                else:
+                    terms.extend(value for value in query.split() if value)
+            try:
+                snapshot = json.loads(row["expansion_snapshot_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                snapshot = {}
+            for group in snapshot.get("groups", []) if isinstance(snapshot, dict) else []:
+                if not isinstance(group, list):
+                    continue
+                for item in group:
+                    if isinstance(item, dict) and str(item.get("term") or "").strip():
+                        terms.append(str(item["term"]).strip())
+        return tuple(dict.fromkeys(terms))
+
     def summary(self) -> dict[str, int]:
         values = {status: 0 for status in CANDIDATE_STATUSES}
         for row in self.db.fetchall(
@@ -479,3 +571,13 @@ class MofaCandidateService:
             (document_id, int(page_index)),
         )
         return str(row["research_status"]) if row else ""
+
+    def candidate_id_for_page(self, document_id: str, page_index: int) -> str:
+        row = self.db.fetchone(
+            """
+            SELECT candidate_id FROM mofa_research_candidates
+            WHERE document_id = ? AND page_index = ?
+            """,
+            (document_id, int(page_index)),
+        )
+        return str(row["candidate_id"]) if row else ""

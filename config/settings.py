@@ -33,7 +33,7 @@ BUNDLE_REL_STRUCTURED_DIR = "structured"
 BUNDLE_REL_SCRATCH_DIR = "_scratch"
 
 #全局版本号配置
-APP_VERSION = "V3.8.0"
+APP_VERSION = "V3.9.4"
 
 # 进度汇报「导出内容2」总结所用 Gemini 模型（与 OCR/分析页、token_logger 定价一致）
 GEMINI_SUMMARY_MODEL_DEFAULT = "gemini-3-flash-preview"

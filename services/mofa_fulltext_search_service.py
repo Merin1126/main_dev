@@ -78,6 +78,23 @@ class MofaSearchBlock:
 
 
 @dataclass(frozen=True)
+class MofaIndexedPage:
+    document_id: str
+    generation_id: str
+    native_id: str
+    year: int
+    volume_code: str
+    title: str
+    page_index: int
+    display_page: int
+    source_pdf_page: int | None
+    source_region: str
+    printed_page_label: str
+    raw_text: str
+    search_text: str
+
+
+@dataclass(frozen=True)
 class MofaSearchHit:
     document_id: str
     generation_id: str
@@ -397,6 +414,69 @@ class MofaFullTextSearchService:
             else:
                 merged.append((start, end))
         return tuple(merged)
+
+    @staticmethod
+    def _indexed_page_from_row(row) -> MofaIndexedPage:
+        return MofaIndexedPage(
+            document_id=str(row["document_id"]),
+            generation_id=str(row["generation_id"]),
+            native_id=str(row["native_id"]),
+            year=int(row["gregorian_year"]),
+            volume_code=str(row["volume_code"]),
+            title=str(row["title"]),
+            page_index=int(row["page_index"]),
+            display_page=int(row["display_page"]),
+            source_pdf_page=(
+                int(row["source_pdf_page"])
+                if row["source_pdf_page"] is not None
+                else None
+            ),
+            source_region=str(row["source_region"]),
+            printed_page_label=str(row["printed_page_label"]),
+            raw_text=str(row["raw_text"]),
+            search_text=str(row["search_text"]),
+        )
+
+    def get_indexed_page(
+        self,
+        document_id: str,
+        generation_id: str,
+        page_index: int,
+    ) -> MofaIndexedPage | None:
+        row = self.db.fetchone(
+            """
+            SELECT * FROM mofa_search_pages
+            WHERE document_id = ? AND generation_id = ? AND page_index = ?
+            """,
+            (document_id, generation_id, int(page_index)),
+        )
+        return self._indexed_page_from_row(row) if row else None
+
+    def indexed_pages_for_source_pdf(
+        self,
+        document_id: str,
+        generation_id: str,
+        source_pdf_page: int,
+    ) -> tuple[MofaIndexedPage, ...]:
+        rows = self.db.fetchall(
+            """
+            SELECT * FROM mofa_search_pages
+            WHERE document_id = ? AND generation_id = ? AND source_pdf_page = ?
+            ORDER BY page_index
+            """,
+            (document_id, generation_id, int(source_pdf_page)),
+        )
+        return tuple(self._indexed_page_from_row(row) for row in rows)
+
+    def indexed_document_page_count(self, document_id: str, generation_id: str) -> int:
+        row = self.db.fetchone(
+            """
+            SELECT COUNT(*) AS value FROM mofa_search_pages
+            WHERE document_id = ? AND generation_id = ?
+            """,
+            (document_id, generation_id),
+        )
+        return int(row["value"] or 0) if row else 0
 
     @staticmethod
     def _fts_expression(terms: tuple[str, ...], mode: str) -> str:

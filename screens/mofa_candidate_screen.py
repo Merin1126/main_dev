@@ -14,7 +14,13 @@ from services.mofa_candidate_service import (
     MofaCandidate,
     MofaCandidateService,
 )
+from services.mofa_fulltext_search_service import MofaFullTextSearchService
 from services.mofa_library_service import MofaLibraryEntry, MofaLibraryService
+from services.mofa_research_package_service import MofaResearchPackageService
+from screens.mofa_research_package_dialog import (
+    MofaResearchPackageCreateDialog,
+    MofaResearchPackageManagerDialog,
+)
 from utils.open_path import open_path_in_system, reveal_file_in_folder
 
 
@@ -38,8 +44,23 @@ class MofaCandidateScreen(ctk.CTkFrame):
         super().__init__(master, fg_color=Color.TRANSPARENT, corner_radius=0, **kwargs)
         self.library = MofaLibraryService()
         self.service = MofaCandidateService(db_service=self.library.db)
+        self.search_service = MofaFullTextSearchService(
+            project_root=self.library.project_root,
+            db_service=self.library.db,
+            library_service=self.library,
+        )
+        self.package_service = MofaResearchPackageService(
+            project_root=self.library.project_root,
+            db_service=self.library.db,
+            library_service=self.library,
+            candidate_service=self.service,
+        )
         self.candidates: list[MofaCandidate] = []
         self.entries_by_native_id: dict[str, MofaLibraryEntry] = {}
+        self._detail_candidate_id = ""
+        self._detail_page_index = 0
+        self._detail_page_count = 0
+        self._detail_highlight_terms: tuple[str, ...] = ()
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -64,6 +85,13 @@ class MofaCandidateScreen(ctk.CTkFrame):
             command=self.show_saved_searches,
         )
         self.saved_searches_btn.pack(side="right", padx=(0, 8))
+        self.packages_btn = ctk.CTkButton(
+            header,
+            text="MOFA工作包",
+            width=104,
+            command=self.show_research_packages,
+        )
+        self.packages_btn.pack(side="right", padx=(0, 8))
 
         self.summary_label = ctk.CTkLabel(
             self,
@@ -132,6 +160,21 @@ class MofaCandidateScreen(ctk.CTkFrame):
             fg_color=Color.RED,
             command=lambda: self._set_selected_status(EXCLUDED_STATUS),
         ).pack(side="left", padx=6, pady=10)
+        self.remove_candidate_btn = ctk.CTkButton(
+            actions,
+            text="取消候选",
+            width=94,
+            fg_color=Color.TEXT_GRAY,
+            command=self.remove_selected_candidates,
+        )
+        self.remove_candidate_btn.pack(side="left", padx=(12, 6), pady=10)
+        self.create_package_btn = ctk.CTkButton(
+            actions,
+            text="创建MOFA研究工作包",
+            width=150,
+            command=self.create_research_package,
+        )
+        self.create_package_btn.pack(side="left", padx=(12, 6), pady=10)
         self.open_btn = ctk.CTkButton(
             actions,
             text="打开单页PDF",
@@ -206,6 +249,11 @@ class MofaCandidateScreen(ctk.CTkFrame):
         scrollbar.pack(side="right", fill="y", padx=(0, 10), pady=10)
         self.tree.bind("<<TreeviewSelect>>", self._show_selected)
         self.tree.bind("<Double-Button-1>", lambda _event: self.open_selected_pdf())
+        self.tree.bind("<Button-2>", self._show_context_menu)
+        self.tree.bind("<Button-3>", self._show_context_menu)
+        self.tree.bind("<Control-Button-1>", self._show_context_menu)
+        self.context_menu = tk.Menu(self, tearoff=False)
+        self.context_menu.add_command(label="取消候选", command=self.remove_selected_candidates)
 
         info = ctk.CTkFrame(detail_frame, fg_color=Color.TRANSPARENT)
         info.pack(fill="x", padx=10, pady=(10, 4))
@@ -215,7 +263,33 @@ class MofaCandidateScreen(ctk.CTkFrame):
             anchor="w",
             font=("PingFang SC", 12, "bold"),
         )
-        self.detail_title.pack(fill="x")
+        self.detail_title.pack(side="left", fill="x", expand=True)
+        self.next_ocr_page_btn = ctk.CTkButton(
+            info,
+            text="›",
+            width=38,
+            state="disabled",
+            command=lambda: self._change_detail_page(1),
+        )
+        self.next_ocr_page_btn.pack(side="right", padx=(4, 0))
+        self.prev_ocr_page_btn = ctk.CTkButton(
+            info,
+            text="‹",
+            width=38,
+            state="disabled",
+            command=lambda: self._change_detail_page(-1),
+        )
+        self.prev_ocr_page_btn.pack(side="right", padx=(4, 0))
+        self.ocr_page_label = ctk.CTkLabel(info, text="— / —", width=72)
+        self.ocr_page_label.pack(side="right", padx=(8, 0))
+        self.jump_candidate_page_btn = ctk.CTkButton(
+            info,
+            text="返回命中页",
+            width=88,
+            state="disabled",
+            command=self._jump_to_candidate_page,
+        )
+        self.jump_candidate_page_btn.pack(side="right", padx=(8, 0))
 
         editor = ctk.CTkFrame(detail_frame, fg_color=Color.TRANSPARENT)
         editor.pack(fill="both", expand=True, padx=10, pady=(4, 10))
@@ -226,8 +300,19 @@ class MofaCandidateScreen(ctk.CTkFrame):
         right.pack_propagate(False)
         self.ocr_text = ctk.CTkTextbox(left, wrap="word", font=("PingFang SC", 12))
         self.ocr_text.pack(fill="both", expand=True)
+        self.ocr_text.tag_config(
+            "query_match",
+            background="#ffcc4d",
+            foreground="#251a00",
+            underline=True,
+        )
+        self.ocr_text.tag_config(
+            "section_heading",
+            foreground="#6c6f78",
+            underline=True,
+        )
         self.ocr_text.configure(state="disabled")
-        ctk.CTkLabel(right, text="研究备注", anchor="w").pack(fill="x")
+        ctk.CTkLabel(right, text="研究备注（候选命中页）", anchor="w").pack(fill="x")
         self.notes_text = ctk.CTkTextbox(right, height=120, wrap="word")
         self.notes_text.pack(fill="x", pady=(4, 10))
         ctk.CTkLabel(right, text="标签（逗号分隔）", anchor="w").pack(fill="x")
@@ -284,11 +369,12 @@ class MofaCandidateScreen(ctk.CTkFrame):
                 ),
             )
         summary = self.service.summary()
+        package_summary = self.package_service.summary()
         self.summary_label.configure(
             text=(
                 f"当前显示 {len(self.candidates)} · 全部 {summary['total']} · "
                 f"候选 {summary[CANDIDATE_STATUS]} · 相关 {summary[RELEVANT_STATUS]} · "
-                f"排除 {summary[EXCLUDED_STATUS]}"
+                f"排除 {summary[EXCLUDED_STATUS]} · MOFA研究工作包 {package_summary['total']}"
             )
         )
         self._clear_detail()
@@ -305,21 +391,16 @@ class MofaCandidateScreen(ctk.CTkFrame):
         if candidate is None:
             self._clear_detail()
             return
-        region = {"right": "右半页", "left": "左半页", "full": "整页"}.get(
-            candidate.source_region,
-            candidate.source_region or "未知",
+        self._detail_candidate_id = candidate.candidate_id
+        self._detail_page_index = candidate.page_index
+        self._detail_page_count = self.search_service.indexed_document_page_count(
+            candidate.document_id,
+            candidate.generation_id,
         )
-        self.detail_title.configure(
-            text=(
-                f"{candidate.title} · single-pages 第 {candidate.display_page} 页 · "
-                f"原PDF第 {candidate.source_pdf_page or '—'}页/{region} · "
-                f"召回：{'、'.join(candidate.search_queries)}"
-            )
+        self._detail_highlight_terms = self.service.highlight_terms_for_candidate(
+            candidate.candidate_id
         )
-        self.ocr_text.configure(state="normal")
-        self.ocr_text.delete("1.0", "end")
-        self.ocr_text.insert("1.0", candidate.raw_text)
-        self.ocr_text.configure(state="disabled")
+        self._render_detail_page()
         self.notes_text.delete("1.0", "end")
         self.notes_text.insert("1.0", candidate.notes)
         self.tags_var.set("，".join(candidate.tags))
@@ -330,6 +411,10 @@ class MofaCandidateScreen(ctk.CTkFrame):
         self.reveal_btn.configure(state="normal" if ready else "disabled")
 
     def _clear_detail(self) -> None:
+        self._detail_candidate_id = ""
+        self._detail_page_index = 0
+        self._detail_page_count = 0
+        self._detail_highlight_terms = ()
         self.detail_title.configure(text="选择一条候选史料查看详情")
         self.ocr_text.configure(state="normal")
         self.ocr_text.delete("1.0", "end")
@@ -339,6 +424,109 @@ class MofaCandidateScreen(ctk.CTkFrame):
         self.save_meta_btn.configure(state="disabled")
         self.open_btn.configure(state="disabled")
         self.reveal_btn.configure(state="disabled")
+        self.ocr_page_label.configure(text="— / —")
+        self.prev_ocr_page_btn.configure(state="disabled")
+        self.next_ocr_page_btn.configure(state="disabled")
+        self.jump_candidate_page_btn.configure(state="disabled")
+
+    def _detail_candidate(self) -> MofaCandidate | None:
+        return self._candidate_for_id(self._detail_candidate_id)
+
+    def _insert_highlighted_ocr(self, text: str) -> None:
+        ranges = self.search_service.normalized_match_ranges(
+            text,
+            self._detail_highlight_terms,
+        )
+        cursor = 0
+        for start, end in ranges:
+            if start > cursor:
+                self.ocr_text.insert("end", text[cursor:start])
+            self.ocr_text.insert("end", text[start:end], ("query_match",))
+            cursor = end
+        if cursor < len(text):
+            self.ocr_text.insert("end", text[cursor:])
+
+    def _render_detail_page(self) -> None:
+        candidate = self._detail_candidate()
+        if candidate is None:
+            return
+        page = self.search_service.get_indexed_page(
+            candidate.document_id,
+            candidate.generation_id,
+            self._detail_page_index,
+        )
+        self.ocr_text.configure(state="normal")
+        self.ocr_text.delete("1.0", "end")
+        if page is None:
+            self.ocr_text.insert(
+                "1.0",
+                "当前页没有可用的 active Generation OCR 文本。",
+                ("section_heading",),
+            )
+            self.detail_title.configure(text=f"{candidate.title} · OCR 页不存在")
+        else:
+            relation = "候选命中页" if page.page_index == candidate.page_index else "上下文页"
+            offset = page.page_index - candidate.page_index
+            offset_label = "" if offset == 0 else f" · 距命中页 {offset:+d}"
+            region = {"right": "右半页", "left": "左半页", "full": "整页"}.get(
+                page.source_region,
+                page.source_region or "未知区域",
+            )
+            self.detail_title.configure(
+                text=(
+                    f"{candidate.title} · {relation}{offset_label} · "
+                    f"single-pages 第 {page.display_page} 页 · "
+                    f"原PDF第 {page.source_pdf_page or '—'}页/{region}"
+                )
+            )
+            queries = "、".join(candidate.search_queries) or "—"
+            self.ocr_text.insert(
+                "end",
+                f"—— {relation} · 召回关键词：{queries} ——\n",
+                ("section_heading",),
+            )
+            self._insert_highlighted_ocr(page.raw_text)
+        self.ocr_text.configure(state="disabled")
+        self.ocr_text.see("1.0")
+        self.ocr_page_label.configure(
+            text=(
+                f"{self._detail_page_index + 1} / {self._detail_page_count}"
+                if self._detail_page_count
+                else "— / —"
+            )
+        )
+        self.prev_ocr_page_btn.configure(
+            state="normal" if self._detail_page_index > 0 else "disabled"
+        )
+        self.next_ocr_page_btn.configure(
+            state=(
+                "normal"
+                if self._detail_page_index + 1 < self._detail_page_count
+                else "disabled"
+            )
+        )
+        self.jump_candidate_page_btn.configure(
+            state="normal" if self._detail_page_index != candidate.page_index else "disabled"
+        )
+
+    def _change_detail_page(self, delta: int) -> None:
+        if not self._detail_candidate_id or not self._detail_page_count:
+            return
+        self._detail_page_index = max(
+            0,
+            min(
+                self._detail_page_count - 1,
+                self._detail_page_index + int(delta),
+            ),
+        )
+        self._render_detail_page()
+
+    def _jump_to_candidate_page(self) -> None:
+        candidate = self._detail_candidate()
+        if candidate is None:
+            return
+        self._detail_page_index = candidate.page_index
+        self._render_detail_page()
 
     def _set_selected_status(self, status: str) -> None:
         selected = self.tree.selection()
@@ -347,6 +535,51 @@ class MofaCandidateScreen(ctk.CTkFrame):
             return
         self.service.update_status(selected, status)
         self.refresh_candidates()
+
+    def _show_context_menu(self, event) -> str:
+        candidate_id = self.tree.identify_row(event.y)
+        if not candidate_id:
+            return "break"
+        if candidate_id not in self.tree.selection():
+            self.tree.selection_set(candidate_id)
+        self.tree.focus(candidate_id)
+        self._show_selected()
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+        return "break"
+
+    def remove_selected_candidates(self) -> None:
+        selected = tuple(self.tree.selection())
+        if not selected:
+            messagebox.showwarning("请选择候选史料", "请先选择一条或多条候选记录。")
+            return
+        if not messagebox.askyesno(
+            "确认取消候选",
+            f"将选中的 {len(selected)} 条记录从 MOFA 候选清单撤回？\n\n"
+            "候选备注、标签和候选召回关系将被删除；OCR、全文索引和原 PDF 不受影响。\n"
+            "已加入研究工作包的记录会自动保留。",
+            parent=self,
+        ):
+            return
+        result = self.service.remove_candidates(selected)
+        self.refresh_candidates()
+        if result.protected:
+            package_label = "、".join(result.package_ids)
+            messagebox.showwarning(
+                "候选撤回部分完成" if result.removed else "无法取消候选",
+                f"已撤回 {result.removed} 条，保留 {result.protected} 条。\n"
+                "保留记录已写入研究工作包，不能破坏溯源证据链。\n"
+                f"工作包：{package_label}",
+                parent=self,
+            )
+            return
+        messagebox.showinfo(
+            "已取消候选",
+            f"已从 MOFA 候选清单撤回 {result.removed} 条记录。",
+            parent=self,
+        )
 
     def save_selected_metadata(self) -> None:
         candidate = self._selected_candidate()
@@ -384,6 +617,35 @@ class MofaCandidateScreen(ctk.CTkFrame):
                 reveal_file_in_folder(entry.split_pdf_path)
             except Exception as exc:
                 messagebox.showerror("无法定位单页PDF", str(exc))
+
+    def create_research_package(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning(
+                "请选择 MOFA 候选页",
+                "请先选择一条或多条候选记录，再创建 MOFA 研究工作包。",
+            )
+            return
+        candidates = [
+            candidate
+            for candidate_id in selection
+            if (candidate := self._candidate_for_id(candidate_id)) is not None
+        ]
+        if not candidates:
+            return
+        MofaResearchPackageCreateDialog(
+            self,
+            service=self.package_service,
+            candidates=candidates,
+            on_created=lambda _result: self.refresh_candidates(),
+        )
+
+    def show_research_packages(self) -> None:
+        MofaResearchPackageManagerDialog(
+            self,
+            service=self.package_service,
+            on_changed=self.refresh_candidates,
+        )
 
     def show_saved_searches(self) -> None:
         searches = self.service.list_saved_searches()
